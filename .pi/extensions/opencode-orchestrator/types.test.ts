@@ -1,15 +1,34 @@
 import assert from "node:assert/strict";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
 	buildWorkerPrompt,
+	configuredModelProfiles,
 	findScopeConflict,
 	normalizeScopes,
+	resolveModel,
 	scopeOverlaps,
 	validateWorkflowPhases,
 } from "./types.ts";
 
-const cwd = "/tmp/pi-opencode-test-repo";
+const cwd = path.join(os.tmpdir(), "pi-opencode-test-repo");
+
+test("model profiles resolve with explicit model precedence and environment overrides", () => {
+	const profiles = configuredModelProfiles({
+		PI_OPENCODE_PROFILE_QWEN_MAX: "custom/qwen",
+	});
+	assert.equal(resolveModel({ profile: "qwen_max" }, "fallback/model", profiles), "custom/qwen");
+	assert.equal(
+		resolveModel({ model: "explicit/model", profile: "qwen_max" }, "fallback/model", profiles),
+		"explicit/model",
+	);
+	assert.equal(resolveModel({}, "fallback/model", profiles), "fallback/model");
+	assert.throws(
+		() => resolveModel({ profile: "missing" as never }, "fallback/model", profiles),
+		/Unknown OpenCode model profile/,
+	);
+});
 
 test("normalizeScopes keeps concrete paths inside cwd", () => {
 	assert.deepEqual(normalizeScopes(cwd, ["src/a.ts", "tests"]), [

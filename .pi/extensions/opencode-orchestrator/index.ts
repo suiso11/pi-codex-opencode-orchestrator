@@ -6,12 +6,16 @@ import type {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { OpenCodeTaskManager } from "./manager.ts";
-import type { TaskMode, TaskSpec, WorkflowPhaseSpec } from "./types.ts";
+import type { ModelProfile, TaskMode, TaskSpec, WorkflowPhaseSpec } from "./types.ts";
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
 
 const ModeSchema = StringEnum(["read_only", "write"] as const, {
 	description: "read_only forbids changes; write permits changes only in relevant_paths.",
+});
+
+const ProfileSchema = StringEnum(["qwen_max"] as const, {
+	description: "Named OpenCode worker model: qwen_max for complex or large-context implementation.",
 });
 
 const TaskSchema = Type.Object({
@@ -28,7 +32,8 @@ const TaskSchema = Type.Object({
 		maxItems: 32,
 	})),
 	expected_output: Type.String({ description: "Evidence/result the worker must return.", minLength: 1 }),
-	model: Type.Optional(Type.String({ description: "Optional OpenCode provider/model override." })),
+	model: Type.Optional(Type.String({ description: "Optional OpenCode provider/model override. Takes precedence over profile." })),
+	profile: Type.Optional(ProfileSchema),
 });
 
 const IdsSchema = Type.Object({
@@ -61,6 +66,7 @@ type RawTask = {
 	constraints?: string[];
 	expected_output: string;
 	model?: string;
+	profile?: ModelProfile;
 };
 
 function toTaskSpec(raw: RawTask): TaskSpec {
@@ -72,6 +78,7 @@ function toTaskSpec(raw: RawTask): TaskSpec {
 		constraints: raw.constraints ?? [],
 		expectedOutput: raw.expected_output,
 		model: raw.model,
+		profile: raw.profile,
 	};
 }
 
@@ -149,6 +156,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Start a bounded OpenCode worker in the background with read-only or path-scoped write access",
 		promptGuidelines: [
 			"Use opencode_spawn for independent repository exploration, mechanical implementation, tests, docs, or review; give each worker one objective and concrete relevant_paths.",
+			"Use the default GLM worker for routine exploration and mechanical work, and profile qwen_max for complex or large-context implementation. Run GPT-5.5 reviews separately through codex exec, not an OpenCode profile.",
 			"For parallel write opencode_spawn calls, partition relevant_paths so no file or containing directory overlaps; the extension rejects conflicting scopes.",
 			"After opencode_spawn, continue useful orchestration work, then call opencode_wait before relying on worker results.",
 		],
@@ -259,6 +267,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run a complex two-or-more-phase OpenCode workflow with bounded parallel fan-out",
 		promptGuidelines: [
 			"Use opencode_workflow only for complex work with at least two dependent phases or three independent subtasks; use opencode_task/opencode_spawn for simpler work.",
+			"Prefer qwen_max for complex implementation phases and keep routine phases on the default GLM worker. Run a GPT-5.5 independent review separately through codex exec after the OpenCode workflow.",
 			"Within an opencode_workflow phase, give write tasks non-overlapping relevant_paths; overlapping write scopes are rejected before the workflow starts.",
 		],
 		parameters: WorkflowSchema,
@@ -359,6 +368,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(
 				[
 					`OpenCode model: ${config.model}`,
+					`Profiles: ${Object.entries(config.profiles).map(([name, model]) => `${name}=${model}`).join(", ")}`,
 					`Binary: ${config.binary}`,
 					`Timeout: ${config.timeoutMs} ms`,
 					`Running: ${tasks.runningCount()}/${config.maxRunning}`,

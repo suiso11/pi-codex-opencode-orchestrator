@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -9,10 +9,10 @@ import { OpenCodeWorkflowManager } from "./workflow.ts";
 
 async function fakeOpenCode() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-workflow-"));
-	const binary = path.join(dir, "opencode");
+	const script = path.join(dir, "opencode.mjs");
 	await writeFile(
-		binary,
-		`#!/usr/bin/env node
+		script,
+		`
 const prompt = process.argv.at(-1) || "";
 let text = "PHASE_ONE_RESULT";
 if (prompt.includes("second phase")) {
@@ -23,13 +23,20 @@ if (prompt.includes("second phase")) {
 process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text } }) + "\\n");
 `,
 	);
-	await chmod(binary, 0o755);
-	return { binary, cleanup: () => rm(dir, { recursive: true, force: true }) };
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
 }
 
 test("workflow runs phases sequentially and passes bounded prior results forward", async () => {
 	const fake = await fakeOpenCode();
-	const tasks = new OpenCodeTaskManager({ binary: fake.binary, timeoutMs: 2_000 });
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
 	const workflows = new OpenCodeWorkflowManager(tasks);
 	const phases: WorkflowPhaseSpec[] = [
 		{
@@ -52,6 +59,7 @@ test("workflow runs phases sequentially and passes bounded prior results forward
 				relevantPaths: ["src"],
 				constraints: [],
 				expectedOutput: "integrated result",
+				profile: "qwen_max",
 			}],
 		},
 	];
@@ -63,6 +71,7 @@ test("workflow runs phases sequentially and passes bounded prior results forward
 		assert.equal(settled.taskIds.length, 2);
 		assert.match(tasks.get(settled.taskIds[0])?.output ?? "", /PHASE_ONE_RESULT/);
 		assert.match(tasks.get(settled.taskIds[1])?.output ?? "", /HAS_PRIOR_CONTEXT/);
+		assert.equal(tasks.get(settled.taskIds[1])?.model, "opencode-go/qwen3.7-max");
 	} finally {
 		await workflows.dispose();
 		await tasks.dispose();

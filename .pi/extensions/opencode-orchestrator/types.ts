@@ -1,6 +1,9 @@
 import * as path from "node:path";
 
 export const DEFAULT_MODEL = "opencode-go/glm-5.2";
+export const MODEL_PROFILE_DEFAULTS = {
+	qwen_max: "opencode-go/qwen3.7-max",
+} as const;
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
 export const MAX_OUTPUT_CHARS = 120_000;
@@ -9,6 +12,7 @@ export const MAX_ACTIVITY_ITEMS = 30;
 export type TaskMode = "read_only" | "write";
 export type TaskStatus = "running" | "done" | "error" | "cancelled";
 export type WorkflowStatus = "running" | "done" | "error" | "cancelled";
+export type ModelProfile = keyof typeof MODEL_PROFILE_DEFAULTS;
 
 export interface TaskSpec {
 	name: string;
@@ -18,6 +22,7 @@ export interface TaskSpec {
 	constraints: string[];
 	expectedOutput: string;
 	model?: string;
+	profile?: ModelProfile;
 }
 
 export interface InternalTaskSpec extends TaskSpec {
@@ -60,6 +65,25 @@ export interface WorkflowSnapshot {
 	createdAt: number;
 	settledAt?: number;
 	error?: string;
+}
+
+export function configuredModelProfiles(env: NodeJS.ProcessEnv = process.env): Record<ModelProfile, string> {
+	return {
+		qwen_max: env.PI_OPENCODE_PROFILE_QWEN_MAX?.trim() || MODEL_PROFILE_DEFAULTS.qwen_max,
+	};
+}
+
+export function resolveModel(
+	spec: Pick<TaskSpec, "model" | "profile">,
+	fallback: string,
+	profiles: Readonly<Record<ModelProfile, string>> = configuredModelProfiles(),
+) {
+	const explicit = spec.model?.trim();
+	if (explicit) return explicit;
+	if (!spec.profile) return fallback;
+	const resolved = profiles[spec.profile];
+	if (!resolved) throw new Error(`Unknown OpenCode model profile: ${spec.profile}`);
+	return resolved;
 }
 
 export function boundedAppend(current: string, chunk: string, max = MAX_OUTPUT_CHARS) {

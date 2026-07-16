@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -7,10 +7,10 @@ import { OpenCodeTaskManager } from "./manager.ts";
 
 async function fakeOpenCode() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-"));
-	const binary = path.join(dir, "opencode");
+	const script = path.join(dir, "opencode.mjs");
 	await writeFile(
-		binary,
-		`#!/usr/bin/env node
+		script,
+		`
 const prompt = process.argv.at(-1) || "";
 const delay = prompt.includes("slow") ? 500 : 20;
 setTimeout(() => {
@@ -18,8 +18,11 @@ setTimeout(() => {
 }, delay);
 `,
 	);
-	await chmod(binary, 0o755);
-	return { binary, cleanup: () => rm(dir, { recursive: true, force: true }) };
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
 }
 
 function spec(name: string, mode: "read_only" | "write", relevantPaths: string[], objective = name) {
@@ -35,7 +38,11 @@ function spec(name: string, mode: "read_only" | "write", relevantPaths: string[]
 
 test("manager runs read-only and disjoint write tasks concurrently", async () => {
 	const fake = await fakeOpenCode();
-	const manager = new OpenCodeTaskManager({ binary: fake.binary, timeoutMs: 2_000 });
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
 	try {
 		const readA = manager.spawn(spec("read-a", "read_only", ["src"]), process.cwd());
 		const readB = manager.spawn(spec("read-b", "read_only", ["src"]), process.cwd());
@@ -62,7 +69,11 @@ test("manager runs read-only and disjoint write tasks concurrently", async () =>
 
 test("manager enforces the global four-worker cap", async () => {
 	const fake = await fakeOpenCode();
-	const manager = new OpenCodeTaskManager({ binary: fake.binary, timeoutMs: 2_000 });
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
 	try {
 		const running = Array.from({ length: 4 }, (_, index) =>
 			manager.spawn(spec(`slow-${index}`, "read_only", ["src"], `slow ${index}`), process.cwd()),
