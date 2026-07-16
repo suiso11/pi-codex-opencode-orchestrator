@@ -2,18 +2,21 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as os from "node:os";
 import type {
 	InternalTaskSpec,
+	ModelProfile,
 	TaskSnapshot,
 	TaskSpec,
 } from "./types.ts";
 import {
 	boundedAppend,
 	buildWorkerPrompt,
+	configuredModelProfiles,
 	DEFAULT_MODEL,
 	findScopeConflict,
 	MAX_ACTIVITY_ITEMS,
 	MAX_RUNNING,
 	MAX_TRACKED,
 	normalizeScopes,
+	resolveModel,
 } from "./types.ts";
 
 interface ManagedTask {
@@ -30,6 +33,7 @@ interface ManagedTask {
 interface ManagerOptions {
 	onChange?: () => void;
 	binary?: string;
+	binaryArgs?: string[];
 	model?: string;
 	timeoutMs?: number;
 }
@@ -85,18 +89,28 @@ export class OpenCodeTaskManager {
 	private capacityListeners = new Set<() => void>();
 	private readonly onChange?: () => void;
 	private readonly binary: string;
+	private readonly binaryArgs: string[];
 	private readonly defaultModel: string;
+	private readonly modelProfiles: Record<ModelProfile, string>;
 	private readonly timeoutMs: number;
 
 	constructor(options: ManagerOptions = {}) {
 		this.onChange = options.onChange;
 		this.binary = options.binary ?? process.env.PI_OPENCODE_BIN ?? "opencode";
+		this.binaryArgs = options.binaryArgs ?? [];
 		this.defaultModel = options.model ?? process.env.PI_OPENCODE_MODEL ?? DEFAULT_MODEL;
+		this.modelProfiles = configuredModelProfiles();
 		this.timeoutMs = configuredTimeout(options.timeoutMs);
 	}
 
 	configuration() {
-		return { binary: this.binary, model: this.defaultModel, timeoutMs: this.timeoutMs, maxRunning: MAX_RUNNING };
+		return {
+			binary: this.binary,
+			model: this.defaultModel,
+			profiles: { ...this.modelProfiles },
+			timeoutMs: this.timeoutMs,
+			maxRunning: MAX_RUNNING,
+		};
 	}
 
 	private notify() {
@@ -139,7 +153,7 @@ export class OpenCodeTaskManager {
 		if (blockReason) throw new Error(blockReason);
 		const scopes = normalizeScopes(cwd, spec.relevantPaths);
 		const id = `oc-${++this.counter}`;
-		const model = spec.model?.trim() || this.defaultModel;
+		const model = resolveModel(spec, this.defaultModel, this.modelProfiles);
 		const snapshot: TaskSnapshot = {
 			id,
 			name: spec.name.trim().slice(0, 160) || id,
@@ -211,7 +225,15 @@ export class OpenCodeTaskManager {
 
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
-		const child = spawn(this.binary, ["run", "--format", "json", "--model", entry.snapshot.model, prompt], {
+		const child = spawn(this.binary, [
+			...this.binaryArgs,
+			"run",
+			"--format",
+			"json",
+			"--model",
+			entry.snapshot.model,
+			prompt,
+		], {
 			cwd,
 			env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
 			detached: os.platform() !== "win32",

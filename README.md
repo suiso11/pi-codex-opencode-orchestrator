@@ -21,8 +21,15 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Node.js 22 or newer
 - Pi with a configured Codex/OpenAI provider
 - OpenCode CLI with access to the selected worker model
+- Codex CLI for optional GPT-5.5 review subagents
 
 Install Pi and OpenCode according to their upstream documentation, then authenticate each provider before starting the launcher.
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.7
+npm install -g opencode-ai@1.18.2
+npm install -g @openai/codex
+```
 
 ## Quick start
 
@@ -31,6 +38,12 @@ git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
 cd pi-codex-opencode-orchestrator
 npm install
 scripts/pi_codex_orchestrator.sh
+```
+
+On Windows PowerShell, use:
+
+```powershell
+.\scripts\pi_codex_orchestrator.ps1
 ```
 
 On the first Pi run, use `/login` and select the Codex/OpenAI provider. The launcher defaults to `openai-codex/gpt-5.5` for the parent agent.
@@ -49,6 +62,25 @@ Other settings:
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
 - `/opencode-status`: show the current worker configuration inside Pi
 
+## Worker models
+
+Routine OpenCode tasks use `opencode-go/glm-5.2`. Set `profile: "qwen_max"` on a task or workflow task for complex or large-context implementation; it resolves to `opencode-go/qwen3.7-max`. An explicit `model` always takes precedence over `profile`.
+
+Override the profile model when needed:
+
+```bash
+PI_OPENCODE_PROFILE_QWEN_MAX=opencode-go/qwen3.7-max \
+scripts/pi_codex_orchestrator.sh
+```
+
+GPT-5.5 review subagents run through Codex CLI, not OpenCode:
+
+```bash
+codex exec -m gpt-5.5 --sandbox read-only "$(cat /tmp/codex_prompt.md)"
+```
+
+The currently available OpenCode Go catalog exposes Qwen3.7 Max rather than Qwen3.6 Max.
+
 ## Using it in another repository
 
 Copy the extension directory into that repository:
@@ -63,6 +95,8 @@ You may also copy `scripts/pi_codex_orchestrator.sh` or launch Pi with the same 
 ## Task model
 
 Each worker receives a structured objective, mode, relevant paths, constraints, and expected output.
+
+Tasks may also select the `qwen_max` profile. Direct `model` overrides remain available for any OpenCode provider/model ID.
 
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
 - `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship.
