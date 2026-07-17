@@ -33,6 +33,8 @@ npm install -g @openai/codex
 
 ## Quick start
 
+For setup on additional PCs, configuration sharing, and update procedures, see [docs/multi-pc-setup.ja.md](docs/multi-pc-setup.ja.md) (Japanese).
+
 ```bash
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
 cd pi-codex-opencode-orchestrator
