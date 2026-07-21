@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Pi extension for Codex-orchestrated OpenCode workers",
+  "bin": {
+    "pi-orch": "scripts/pi-orch.mjs"
+  },
   "scripts": {
     "test": "node --test --experimental-strip-types .pi/extensions/opencode-orchestrator/*.test.ts",
     "typecheck": "tsc -p tsconfig.json"

@@ -39,14 +39,18 @@ For setup on additional PCs, configuration sharing, and update procedures, see [
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
 cd pi-codex-opencode-orchestrator
 npm install
-scripts/pi_codex_orchestrator.sh
+npm link
+pi-orch
 ```
 
-On Windows PowerShell, use:
+`npm link` registers the `pi-orch` command globally. After that, launch the orchestrator from any directory with:
 
-```powershell
-.\scripts\pi_codex_orchestrator.ps1
+```bash
+pi-orch
 ```
+
+You can still run `scripts/pi_codex_orchestrator.sh` directly, or
+`.\scripts\pi_codex_orchestrator.ps1` on Windows PowerShell, without creating the global command.
 
 On the first Pi run, use `/login` and select the Codex/OpenAI provider. The launcher defaults to `openai-codex/gpt-5.5` for the parent agent.
 
@@ -55,7 +59,7 @@ You can override both models:
 ```bash
 PI_CODEX_MODEL=openai-codex/gpt-5.5 \
 PI_OPENCODE_MODEL=opencode-go/glm-5.2 \
-scripts/pi_codex_orchestrator.sh
+pi-orch
 ```
 
 Other settings:
@@ -72,7 +76,7 @@ Override the profile model when needed:
 
 ```bash
 PI_OPENCODE_PROFILE_QWEN_MAX=opencode-go/qwen3.7-max \
-scripts/pi_codex_orchestrator.sh
+pi-orch
 ```
 
 GPT-5.5 review subagents run through Codex CLI, not OpenCode:
