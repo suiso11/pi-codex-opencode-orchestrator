@@ -80,17 +80,19 @@ opencode auth list
 
 既定の役割分担は次のとおり。
 
-- 親オーケストレーター: `openai-codex/gpt-5.5`
+- 親オーケストレーター・最終承認: `openai-codex/gpt-5.6-sol`
 - OpenCodeの通常タスク: `opencode-go/glm-5.2`
-- 複雑または大きいコンテキストのタスク: `qwen_max` プロファイル（`opencode-go/qwen3.7-max`）
-- 独立レビュー: `codex exec -m gpt-5.5 --sandbox read-only`
+- OpenCode実装: `glm` プロファイル（`opencode-go/glm-5.2`）
+- OpenCode別視点レビュー: `kimi_k3` プロファイル（`opencode-go/kimi-k3`、読み取り専用）
+- 最終レビュー: `codex exec -m gpt-5.6-sol --sandbox read-only`
 
 モデルは環境変数で上書きできる。
 
 ```bash
-PI_CODEX_MODEL=openai-codex/gpt-5.5
+PI_CODEX_MODEL=openai-codex/gpt-5.6-sol
 PI_OPENCODE_MODEL=opencode-go/glm-5.2
-PI_OPENCODE_PROFILE_QWEN_MAX=opencode-go/qwen3.7-max
+PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2
+PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3
 ```
 
 ## 共有してよい設定
@@ -108,7 +110,7 @@ Piのグローバル設定例:
 ```json
 {
   "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.5",
+  "defaultModel": "gpt-5.6-sol",
   "defaultThinkingLevel": "high"
 }
 ```

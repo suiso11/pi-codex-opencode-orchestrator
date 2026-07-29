@@ -59,7 +59,7 @@ test("workflow runs phases sequentially and passes bounded prior results forward
 				relevantPaths: ["src"],
 				constraints: [],
 				expectedOutput: "integrated result",
-				profile: "qwen_max",
+				profile: "kimi_k3",
 			}],
 		},
 	];
@@ -71,7 +71,7 @@ test("workflow runs phases sequentially and passes bounded prior results forward
 		assert.equal(settled.taskIds.length, 2);
 		assert.match(tasks.get(settled.taskIds[0])?.output ?? "", /PHASE_ONE_RESULT/);
 		assert.match(tasks.get(settled.taskIds[1])?.output ?? "", /HAS_PRIOR_CONTEXT/);
-		assert.equal(tasks.get(settled.taskIds[1])?.model, "opencode-go/qwen3.7-max");
+		assert.equal(tasks.get(settled.taskIds[1])?.model, "opencode-go/kimi-k3");
 	} finally {
 		await workflows.dispose();
 		await tasks.dispose();

@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $model = if ($env:PI_CODEX_MODEL) {
     $env:PI_CODEX_MODEL
 } else {
-    "openai-codex/gpt-5.5"
+    "openai-codex/gpt-5.6-sol"
 }
 
 $piCommand = Get-Command pi -ErrorAction Stop
@@ -25,6 +25,9 @@ $tools = @(
     "find",
     "ls",
     "bash",
+    "subagent",
+    "subagent_resume",
+    "subagent_kill",
     "opencode_task",
     "opencode_spawn",
     "opencode_wait",

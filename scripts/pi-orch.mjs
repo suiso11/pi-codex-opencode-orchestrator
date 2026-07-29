@@ -18,7 +18,7 @@ const commandArgs = isWindows
   : [launcher, ...process.argv.slice(2)];
 
 const result = spawnSync(command, commandArgs, {
-  cwd: root,
+  cwd: process.cwd(),
   env: process.env,
   stdio: "inherit",
 });

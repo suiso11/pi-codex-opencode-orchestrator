@@ -2,7 +2,8 @@ import * as path from "node:path";
 
 export const DEFAULT_MODEL = "opencode-go/glm-5.2";
 export const MODEL_PROFILE_DEFAULTS = {
-	qwen_max: "opencode-go/qwen3.7-max",
+	glm: "opencode-go/glm-5.2",
+	kimi_k3: "opencode-go/kimi-k3",
 } as const;
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -69,7 +70,8 @@ export interface WorkflowSnapshot {
 
 export function configuredModelProfiles(env: NodeJS.ProcessEnv = process.env): Record<ModelProfile, string> {
 	return {
-		qwen_max: env.PI_OPENCODE_PROFILE_QWEN_MAX?.trim() || MODEL_PROFILE_DEFAULTS.qwen_max,
+		glm: env.PI_OPENCODE_PROFILE_GLM?.trim() || MODEL_PROFILE_DEFAULTS.glm,
+		kimi_k3: env.PI_OPENCODE_PROFILE_KIMI_K3?.trim() || MODEL_PROFILE_DEFAULTS.kimi_k3,
 	};
 }
 

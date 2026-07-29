@@ -21,7 +21,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Node.js 22 or newer
 - Pi with a configured Codex/OpenAI provider
 - OpenCode CLI with access to the selected worker model
-- Codex CLI for optional GPT-5.5 review subagents
+- Codex CLI for optional GPT-5.6 Sol final-review subagents
 
 Install Pi and OpenCode according to their upstream documentation, then authenticate each provider before starting the launcher.
 
@@ -52,12 +52,12 @@ pi-orch
 You can still run `scripts/pi_codex_orchestrator.sh` directly, or
 `.\scripts\pi_codex_orchestrator.ps1` on Windows PowerShell, without creating the global command.
 
-On the first Pi run, use `/login` and select the Codex/OpenAI provider. The launcher defaults to `openai-codex/gpt-5.5` for the parent agent.
+On the first Pi run, use `/login` and select the Codex/OpenAI provider. The launcher defaults to `openai-codex/gpt-5.6-sol` for the parent and final approval.
 
 You can override both models:
 
 ```bash
-PI_CODEX_MODEL=openai-codex/gpt-5.5 \
+PI_CODEX_MODEL=openai-codex/gpt-5.6-sol \
 PI_OPENCODE_MODEL=opencode-go/glm-5.2 \
 pi-orch
 ```
@@ -70,22 +70,23 @@ Other settings:
 
 ## Worker models
 
-Routine OpenCode tasks use `opencode-go/glm-5.2`. Set `profile: "qwen_max"` on a task or workflow task for complex or large-context implementation; it resolves to `opencode-go/qwen3.7-max`. An explicit `model` always takes precedence over `profile`.
+Routine exploration and implementation use `opencode-go/glm-5.2` (default or `profile: "glm"`). Use `profile: "kimi_k3"` for independent read-only wide-context review; it resolves to `opencode-go/kimi-k3`. An explicit `model` always takes precedence over `profile`.
 
-Override the profile model when needed:
+Override either profile when needed:
 
 ```bash
-PI_OPENCODE_PROFILE_QWEN_MAX=opencode-go/qwen3.7-max \
+PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2 \
+PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3 \
 pi-orch
 ```
 
-GPT-5.5 review subagents run through Codex CLI, not OpenCode:
+Final approval remains with GPT-5.6 Sol through the parent or a separate Codex CLI review:
 
 ```bash
-codex exec -m gpt-5.5 --sandbox read-only "$(cat /tmp/codex_prompt.md)"
+codex exec -m gpt-5.6-sol --sandbox read-only "$(cat /tmp/codex_prompt.md)"
 ```
 
-The currently available OpenCode Go catalog exposes Qwen3.7 Max rather than Qwen3.6 Max.
+Kimi K3 provides a different review perspective but does not grant final approval.
 
 ## Using it in another repository
 
@@ -102,7 +103,7 @@ You may also copy `scripts/pi_codex_orchestrator.sh` or launch Pi with the same 
 
 Each worker receives a structured objective, mode, relevant paths, constraints, and expected output.
 
-Tasks may also select the `qwen_max` profile. Direct `model` overrides remain available for any OpenCode provider/model ID.
+Tasks may select the `glm` or `kimi_k3` profile. Direct `model` overrides remain available for any OpenCode provider/model ID.
 
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
 - `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship.

@@ -16,11 +16,13 @@ const cwd = path.join(os.tmpdir(), "pi-opencode-test-repo");
 
 test("model profiles resolve with explicit model precedence and environment overrides", () => {
 	const profiles = configuredModelProfiles({
-		PI_OPENCODE_PROFILE_QWEN_MAX: "custom/qwen",
+		PI_OPENCODE_PROFILE_GLM: "custom/glm",
+		PI_OPENCODE_PROFILE_KIMI_K3: "custom/kimi",
 	});
-	assert.equal(resolveModel({ profile: "qwen_max" }, "fallback/model", profiles), "custom/qwen");
+	assert.equal(resolveModel({ profile: "glm" }, "fallback/model", profiles), "custom/glm");
+	assert.equal(resolveModel({ profile: "kimi_k3" }, "fallback/model", profiles), "custom/kimi");
 	assert.equal(
-		resolveModel({ model: "explicit/model", profile: "qwen_max" }, "fallback/model", profiles),
+		resolveModel({ model: "explicit/model", profile: "kimi_k3" }, "fallback/model", profiles),
 		"explicit/model",
 	);
 	assert.equal(resolveModel({}, "fallback/model", profiles), "fallback/model");
