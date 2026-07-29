@@ -9,6 +9,7 @@ import { OpenCodeTaskManager } from "./manager.ts";
 import type { ModelProfile, TaskMode, TaskSpec, WorkflowPhaseSpec } from "./types.ts";
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
+import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard } from "./dashboard.ts";
 
 const ModeSchema = StringEnum(["read_only", "write"] as const, {
 	description: "read_only forbids changes; write permits changes only in relevant_paths.",
@@ -89,13 +90,36 @@ export default function (pi: ExtensionAPI) {
 	let workflows!: OpenCodeWorkflowManager;
 	let deliverSettled = () => {};
 	let deliveryScheduled = false;
+	let dashboardTimer: ReturnType<typeof setInterval> | undefined;
+
+	const updateDashboard = () => {
+		if (!ui) return;
+		ui.setWidget(
+			DASHBOARD_KEY,
+			formatDashboard(tasks.list(), workflows.list(), Date.now()),
+			{ placement: "aboveEditor" },
+		);
+	};
+
+	const syncDashboardTimer = (hasRunningWork: boolean) => {
+		if (hasRunningWork && !dashboardTimer) {
+			dashboardTimer = setInterval(updateDashboard, DASHBOARD_INTERVAL_MS);
+			dashboardTimer.unref();
+		} else if (!hasRunningWork && dashboardTimer) {
+			clearInterval(dashboardTimer);
+			dashboardTimer = undefined;
+		}
+	};
 
 	const updateStatus = () => {
 		const taskRunning = tasks?.runningCount() ?? 0;
 		const workflowRunning = workflows?.list().filter((item) => item.status === "running").length ?? 0;
 		if (ui) {
-			if (taskRunning === 0 && workflowRunning === 0) ui.setStatus("opencode-orchestrator", undefined);
+			const hasRunningWork = taskRunning > 0 || workflowRunning > 0;
+			if (!hasRunningWork) ui.setStatus("opencode-orchestrator", undefined);
 			else ui.setStatus("opencode-orchestrator", `OpenCode ${taskRunning}/4 · workflows ${workflowRunning}`);
+			syncDashboardTimer(hasRunningWork);
+			updateDashboard();
 		}
 		if (sessionContext?.isIdle() && !deliveryScheduled) {
 			deliveryScheduled = true;
@@ -142,7 +166,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", deliverSettled);
 	pi.on("session_shutdown", async () => {
 		sessionContext = undefined;
+		if (dashboardTimer) clearInterval(dashboardTimer);
+		dashboardTimer = undefined;
 		ui?.setStatus("opencode-orchestrator", undefined);
+		ui?.setWidget(DASHBOARD_KEY, undefined);
 		ui = undefined;
 		await workflows.dispose();
 		await tasks.dispose();

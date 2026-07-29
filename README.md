@@ -15,6 +15,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Background result delivery through Pi follow-up messages
 - Timeout handling, SIGTERM/SIGKILL cleanup, and bounded output capture
 - Default worker model: `opencode-go/glm-5.2`
+- Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
 
 ## Requirements
 
@@ -67,6 +68,16 @@ Other settings:
 - `PI_OPENCODE_BIN`: OpenCode executable, default `opencode`
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
 - `/opencode-status`: show the current worker configuration inside Pi
+
+## Live activity dashboard
+
+While OpenCode work is running, Pi shows a widget above the editor. It refreshes about once per second and includes:
+
+- running worker and workflow counts
+- each worker ID, full model ID, elapsed time, mode, task name, and latest OpenCode activity
+- each workflow ID, elapsed time, and current phase
+
+The widget disappears automatically when no OpenCode work remains. The compact footer status and `/opencode-status` command remain available.
 
 ## Worker models
 

@@ -95,6 +95,13 @@ PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3
 ```
 
+### 実行状況ダッシュボード
+
+OpenCode workerまたはworkflowの実行中は、Piの入力欄上にダッシュボードが常時表示される。
+約1秒ごとに更新され、workerごとのID、モデル、経過時間、権限モード、タスク名、最新activityと、
+workflowの現在phaseを確認できる。全処理が終了すると自動で消える。設定と実行数の確認には
+`/opencode-status`も利用できる。
+
 ## 共有してよい設定
 
 個人用のprivate dotfilesリポジトリを用意し、秘密情報を含まない次のファイルだけを同期すると管理しやすい。
