@@ -3,6 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+	decodeWorkerModel,
+	encodeWorkerModel,
 	buildWorkerPrompt,
 	configuredModelProfiles,
 	findScopeConflict,
@@ -13,6 +15,19 @@ import {
 } from "./types.ts";
 
 const cwd = path.join(os.tmpdir(), "pi-opencode-test-repo");
+
+test("worker model routes encode Pi opt-out without changing OpenCode model IDs", () => {
+	assert.equal(encodeWorkerModel("opencode", "opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	assert.equal(encodeWorkerModel("pi", "anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.deepEqual(decodeWorkerModel("opencode-go/glm-5.2"), {
+		backend: "opencode",
+		model: "opencode-go/glm-5.2",
+	});
+	assert.deepEqual(decodeWorkerModel("pi::anthropic/claude-example"), {
+		backend: "pi",
+		model: "anthropic/claude-example",
+	});
+});
 
 test("model profiles resolve with explicit model precedence and environment overrides", () => {
 	const profiles = configuredModelProfiles({

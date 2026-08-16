@@ -22,7 +22,7 @@ export function formatLatestActivity(activity: string[]): string {
 export function formatWorkerRow(task: TaskSnapshot, now: number): string {
 	const elapsed = formatElapsed(now, task.createdAt, task.settledAt);
 	const latest = formatLatestActivity(task.activity);
-	return `  ${task.id} ${task.model} ${elapsed} [${task.mode}] "${task.name}" · ${latest}`;
+	return `  ${task.id} ${task.backend}:${task.model} ${elapsed} [${task.mode}] "${task.name}" · ${latest}`;
 }
 
 export function formatWorkflowPhase(workflow: WorkflowSnapshot): string {
@@ -44,7 +44,7 @@ export function formatDashboard(
 	const runningWorkflows = workflows.filter((workflow) => workflow.status === "running");
 	if (runningWorkers.length === 0 && runningWorkflows.length === 0) return undefined;
 	const lines: string[] = [
-		`OpenCode activity: ${runningWorkers.length} worker(s), ${runningWorkflows.length} workflow(s)`,
+		`Worker activity: ${runningWorkers.length} worker(s), ${runningWorkflows.length} workflow(s)`,
 	];
 	for (const task of runningWorkers) lines.push(formatWorkerRow(task, now));
 

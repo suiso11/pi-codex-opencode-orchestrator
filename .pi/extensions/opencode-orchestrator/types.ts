@@ -14,6 +14,23 @@ export type TaskMode = "read_only" | "write";
 export type TaskStatus = "running" | "done" | "error" | "cancelled";
 export type WorkflowStatus = "running" | "done" | "error" | "cancelled";
 export type ModelProfile = keyof typeof MODEL_PROFILE_DEFAULTS;
+export type WorkerBackend = "opencode" | "pi";
+
+const PI_WORKER_PREFIX = "pi::";
+
+export function encodeWorkerModel(backend: WorkerBackend, model: string) {
+	const value = model.trim();
+	if (!value) throw new Error("Worker model must not be empty.");
+	return backend === "pi" ? `${PI_WORKER_PREFIX}${value}` : value;
+}
+
+export function decodeWorkerModel(value: string): { backend: WorkerBackend; model: string } {
+	const normalized = value.trim();
+	if (normalized.startsWith(PI_WORKER_PREFIX)) {
+		return { backend: "pi", model: normalized.slice(PI_WORKER_PREFIX.length) };
+	}
+	return { backend: "opencode", model: normalized };
+}
 
 export interface TaskSpec {
 	name: string;
@@ -39,6 +56,7 @@ export interface TaskSnapshot {
 	relevantPaths: string[];
 	scopes: string[];
 	model: string;
+	backend: WorkerBackend;
 	workflowId?: string;
 	createdAt: number;
 	settledAt?: number;
@@ -138,7 +156,7 @@ export function buildWorkerPrompt(spec: TaskSpec) {
 		: "- No additional task-specific constraints.";
 
 	return [
-		"You are an OpenCode worker delegated by a Codex orchestrator running in Pi.",
+		"You are a bounded worker delegated by a parent orchestrator running in Pi.",
 		"Follow the repository's AGENTS.md.",
 		"Do not read secrets or git-ignored runtime configuration such as config/*.env.",
 		modeInstruction,
@@ -160,7 +178,7 @@ export function buildWorkerPrompt(spec: TaskSpec) {
 
 export function taskSummary(task: TaskSnapshot) {
 	const elapsed = Math.max(0, (task.settledAt ?? Date.now()) - task.createdAt);
-	return `${task.id} [${task.status}] ${task.mode} "${task.name}" (${Math.round(elapsed / 1000)}s, ${task.model})`;
+	return `${task.id} [${task.status}] ${task.mode} "${task.name}" (${Math.round(elapsed / 1000)}s, ${task.backend}:${task.model})`;
 }
 
 function clippedTail(value: string, maxChars: number) {

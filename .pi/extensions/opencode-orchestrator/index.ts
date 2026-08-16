@@ -10,13 +10,14 @@ import type { ModelProfile, TaskMode, TaskSpec, WorkflowPhaseSpec } from "./type
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
 import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard } from "./dashboard.ts";
+import { registerModelCommand } from "./model-command.ts";
 
 const ModeSchema = StringEnum(["read_only", "write"] as const, {
 	description: "read_only forbids changes; write permits changes only in relevant_paths.",
 });
 
 const ProfileSchema = StringEnum(["glm", "kimi_k3"] as const, {
-	description: "Named OpenCode worker model: glm for implementation, kimi_k3 for independent read-only review.",
+	description: "Named worker route. Each route may use either the OpenCode or Pi backend.",
 });
 
 const TaskSchema = Type.Object({
@@ -33,7 +34,7 @@ const TaskSchema = Type.Object({
 		maxItems: 32,
 	})),
 	expected_output: Type.String({ description: "Evidence/result the worker must return.", minLength: 1 }),
-	model: Type.Optional(Type.String({ description: "Optional OpenCode provider/model override. Takes precedence over profile." })),
+	model: Type.Optional(Type.String({ description: "Optional worker model override. Prefix with pi:: to bypass OpenCode and run through Pi." })),
 	profile: Type.Optional(ProfileSchema),
 });
 
@@ -117,7 +118,7 @@ export default function (pi: ExtensionAPI) {
 		if (ui) {
 			const hasRunningWork = taskRunning > 0 || workflowRunning > 0;
 			if (!hasRunningWork) ui.setStatus("opencode-orchestrator", undefined);
-			else ui.setStatus("opencode-orchestrator", `OpenCode ${taskRunning}/4 · workflows ${workflowRunning}`);
+			else ui.setStatus("opencode-orchestrator", `Workers ${taskRunning}/4 · workflows ${workflowRunning}`);
 			syncDashboardTimer(hasRunningWork);
 			updateDashboard();
 		}
@@ -138,7 +139,7 @@ export default function (pi: ExtensionAPI) {
 			pi.sendMessage(
 				{
 					customType: "opencode-task-result",
-					content: `[Background OpenCode task settled]\n\n${taskResultText(task)}`,
+					content: `[Background worker task settled]\n\n${taskResultText(task)}`,
 					display: true,
 					details: { id: task.id, status: task.status, mode: task.mode },
 				},
@@ -149,7 +150,7 @@ export default function (pi: ExtensionAPI) {
 			pi.sendMessage(
 				{
 					customType: "opencode-workflow-result",
-					content: `[Background OpenCode workflow settled]\n\n${workflows.resultText(workflow)}`,
+					content: `[Background worker workflow settled]\n\n${workflows.resultText(workflow)}`,
 					display: true,
 					details: { id: workflow.id, status: workflow.status },
 				},
@@ -177,14 +178,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "opencode_spawn",
-		label: "Spawn OpenCode Worker",
+		label: "Spawn Worker",
 		description:
-			"Start one bounded OpenCode worker in the background. Up to four workers run concurrently. Read-only workers may overlap; write workers run concurrently only when their concrete relevant_paths do not overlap.",
-		promptSnippet: "Start a bounded OpenCode worker in the background with read-only or path-scoped write access",
+			"Start one bounded worker through its configured OpenCode or Pi backend. Up to four workers run concurrently. Read-only workers may overlap; write workers run concurrently only when their concrete relevant_paths do not overlap.",
+		promptSnippet: "Start a bounded worker in the background with read-only or path-scoped write access",
 		promptGuidelines: [
 			"Use opencode_spawn for independent repository exploration, mechanical implementation, tests, docs, or review; give each worker one objective and concrete relevant_paths.",
-			"Use the default GLM worker (or profile glm) for exploration and implementation. Use profile kimi_k3 for independent read-only wide-context review; do not give Kimi write access by default.",
-			"Keep final approval with the parent openai-codex/gpt-5.6-sol or run a separate gpt-5.6-sol Codex review; an OpenCode worker does not grant final approval.",
+			"The glm and kimi_k3 profile names are routing aliases; honor their currently configured backend and model rather than assuming a specific model family.",
+			"Keep final approval with the parent model; a delegated worker does not grant final approval.",
 			"For parallel write opencode_spawn calls, partition relevant_paths so no file or containing directory overlaps; the extension rejects conflicting scopes.",
 			"After opencode_spawn, continue useful orchestration work, then call opencode_wait before relying on worker results.",
 		],
@@ -295,8 +296,8 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run a complex two-or-more-phase OpenCode workflow with bounded parallel fan-out",
 		promptGuidelines: [
 			"Use opencode_workflow only for complex work with at least two dependent phases or three independent subtasks; use opencode_task/opencode_spawn for simpler work.",
-			"Use the default GLM worker (or profile glm) for implementation phases and profile kimi_k3 for an independent read-only review phase.",
-			"After the OpenCode workflow, keep final approval with openai-codex/gpt-5.6-sol; do not treat Kimi or GLM output as final approval.",
+			"The glm and kimi_k3 profile names are configurable routing aliases and may use either OpenCode or Pi.",
+			"After the workflow, keep final approval with the parent; do not treat worker output as final approval.",
 			"Within an opencode_workflow phase, give write tasks non-overlapping relevant_paths; overlapping write scopes are rejected before the workflow starts.",
 		],
 		parameters: WorkflowSchema,
@@ -391,12 +392,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("opencode-status", {
-		description: "Show OpenCode orchestration configuration and active work",
+		description: "Show worker routing configuration and active work",
 		handler: async (_args, ctx) => {
 			const config = tasks.configuration();
 			ctx.ui.notify(
 				[
-					`OpenCode model: ${config.model}`,
+					`Default worker route: ${config.model}`,
 					`Profiles: ${Object.entries(config.profiles).map(([name, model]) => `${name}=${model}`).join(", ")}`,
 					`Binary: ${config.binary}`,
 					`Timeout: ${config.timeoutMs} ms`,
@@ -407,4 +408,6 @@ export default function (pi: ExtensionAPI) {
 			);
 		},
 	});
+
+	registerModelCommand(pi, tasks);
 }

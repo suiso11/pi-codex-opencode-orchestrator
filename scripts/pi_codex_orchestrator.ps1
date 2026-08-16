@@ -6,6 +6,12 @@ $model = if ($env:PI_CODEX_MODEL) {
     "openai-codex/gpt-5.6-sol"
 }
 
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$extension = Join-Path (Split-Path -Parent $scriptDir) ".pi\extensions\opencode-orchestrator\index.ts"
+if (-not (Test-Path -LiteralPath $extension)) {
+    throw "OpenCode orchestrator extension was not found at $extension."
+}
+
 $piCommand = Get-Command pi -ErrorAction Stop
 $opencodeCommand = Get-Command opencode -ErrorAction Stop
 
@@ -43,6 +49,7 @@ $tools = @(
 
 & $piCommand.Source `
     --approve `
+    --extension $extension `
     --model $model `
     --thinking high `
     --tools $tools `

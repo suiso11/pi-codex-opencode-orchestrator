@@ -20,6 +20,7 @@ function task(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 		relevantPaths: ["src"],
 		scopes: ["/repo/src"],
 		model: "opencode-go/glm-5.2",
+		backend: "opencode",
 		createdAt: 1_000,
 		output: "",
 		stderr: "",
@@ -85,7 +86,7 @@ test("dashboard shows only running work and disappears when idle", () => {
 	);
 	assert.ok(lines);
 	assert.equal(lines.length, 3);
-	assert.equal(lines[0], "OpenCode activity: 1 worker(s), 1 workflow(s)");
+	assert.equal(lines[0], "Worker activity: 1 worker(s), 1 workflow(s)");
 	assert.match(lines[1], /oc-1/);
 	assert.match(lines[2], /wf-1/);
 	assert.equal(formatDashboard([task({ status: "done" })], [workflow({ status: "done" })], 66_000), undefined);
