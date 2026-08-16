@@ -19,8 +19,8 @@
 Windows PowerShellでは次を実行する。
 
 ```powershell
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.7
-npm install -g opencode-ai@1.18.2
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+npm install -g opencode-ai@1.18.18
 npm install -g @openai/codex
 
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
@@ -32,8 +32,8 @@ npm install
 LinuxまたはmacOSでは次を実行する。
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.7
-npm install -g opencode-ai@1.18.2
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+npm install -g opencode-ai@1.18.18
 npm install -g @openai/codex
 
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
@@ -94,6 +94,17 @@ PI_OPENCODE_MODEL=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3
 ```
+
+Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対話的に選べる。
+
+```text
+/orch-model
+/orch-model glm pi anthropic/claude-sonnet-4-5
+/orch-model kimi pi openai-codex/gpt-5.6-sol
+/orch-model worker opencode opencode-go/glm-5.2
+```
+
+`pi` backendはOpenCodeを完全に迂回し、Piで認証済みのClaude、Codexなどを直接workerとして起動する。`opencode` backendを選んだ経路だけがOpenCode CLIを使用する。
 
 ### 実行状況ダッシュボード
 

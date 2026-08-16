@@ -15,6 +15,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Background result delivery through Pi follow-up messages
 - Timeout handling, SIGTERM/SIGKILL cleanup, and bounded output capture
 - Default worker model: `opencode-go/glm-5.2`
+- Interactive `/orch-model` command for persistent parent and worker model changes
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
 
 ## Requirements
@@ -27,8 +28,8 @@ It adds background task control, safe parallel scheduling for declared file scop
 Install Pi and OpenCode according to their upstream documentation, then authenticate each provider before starting the launcher.
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.7
-npm install -g opencode-ai@1.18.2
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+npm install -g opencode-ai@1.18.18
 npm install -g @openai/codex
 ```
 
@@ -69,19 +70,40 @@ Other settings:
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
 - `/opencode-status`: show the current worker configuration inside Pi
 
+Change models interactively inside Pi:
+
+```text
+/orch-model
+```
+
+The command can also be used directly:
+
+```text
+/orch-model show
+/orch-model parent openai-codex/gpt-5.6-sol
+/orch-model worker opencode opencode-go/glm-5.2
+/orch-model glm pi anthropic/claude-sonnet-4-5
+/orch-model kimi pi openai-codex/gpt-5.6-sol
+/orch-model reset worker
+```
+
+For worker routes, `opencode` runs the OpenCode CLI and `pi` bypasses OpenCode completely, using Pi's authenticated providers directly. Selections are saved to the per-user `pi-orch/models.json` config and apply immediately to the parent or to newly started workers.
+
 ## Live activity dashboard
 
-While OpenCode work is running, Pi shows a widget above the editor. It refreshes about once per second and includes:
+While worker tasks are running, Pi shows a widget above the editor. It refreshes about once per second and includes:
 
 - running worker and workflow counts
-- each worker ID, full model ID, elapsed time, mode, task name, and latest OpenCode activity
+- each worker ID, backend, full model ID, elapsed time, mode, task name, and latest activity
 - each workflow ID, elapsed time, and current phase
 
 The widget disappears automatically when no OpenCode work remains. The compact footer status and `/opencode-status` command remain available.
 
-## Worker models
+## Worker backends and models
 
-Routine exploration and implementation use `opencode-go/glm-5.2` (default or `profile: "glm"`). Use `profile: "kimi_k3"` for independent read-only wide-context review; it resolves to `opencode-go/kimi-k3`. An explicit `model` always takes precedence over `profile`.
+Each worker route can use either the OpenCode backend or the Pi backend. The Pi backend launches a bounded, non-interactive Pi worker with the selected Pi provider/model and never starts OpenCode. Read-only Pi workers receive only read/search tools; write workers receive the editing toolset.
+
+The default routes remain `opencode-go/glm-5.2` and `opencode-go/kimi-k3`. The profile names are compatibility aliases and do not force those model families.
 
 Override either profile when needed:
 

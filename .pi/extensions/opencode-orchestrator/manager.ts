@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
 	InternalTaskSpec,
 	ModelProfile,
@@ -10,6 +12,7 @@ import {
 	boundedAppend,
 	buildWorkerPrompt,
 	configuredModelProfiles,
+	decodeWorkerModel,
 	DEFAULT_MODEL,
 	findScopeConflict,
 	MAX_ACTIVITY_ITEMS,
@@ -36,6 +39,16 @@ interface ManagerOptions {
 	binaryArgs?: string[];
 	model?: string;
 	timeoutMs?: number;
+	piBinary?: string;
+	piBinaryArgs?: string[];
+}
+
+function defaultPiCommand() {
+	const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	return {
+		binary: process.execPath,
+		args: [path.join(path.dirname(packageEntry), "cli.js")],
+	};
 }
 
 function configuredTimeout(value?: number) {
@@ -90,9 +103,11 @@ export class OpenCodeTaskManager {
 	private readonly onChange?: () => void;
 	private readonly binary: string;
 	private readonly binaryArgs: string[];
-	private readonly defaultModel: string;
-	private readonly modelProfiles: Record<ModelProfile, string>;
+	private defaultModel: string;
+	private modelProfiles: Record<ModelProfile, string>;
 	private readonly timeoutMs: number;
+	private readonly piBinary: string;
+	private readonly piBinaryArgs: string[];
 
 	constructor(options: ManagerOptions = {}) {
 		this.onChange = options.onChange;
@@ -101,16 +116,28 @@ export class OpenCodeTaskManager {
 		this.defaultModel = options.model ?? process.env.PI_OPENCODE_MODEL ?? DEFAULT_MODEL;
 		this.modelProfiles = configuredModelProfiles();
 		this.timeoutMs = configuredTimeout(options.timeoutMs);
+		const piCommand = defaultPiCommand();
+		this.piBinary = options.piBinary ?? piCommand.binary;
+		this.piBinaryArgs = options.piBinaryArgs ?? piCommand.args;
 	}
 
 	configuration() {
 		return {
 			binary: this.binary,
+			piBinary: this.piBinary,
 			model: this.defaultModel,
 			profiles: { ...this.modelProfiles },
 			timeoutMs: this.timeoutMs,
 			maxRunning: MAX_RUNNING,
 		};
+	}
+
+	setModelSetting(target: "worker" | ModelProfile, model: string) {
+		const value = model.trim();
+		if (!value) throw new Error("OpenCode model must not be empty.");
+		if (target === "worker") this.defaultModel = value;
+		else this.modelProfiles[target] = value;
+		this.notify();
 	}
 
 	private notify() {
@@ -153,7 +180,7 @@ export class OpenCodeTaskManager {
 		if (blockReason) throw new Error(blockReason);
 		const scopes = normalizeScopes(cwd, spec.relevantPaths);
 		const id = `oc-${++this.counter}`;
-		const model = resolveModel(spec, this.defaultModel, this.modelProfiles);
+		const selection = decodeWorkerModel(resolveModel(spec, this.defaultModel, this.modelProfiles));
 		const snapshot: TaskSnapshot = {
 			id,
 			name: spec.name.trim().slice(0, 160) || id,
@@ -162,7 +189,8 @@ export class OpenCodeTaskManager {
 			objective: spec.objective,
 			relevantPaths: [...spec.relevantPaths],
 			scopes,
-			model,
+			model: selection.model,
+			backend: selection.backend,
 			workflowId: spec.workflowId,
 			createdAt: Date.now(),
 			output: "",
@@ -225,15 +253,33 @@ export class OpenCodeTaskManager {
 
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
-		const child = spawn(this.binary, [
-			...this.binaryArgs,
-			"run",
-			"--format",
-			"json",
-			"--model",
-			entry.snapshot.model,
-			prompt,
-		], {
+		const isPiWorker = entry.snapshot.backend === "pi";
+		const binary = isPiWorker ? this.piBinary : this.binary;
+		const args = isPiWorker
+			? [
+				...this.piBinaryArgs,
+				"--approve",
+				"--no-session",
+				"--no-extensions",
+				"--print",
+				"--model",
+				entry.snapshot.model,
+				"--thinking",
+				"high",
+				"--tools",
+				spec.mode === "read_only" ? "read,grep,find,ls" : "read,grep,find,ls,bash,edit,write",
+				prompt,
+			]
+			: [
+				...this.binaryArgs,
+				"run",
+				"--format",
+				"json",
+				"--model",
+				entry.snapshot.model,
+				prompt,
+			];
+		const child = spawn(binary, args, {
 			cwd,
 			env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
 			detached: os.platform() !== "win32",
@@ -244,7 +290,7 @@ export class OpenCodeTaskManager {
 
 		const timeout = setTimeout(() => {
 			entry.snapshot.timedOut = true;
-			entry.snapshot.error = `OpenCode timed out after ${this.timeoutMs} ms.`;
+			entry.snapshot.error = `${isPiWorker ? "Pi" : "OpenCode"} worker timed out after ${this.timeoutMs} ms.`;
 			killProcessTree(child, "SIGTERM");
 			setTimeout(() => killProcessTree(child, "SIGKILL"), 5_000).unref();
 		}, this.timeoutMs);
@@ -258,7 +304,7 @@ export class OpenCodeTaskManager {
 			this.notify();
 		});
 		child.on("error", (error) => {
-			entry.snapshot.error = `Failed to start OpenCode: ${processError(error)}`;
+			entry.snapshot.error = `Failed to start ${isPiWorker ? "Pi" : "OpenCode"} worker: ${processError(error)}`;
 		});
 		child.on("close", (code) => {
 			clearTimeout(timeout);
@@ -269,7 +315,7 @@ export class OpenCodeTaskManager {
 			if (entry.cancelRequested) entry.snapshot.status = "cancelled";
 			else if (entry.snapshot.timedOut || code !== 0 || entry.snapshot.error) {
 				entry.snapshot.status = "error";
-				entry.snapshot.error ??= `OpenCode exited with code ${code ?? 1}.`;
+				entry.snapshot.error ??= `${isPiWorker ? "Pi" : "OpenCode"} worker exited with code ${code ?? 1}.`;
 			} else entry.snapshot.status = "done";
 			entry.child = undefined;
 			for (const listener of entry.settleListeners) listener();
@@ -299,6 +345,10 @@ export class OpenCodeTaskManager {
 			const appended = boundedAppend(entry.snapshot.output, `${line}\n`);
 			entry.snapshot.output = appended.text;
 			entry.snapshot.truncated ||= appended.truncated;
+			if (entry.snapshot.backend === "pi") {
+				entry.snapshot.activity.push("Pi response streaming");
+				if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
+			}
 			return;
 		}
 		const part = event.part && typeof event.part === "object"

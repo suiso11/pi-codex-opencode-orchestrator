@@ -89,3 +89,40 @@ test("manager enforces the global four-worker cap", async () => {
 		await fake.cleanup();
 	}
 });
+
+test("manager applies model changes to future tasks", async () => {
+	const manager = new OpenCodeTaskManager();
+	try {
+		manager.setModelSetting("worker", "example/default");
+		manager.setModelSetting("glm", "example/glm");
+		manager.setModelSetting("kimi_k3", "example/kimi");
+		assert.deepEqual(manager.configuration().model, "example/default");
+		assert.deepEqual(manager.configuration().profiles, {
+			glm: "example/glm",
+			kimi_k3: "example/kimi",
+		});
+	} finally {
+		await manager.dispose();
+	}
+});
+
+test("manager can bypass OpenCode and run a Pi-backed worker", async () => {
+	const fake = await fakeOpenCode();
+	const manager = new OpenCodeTaskManager({
+		piBinary: fake.binary,
+		piBinaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		manager.setModelSetting("worker", "pi::anthropic/example-claude");
+		const started = manager.spawn(spec("pi-worker", "read_only", ["src"]), process.cwd());
+		assert.equal(started.backend, "pi");
+		assert.equal(started.model, "anthropic/example-claude");
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.match(settled.output, /FAKE_OK/);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
