@@ -93,7 +93,11 @@ PI_CODEX_MODEL=openai-codex/gpt-5.6-sol
 PI_OPENCODE_MODEL=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3
+PI_CODEX_THINKING=medium
+PI_OPENCODE_THINKING=medium
 ```
+
+親・workerともに思考レベルの既定は `medium`。タスクごとに `low|medium|high` を指定できる。最終承認などリスクの高い判断では `high` を選ぶこと。`medium` は常に十分という意味ではない。
 
 Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対話的に選べる。
 
@@ -111,7 +115,8 @@ Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対
 OpenCode workerまたはworkflowの実行中は、Piの入力欄上にダッシュボードが常時表示される。
 約1秒ごとに更新され、workerごとのID、モデル、経過時間、権限モード、タスク名、最新activityと、
 workflowの現在phaseを確認できる。全処理が終了すると自動で消える。設定と実行数の確認には
-`/opencode-status`も利用できる。
+`/opencode-status`も利用できる。実際の親・workerトークン使用量とhandoff重複は `/opencode-usage` で、
+コンパクト結果で足りないときの生出力は `opencode_output` で取得できる。
 
 ## 共有してよい設定
 
@@ -129,9 +134,11 @@ Piのグローバル設定例:
 {
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-sol",
-  "defaultThinkingLevel": "high"
+  "defaultThinkingLevel": "medium"
 }
 ```
+
+ランチャーは `PI_CODEX_THINKING`（既定 `medium`）で親の思考レベルを上書きする。最終承認などでは `high` を使うこと。
 
 プロジェクト固有のビルド、テスト、サービス再起動、秘密情報の扱いは各プロジェクトの `AGENTS.md` に置く。全プロジェクト共通の短い個人ルールだけをグローバルな `AGENTS.md` に置く。
 

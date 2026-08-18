@@ -25,6 +25,83 @@ setTimeout(() => {
 	};
 }
 
+async function fakeEchoArgs() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-echo-"));
+	const script = path.join(dir, "echo-args.mjs");
+	await writeFile(
+		script,
+		`
+const args = process.argv.slice(2);
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: JSON.stringify(args) } }) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+async function fakeOpenCodeWithUsage() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-usage-"));
+	const script = path.join(dir, "usage.mjs");
+	await writeFile(
+		script,
+		`
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: "done" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop", tokens: { total: 250, input: 100, output: 50, reasoning: 70, cache: { write: 20, read: 10 } }, cost: 0.003 } }) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+async function fakePiMessageEnd() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-pi-msgend-"));
+	const script = path.join(dir, "msgend.mjs");
+	await writeFile(
+		script,
+		`
+const report = { summary: "pi done", files: ["x.ts"], findings: ["ok"], unresolved: [] };
+process.stdout.write(JSON.stringify({
+	type: "message_end",
+	message: {
+		role: "assistant",
+		content: [{ type: "text", text: JSON.stringify(report) }],
+		usage: { input: 300, output: 120, cacheRead: 40, cacheWrite: 20, reasoning: 60, totalTokens: 420, cost: { total: 0.02 } },
+	},
+}) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+async function fakeOpenCodeWithReport() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-report-"));
+	const script = path.join(dir, "report.mjs");
+	await writeFile(
+		script,
+		`
+const fence = [96, 96, 96].map((c) => String.fromCharCode(c)).join("");
+const report = { summary: "done", files: ["a.ts"], findings: ["ok"], unresolved: [] };
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: "Working on it..." } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: fence + "json\\n" + JSON.stringify(report) + "\\n" + fence } }) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
 function spec(name: string, mode: "read_only" | "write", relevantPaths: string[], objective = name) {
 	return {
 		name,
@@ -121,6 +198,186 @@ test("manager can bypass OpenCode and run a Pi-backed worker", async () => {
 		const [settled] = await manager.wait([started.id]);
 		assert.equal(settled.status, "done");
 		assert.match(settled.output, /FAKE_OK/);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager applies default medium thinking to OpenCode --variant", async () => {
+	const fake = await fakeEchoArgs();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		assert.equal(manager.configuration().thinkingLevel, "medium");
+		const started = manager.spawn(spec("echo", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const args = JSON.parse(settled.output.trim());
+		const variantIdx = args.indexOf("--variant");
+		assert.ok(variantIdx >= 0, "--variant not found in args");
+		assert.equal(args[variantIdx + 1], "medium");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager applies spec thinking override to Pi --thinking", async () => {
+	const fake = await fakeEchoArgs();
+	const manager = new OpenCodeTaskManager({
+		piBinary: fake.binary,
+		piBinaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		manager.setModelSetting("worker", "pi::anthropic/example");
+		const started = manager.spawn(
+			{ ...spec("pi-echo", "read_only", ["src"]), thinking: "low" },
+			process.cwd(),
+		);
+		assert.equal(started.backend, "pi");
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const args = JSON.parse(settled.output.trim());
+		const thinkingIdx = args.indexOf("--thinking");
+		assert.ok(thinkingIdx >= 0, "--thinking not found in args");
+		assert.equal(args[thinkingIdx + 1], "low");
+		const modeIdx = args.indexOf("--mode");
+		assert.ok(modeIdx >= 0, "--mode not found in Pi args");
+		assert.equal(args[modeIdx + 1], "json");
+		assert.equal(args.indexOf("--print"), -1, "--print must no longer be used");
+		assert.ok(args.includes("--no-session"), "--no-session preserved");
+		assert.ok(args.includes("--no-extensions"), "--no-extensions preserved");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager reads PI_OPENCODE_THINKING for default thinking level", async () => {
+	const fake = await fakeEchoArgs();
+	const original = process.env.PI_OPENCODE_THINKING;
+	process.env.PI_OPENCODE_THINKING = "high";
+	try {
+		const manager = new OpenCodeTaskManager({
+			binary: fake.binary,
+			binaryArgs: fake.binaryArgs,
+			timeoutMs: 2_000,
+		});
+		try {
+			assert.equal(manager.configuration().thinkingLevel, "high");
+			const started = manager.spawn(spec("echo", "read_only", ["src"]), process.cwd());
+			const [settled] = await manager.wait([started.id]);
+			const args = JSON.parse(settled.output.trim());
+			assert.equal(args[args.indexOf("--variant") + 1], "high");
+		} finally {
+			await manager.dispose();
+		}
+	} finally {
+		if (original === undefined) delete process.env.PI_OPENCODE_THINKING;
+		else process.env.PI_OPENCODE_THINKING = original;
+		await fake.cleanup();
+	}
+});
+
+test("manager extracts token usage from OpenCode step-finish events", async () => {
+	const fake = await fakeOpenCodeWithUsage();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		const started = manager.spawn(spec("usage", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.deepEqual(settled.usage, {
+			inputTokens: 100,
+			outputTokens: 50,
+			totalTokens: 250,
+			reasoningTokens: 70,
+			cacheReadTokens: 10,
+			cacheWriteTokens: 20,
+			cost: 0.003,
+		});
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager parses structured worker report at settlement", async () => {
+	const fake = await fakeOpenCodeWithReport();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		const started = manager.spawn(spec("report", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.ok(settled.report, "report should be set at settlement");
+		assert.equal(settled.report?.summary, "done");
+		assert.deepEqual(settled.report?.files, ["a.ts"]);
+		assert.deepEqual(settled.report?.findings, ["ok"]);
+		assert.deepEqual(settled.report?.unresolved, []);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager provides bounded fallback report when output is not JSON", async () => {
+	const fake = await fakeOpenCode();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		const started = manager.spawn(spec("plain", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.ok(settled.report, "fallback report should still be set");
+		assert.ok(settled.report!.unresolved.length > 0);
+		assert.ok(settled.report!.summary.includes("fallback"));
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager captures Pi JSON message_end report output and usage", async () => {
+	const fake = await fakePiMessageEnd();
+	const manager = new OpenCodeTaskManager({
+		piBinary: fake.binary,
+		piBinaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		manager.setModelSetting("worker", "pi::anthropic/example");
+		const started = manager.spawn(spec("pi-msgend", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.match(settled.output, /pi done/);
+		assert.deepEqual(settled.usage, {
+			inputTokens: 300,
+			outputTokens: 120,
+			totalTokens: 420,
+			reasoningTokens: 60,
+			cacheReadTokens: 40,
+			cacheWriteTokens: 20,
+			cost: 0.02,
+		});
+		assert.equal(settled.report?.summary, "pi done");
+		assert.deepEqual(settled.report?.files, ["x.ts"]);
+		assert.deepEqual(settled.report?.findings, ["ok"]);
+		assert.deepEqual(settled.report?.unresolved, []);
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();

@@ -6,6 +6,12 @@ $model = if ($env:PI_CODEX_MODEL) {
     "openai-codex/gpt-5.6-sol"
 }
 
+$thinking = if ($env:PI_CODEX_THINKING) {
+    $env:PI_CODEX_THINKING
+} else {
+    "medium"
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $extension = Join-Path (Split-Path -Parent $scriptDir) ".pi\extensions\opencode-orchestrator\index.ts"
 if (-not (Test-Path -LiteralPath $extension)) {
@@ -40,6 +46,7 @@ $tools = @(
     "opencode_check",
     "opencode_cancel",
     "opencode_list",
+    "opencode_output",
     "opencode_workflow",
     "opencode_workflow_wait",
     "opencode_workflow_check",
@@ -51,7 +58,7 @@ $tools = @(
     --approve `
     --extension $extension `
     --model $model `
-    --thinking high `
+    --thinking $thinking `
     --tools $tools `
     @args
 

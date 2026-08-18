@@ -6,10 +6,18 @@ import type {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { OpenCodeTaskManager } from "./manager.ts";
-import type { ModelProfile, TaskMode, TaskSpec, WorkflowPhaseSpec } from "./types.ts";
+import type {
+	ModelProfile,
+	TaskMode,
+	TaskSnapshot,
+	TaskSpec,
+	ThinkingLevel,
+	WorkflowPhaseSpec,
+	WorkflowSnapshot,
+} from "./types.ts";
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
-import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard } from "./dashboard.ts";
+import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard, sumWorkerUsage, type DashboardUsage } from "./dashboard.ts";
 import { registerModelCommand } from "./model-command.ts";
 
 const ModeSchema = StringEnum(["read_only", "write"] as const, {
@@ -18,6 +26,10 @@ const ModeSchema = StringEnum(["read_only", "write"] as const, {
 
 const ProfileSchema = StringEnum(["glm", "kimi_k3"] as const, {
 	description: "Named worker route. Each route may use either the OpenCode or Pi backend.",
+});
+
+const ThinkingSchema = StringEnum(["low", "medium", "high"] as const, {
+	description: "Per-task thinking level override. Defaults to the configured worker thinking level.",
 });
 
 const TaskSchema = Type.Object({
@@ -36,6 +48,7 @@ const TaskSchema = Type.Object({
 	expected_output: Type.String({ description: "Evidence/result the worker must return.", minLength: 1 }),
 	model: Type.Optional(Type.String({ description: "Optional worker model override. Prefix with pi:: to bypass OpenCode and run through Pi." })),
 	profile: Type.Optional(ProfileSchema),
+	thinking: Type.Optional(ThinkingSchema),
 });
 
 const IdsSchema = Type.Object({
@@ -69,6 +82,7 @@ type RawTask = {
 	expected_output: string;
 	model?: string;
 	profile?: ModelProfile;
+	thinking?: ThinkingLevel;
 };
 
 function toTaskSpec(raw: RawTask): TaskSpec {
@@ -81,7 +95,69 @@ function toTaskSpec(raw: RawTask): TaskSpec {
 		expectedOutput: raw.expected_output,
 		model: raw.model,
 		profile: raw.profile,
+		thinking: raw.thinking,
 	};
+}
+
+const BATCH_DELIVERY_MAX_CHARS = 8_000;
+
+export function formatBatchDeliverable(
+	readyTasks: TaskSnapshot[],
+	readyWorkflows: WorkflowSnapshot[],
+	workflowText: (workflow: WorkflowSnapshot) => string,
+): string {
+	const sections: string[] = [];
+	if (readyTasks.length > 0) {
+		const taskBudget = readyWorkflows.length > 0
+			? Math.floor(BATCH_DELIVERY_MAX_CHARS / 2)
+			: BATCH_DELIVERY_MAX_CHARS;
+		sections.push(`[Background worker task(s) settled]\n${taskResultsText(readyTasks, taskBudget)}`);
+	}
+	if (readyWorkflows.length > 0) {
+		const wfText = readyWorkflows.map((workflow) => workflowText(workflow)).join("\n\n---\n\n");
+		sections.push(`[Background worker workflow(s) settled]\n${wfText}`);
+	}
+	const combined = sections.join("\n\n---\n\n");
+	if (combined.length <= BATCH_DELIVERY_MAX_CHARS) return combined;
+	const marker = "\n[Batch delivery truncated.]";
+	const budget = BATCH_DELIVERY_MAX_CHARS - marker.length;
+	if (budget <= 0) return combined.slice(0, BATCH_DELIVERY_MAX_CHARS);
+	return `${combined.slice(0, budget)}${marker}`;
+}
+
+export function boundParentText(value: string, maxChars = BATCH_DELIVERY_MAX_CHARS) {
+	if (value.length <= maxChars) return value;
+	if (maxChars <= 0) return "";
+	const marker = "\n[Parent-facing output truncated.]";
+	if (marker.length >= maxChars) return value.slice(0, maxChars);
+	return `${value.slice(0, maxChars - marker.length)}${marker}`;
+}
+
+export function shouldDelayBackgroundDelivery(tasks: TaskSnapshot[], workflows: WorkflowSnapshot[]) {
+	return tasks.some((task) => task.status === "running" && !task.workflowId) ||
+		workflows.some((workflow) => workflow.status === "running");
+}
+
+export function formatRawOutputSlice(output: string, requestedOffset?: number, requestedLimit = 8_000) {
+	const total = output.length;
+	const limit = Math.min(Math.max(1, requestedLimit), 12_000);
+	const defaultOffset = Math.max(0, total - 8_000);
+	const offset = Math.min(Math.max(0, requestedOffset ?? defaultOffset), total);
+	let slice = output.slice(offset, offset + limit);
+	while (slice.length > 0) {
+		const end = offset + slice.length;
+		const moreFollows = end < total;
+		const header = `[Raw output ${offset}:${end} of ${total}]${moreFollows ? " (more follows)" : ""}`;
+		if (header.length + 1 + slice.length <= limit) break;
+		const overflow = header.length + 1 + slice.length - limit;
+		slice = slice.slice(0, Math.max(0, slice.length - Math.max(1, overflow)));
+	}
+	const end = offset + slice.length;
+	const moreFollows = end < total;
+	const header = `[Raw output ${offset}:${end} of ${total}]${moreFollows ? " (more follows)" : ""}`;
+	const text = `${header}
+${slice || "(empty)"}`.slice(0, limit);
+	return { text, offset, end, total, limit, moreFollows };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -93,11 +169,30 @@ export default function (pi: ExtensionAPI) {
 	let deliveryScheduled = false;
 	let dashboardTimer: ReturnType<typeof setInterval> | undefined;
 
+	const parentUsage = {
+		inputTokens: 0,
+		outputTokens: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		reasoning: 0,
+		totalTokens: 0,
+		cost: 0,
+	};
+
+	const dashboardUsage = (): DashboardUsage => ({
+		parent: {
+			inputTokens: parentUsage.inputTokens,
+			outputTokens: parentUsage.outputTokens,
+			totalTokens: parentUsage.totalTokens,
+			cost: parentUsage.cost,
+		},
+	});
+
 	const updateDashboard = () => {
 		if (!ui) return;
 		ui.setWidget(
 			DASHBOARD_KEY,
-			formatDashboard(tasks.list(), workflows.list(), Date.now()),
+			formatDashboard(tasks.list(), workflows.list(), Date.now(), dashboardUsage()),
 			{ placement: "aboveEditor" },
 		);
 	};
@@ -135,28 +230,25 @@ export default function (pi: ExtensionAPI) {
 	workflows = new OpenCodeWorkflowManager(tasks, { onChange: updateStatus });
 
 	deliverSettled = () => {
-		for (const task of tasks.drainDeliverable()) {
-			pi.sendMessage(
-				{
-					customType: "opencode-task-result",
-					content: `[Background worker task settled]\n\n${taskResultText(task)}`,
-					display: true,
-					details: { id: task.id, status: task.status, mode: task.mode },
+		const taskList = tasks.list();
+		const workflowList = workflows.list();
+		const hasRunningBackground = shouldDelayBackgroundDelivery(taskList, workflowList);
+		const readyTasks = hasRunningBackground ? [] : tasks.drainDeliverable();
+		const readyWorkflows = hasRunningBackground ? [] : workflows.drainDeliverable();
+		if (readyTasks.length === 0 && readyWorkflows.length === 0) return;
+		const content = formatBatchDeliverable(readyTasks, readyWorkflows, (workflow) => workflows.resultText(workflow));
+		pi.sendMessage(
+			{
+				customType: "opencode-batch-result",
+				content,
+				display: true,
+				details: {
+					tasks: readyTasks.map((task) => ({ id: task.id, status: task.status, mode: task.mode })),
+					workflows: readyWorkflows.map((workflow) => ({ id: workflow.id, status: workflow.status })),
 				},
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		}
-		for (const workflow of workflows.drainDeliverable()) {
-			pi.sendMessage(
-				{
-					customType: "opencode-workflow-result",
-					content: `[Background worker workflow settled]\n\n${workflows.resultText(workflow)}`,
-					display: true,
-					details: { id: workflow.id, status: workflow.status },
-				},
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		}
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -165,6 +257,19 @@ export default function (pi: ExtensionAPI) {
 		updateStatus();
 	});
 	pi.on("agent_settled", deliverSettled);
+	pi.on("message_end", (event) => {
+		const message = event.message;
+		if (!message || message.role !== "assistant") return;
+		const usage = message.usage;
+		if (!usage) return;
+		parentUsage.inputTokens += usage.input ?? 0;
+		parentUsage.outputTokens += usage.output ?? 0;
+		parentUsage.cacheRead += usage.cacheRead ?? 0;
+		parentUsage.cacheWrite += usage.cacheWrite ?? 0;
+		parentUsage.reasoning += usage.reasoning ?? 0;
+		parentUsage.totalTokens += usage.totalTokens ?? 0;
+		parentUsage.cost += usage.cost?.total ?? 0;
+	});
 	pi.on("session_shutdown", async () => {
 		sessionContext = undefined;
 		if (dashboardTimer) clearInterval(dashboardTimer);
@@ -184,6 +289,8 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Start a bounded worker in the background with read-only or path-scoped write access",
 		promptGuidelines: [
 			"Use opencode_spawn for independent repository exploration, mechanical implementation, tests, docs, or review; give each worker one objective and concrete relevant_paths.",
+			"Keep trivial one-read or tiny one-file work with the parent; do not spawn a worker for it.",
+			"Spawn independent workers together in one batch and call opencode_wait once to collect all their results.",
 			"The glm and kimi_k3 profile names are routing aliases; honor their currently configured backend and model rather than assuming a specific model family.",
 			"Keep final approval with the parent model; a delegated worker does not grant final approval.",
 			"For parallel write opencode_spawn calls, partition relevant_paths so no file or containing directory overlaps; the extension rejects conflicting scopes.",
@@ -195,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text",
-					text: `Started ${taskSummary(task)}\nScopes: ${task.relevantPaths.join(", ")}`,
+					text: boundParentText(`Started ${taskSummary(task)}\nScopes: ${task.relevantPaths.join(", ")}`),
 				}],
 				details: { id: task.id, status: task.status, mode: task.mode, scopes: task.scopes },
 			};
@@ -229,13 +336,43 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const task = tasks.get(params.id);
 			if (!task) throw new Error(`Unknown OpenCode task id: ${params.id}`);
-			const preview = task.output.slice(-4_000);
+			const preview = task.output.slice(-2_000);
 			return {
 				content: [{
 					type: "text",
-					text: `${taskSummary(task)}\nActivity:\n${task.activity.slice(-10).join("\n") || "(none)"}\n\nOutput preview:\n${preview || "(none)"}`,
+					text: boundParentText(`${taskSummary(task)}\nActivity:\n${task.activity.slice(-10).join("\n") || "(none)"}\n\nOutput preview:\n${preview || "(none)"}`),
 				}],
 				details: { id: task.id, status: task.status, activity: task.activity },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "opencode_output",
+		label: "Fetch OpenCode Worker Output",
+		description:
+			"Fetch a retained raw output slice from one OpenCode worker on demand. Use when the opencode_check preview is insufficient; this fetch is explicitly on-demand and does not wait.",
+		promptSnippet: "Fetch a retained raw output slice from an OpenCode worker on demand",
+		parameters: Type.Object({
+			id: Type.String({ description: "OpenCode task id." }),
+			offset: Type.Optional(Type.Integer({
+				description: "Character offset into retained output. Defaults to the last 8000 characters.",
+				minimum: 0,
+			})),
+			limit: Type.Optional(Type.Integer({
+				description: "Maximum characters to return.",
+				minimum: 1,
+				maximum: 12_000,
+			})),
+		}),
+		async execute(_toolCallId, params) {
+			const task = tasks.get(params.id);
+			if (!task) throw new Error(`Unknown OpenCode task id: ${params.id}`);
+			const result = formatRawOutputSlice(task.output, params.offset, params.limit);
+			const { text, ...details } = result;
+			return {
+				content: [{ type: "text", text }],
+				details: { id: task.id, status: task.status, ...details },
 			};
 		},
 	});
@@ -262,7 +399,7 @@ export default function (pi: ExtensionAPI) {
 		async execute() {
 			const all = tasks.list();
 			return {
-				content: [{ type: "text", text: all.length ? all.map(taskSummary).join("\n") : "No OpenCode workers." }],
+				content: [{ type: "text", text: boundParentText(all.length ? all.map(taskSummary).join("\n") : "No OpenCode workers.") }],
 				details: { tasks: all.map((task) => ({ id: task.id, status: task.status, mode: task.mode })) },
 			};
 		},
@@ -382,9 +519,9 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text",
-					text: all.length
+					text: boundParentText(all.length
 						? all.map((workflow) => `${workflow.id} [${workflow.status}] "${workflow.name}" phase ${workflow.currentPhase === undefined ? "-" : workflow.currentPhase + 1}/${workflow.phases.length}`).join("\n")
-						: "No OpenCode workflows.",
+						: "No OpenCode workflows."),
 				}],
 				details: { workflows: all.map((workflow) => ({ id: workflow.id, status: workflow.status })) },
 			};
@@ -399,10 +536,37 @@ export default function (pi: ExtensionAPI) {
 				[
 					`Default worker route: ${config.model}`,
 					`Profiles: ${Object.entries(config.profiles).map(([name, model]) => `${name}=${model}`).join(", ")}`,
+					`Worker thinking: ${config.thinkingLevel}`,
 					`Binary: ${config.binary}`,
 					`Timeout: ${config.timeoutMs} ms`,
 					`Running: ${tasks.runningCount()}/${config.maxRunning}`,
 					`Workflows: ${workflows.list().filter((item) => item.status === "running").length} running`,
+				].join("\n"),
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("opencode-usage", {
+		description: "Report parent and worker token usage plus workflow handoff duplication",
+		handler: async (_args, ctx) => {
+			const worker = sumWorkerUsage(tasks.list());
+			const workflowList = workflows.list();
+			let handoffCreated = 0;
+			let handoffInjected = 0;
+			for (const workflow of workflowList) {
+				handoffCreated += workflow.handoffCharsCreated ?? 0;
+				handoffInjected += workflow.handoffCharsInjected ?? 0;
+			}
+			const duplicationRatio = handoffInjected > 0
+				? Math.max(0, (handoffInjected - handoffCreated) / handoffInjected)
+				: 0;
+			ctx.ui.notify(
+				[
+					`Parent tokens: in ${parentUsage.inputTokens.toLocaleString()} / out ${parentUsage.outputTokens.toLocaleString()} / total ${parentUsage.totalTokens.toLocaleString()} / cost ${parentUsage.cost.toFixed(6)}`,
+					`Worker tokens: in ${worker.inputTokens.toLocaleString()} / out ${worker.outputTokens.toLocaleString()} / total ${worker.totalTokens.toLocaleString()} / cost ${worker.cost.toFixed(6)}`,
+					`Workflow handoff: ${handoffCreated.toLocaleString()} unique chars created, ${handoffInjected.toLocaleString()} chars injected downstream (duplication ratio ${duplicationRatio.toFixed(2)})`,
+					`Totals are observed usage; no baseline comparison is available, so token savings are not claimed.`,
 				].join("\n"),
 				"info",
 			);

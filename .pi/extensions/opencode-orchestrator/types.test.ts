@@ -3,16 +3,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
-	decodeWorkerModel,
-	encodeWorkerModel,
 	buildWorkerPrompt,
 	configuredModelProfiles,
+	configuredThinkingLevel,
+	decodeWorkerModel,
+	encodeWorkerModel,
+	extractUsageFromEvent,
 	findScopeConflict,
+	mergeUsage,
 	normalizeScopes,
+	pathForScopeComparison,
+	parseWorkerReport,
 	resolveModel,
+	resolveThinkingLevel,
 	scopeOverlaps,
+	taskResultText,
+	taskResultsText,
 	validateWorkflowPhases,
 } from "./types.ts";
+import type { TaskSnapshot } from "./types.ts";
 
 const cwd = path.join(os.tmpdir(), "pi-opencode-test-repo");
 
@@ -68,6 +77,18 @@ test("scope overlap is path-boundary aware", () => {
 	);
 });
 
+test("scope comparison is case-insensitive on Windows", () => {
+	const parent = path.join(cwd, "src");
+	const childWithDifferentCase = path.join(cwd, "SRC", "a.ts");
+	assert.equal(
+		pathForScopeComparison(childWithDifferentCase, "win32"),
+		path.resolve(childWithDifferentCase).toLowerCase(),
+	);
+	if (process.platform === "win32") {
+		assert.equal(scopeOverlaps(parent, childWithDifferentCase), true);
+	}
+});
+
 test("worker prompt distinguishes read-only and write tasks", () => {
 	const base = {
 		name: "inspect",
@@ -100,4 +121,226 @@ test("workflow rejects overlapping write scopes in the same phase", () => {
 		{ name: "edit", tasks: [write("a", ["src/a.ts"]), write("b", ["src/b.ts"])] },
 		{ name: "verify", tasks: [{ ...write("verify", ["tests"]), mode: "read_only" as const }] },
 	]));
+});
+
+test("buildWorkerPrompt requires a compact JSON report with structured fields", () => {
+	const base = {
+		name: "inspect",
+		mode: "read_only" as const,
+		objective: "Inspect code",
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "Findings",
+	};
+	const prompt = buildWorkerPrompt(base);
+	assert.match(prompt, /"summary"/);
+	assert.match(prompt, /"files"/);
+	assert.match(prompt, /"findings"/);
+	assert.match(prompt, /"unresolved"/);
+	assert.match(prompt, /2-4k characters/);
+	assert.match(prompt, /No reasoning trace/);
+});
+
+test("parseWorkerReport accepts bare JSON, fenced JSON, embedded JSON, and falls back bounded", () => {
+	const direct = parseWorkerReport(JSON.stringify({
+		summary: "ok",
+		files: ["a.ts", "b.ts"],
+		findings: ["found issue"],
+		unresolved: [],
+	}));
+	assert.equal(direct.summary, "ok");
+	assert.deepEqual(direct.files, ["a.ts", "b.ts"]);
+	assert.deepEqual(direct.findings, ["found issue"]);
+	assert.deepEqual(direct.unresolved, []);
+
+	const fenced = parseWorkerReport(
+		`Here is my report:\n\`\`\`json\n${JSON.stringify({ summary: "fenced", files: [], findings: ["x"], unresolved: ["u"] })}\n\`\`\`\nDone.`,
+	);
+	assert.equal(fenced.summary, "fenced");
+	assert.deepEqual(fenced.findings, ["x"]);
+	assert.deepEqual(fenced.unresolved, ["u"]);
+
+	const embedded = parseWorkerReport(
+		`Reasoning text here.\n${JSON.stringify({ summary: "embedded", files: ["c.ts"], findings: [], unresolved: [] })}\nMore text.`,
+	);
+	assert.equal(embedded.summary, "embedded");
+	assert.deepEqual(embedded.files, ["c.ts"]);
+
+	const fallback = parseWorkerReport("just plain text output that is not JSON at all and has no braces");
+	assert.ok(fallback.summary.includes("fallback"));
+	assert.equal(fallback.findings.length, 1);
+	assert.ok(fallback.findings[0].length <= 1_500);
+	assert.equal(fallback.unresolved.length, 1);
+	assert.ok(fallback.unresolved[0].includes("parsing failed"));
+	assert.equal(fallback.files.length, 0);
+});
+
+test("parseWorkerReport returns empty report for blank input", () => {
+	const report = parseWorkerReport("");
+	assert.equal(report.summary, "");
+	assert.deepEqual(report.files, []);
+	assert.deepEqual(report.findings, []);
+	assert.deepEqual(report.unresolved, []);
+});
+
+test("extractUsageFromEvent reads OpenCode step-finish and Pi message_end", () => {
+	const oc = extractUsageFromEvent({
+		type: "step_finish",
+		part: {
+			type: "step-finish",
+			reason: "stop",
+			tokens: {
+				total: 250,
+				input: 100,
+				output: 50,
+				reasoning: 70,
+				cache: { write: 20, read: 10 },
+			},
+			cost: 0.003,
+		},
+	});
+	assert.deepEqual(oc, {
+		inputTokens: 100,
+		outputTokens: 50,
+		totalTokens: 250,
+		reasoningTokens: 70,
+		cacheReadTokens: 10,
+		cacheWriteTokens: 20,
+		cost: 0.003,
+	});
+
+	const pi = extractUsageFromEvent({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			usage: {
+				input: 200,
+				output: 80,
+				cacheRead: 30,
+				cacheWrite: 15,
+				reasoning: 40,
+				totalTokens: 280,
+				cost: { total: 0.01 },
+			},
+		},
+	});
+	assert.equal(pi?.inputTokens, 200);
+	assert.equal(pi?.outputTokens, 80);
+	assert.equal(pi?.totalTokens, 280);
+	assert.equal(pi?.reasoningTokens, 40);
+	assert.equal(pi?.cacheReadTokens, 30);
+	assert.equal(pi?.cacheWriteTokens, 15);
+	assert.equal(pi?.cost, 0.01);
+
+	const none = extractUsageFromEvent({ type: "text", part: { type: "text", text: "hi" } });
+	assert.equal(none, undefined);
+});
+
+test("mergeUsage accumulates tokens, costs, cache, and reasoning across events", () => {
+	const merged = mergeUsage(
+		{ inputTokens: 10, cost: 0.01, cacheReadTokens: 5, reasoningTokens: 2 },
+		{ inputTokens: 5, outputTokens: 3, cost: 0.02, cacheReadTokens: 7, cacheWriteTokens: 4, reasoningTokens: 1 },
+	);
+	assert.equal(merged.inputTokens, 15);
+	assert.equal(merged.outputTokens, 3);
+	assert.equal(merged.cost, 0.03);
+	assert.equal(merged.cacheReadTokens, 12);
+	assert.equal(merged.cacheWriteTokens, 4);
+	assert.equal(merged.reasoningTokens, 3);
+	assert.equal(merged.totalTokens, undefined);
+});
+
+test("configuredThinkingLevel reads PI_OPENCODE_THINKING and defaults to medium", () => {
+	assert.equal(configuredThinkingLevel({}), "medium");
+	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "high" }), "high");
+	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "LOW" }), "low");
+	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "bogus" }), "medium");
+});
+
+test("resolveThinkingLevel prefers spec over fallback", () => {
+	assert.equal(resolveThinkingLevel({ thinking: "high" }, "medium"), "high");
+	assert.equal(resolveThinkingLevel({}, "low"), "low");
+});
+
+function fakeSnapshot(output: string, report?: TaskSnapshot["report"]): TaskSnapshot {
+	return {
+		id: "oc-test",
+		name: "test",
+		mode: "read_only",
+		status: "done",
+		objective: "o",
+		relevantPaths: ["src"],
+		scopes: [],
+		model: "m",
+		backend: "opencode",
+		createdAt: 0,
+		settledAt: 1,
+		output,
+		stderr: "",
+		activity: [],
+		timedOut: false,
+		truncated: false,
+		report,
+	};
+}
+
+test("taskResultText and taskResultsText default to 8000 character budget", () => {
+	const task = fakeSnapshot("x".repeat(20_000));
+	const single = taskResultText(task);
+	assert.ok(single.length <= 8_000, `single len=${single.length}`);
+	const multi = taskResultsText([task]);
+	assert.ok(multi.length <= 8_000, `multi len=${multi.length}`);
+});
+
+test("taskResultText includes observed task usage within the compact result", () => {
+	const task = fakeSnapshot("", { summary: "done", files: [], findings: [], unresolved: [] });
+	task.usage = {
+		inputTokens: 9_693,
+		outputTokens: 3,
+		totalTokens: 9_772,
+		cacheReadTokens: 76,
+		reasoningTokens: 0,
+		cost: 0.01360316,
+	};
+	const text = taskResultText(task);
+	assert.match(text, /Usage: in 9,693 · out 3 · total 9,772/);
+	assert.match(text, /cache read 76/);
+	assert.match(text, /cost 0\.013603/);
+	assert.ok(text.length <= 8_000);
+});
+
+test("taskResultText prefers structured report over raw output", () => {
+	const task = fakeSnapshot("raw output that should not appear", {
+		summary: "compact summary",
+		files: ["a.ts"],
+		findings: ["finding one"],
+		unresolved: ["blocker"],
+	});
+	const text = taskResultText(task);
+	assert.match(text, /compact summary/);
+	assert.match(text, /a\.ts/);
+	assert.match(text, /finding one/);
+	assert.match(text, /blocker/);
+	assert.doesNotMatch(text, /raw output that should not appear/);
+});
+
+test("taskResultText falls back to bounded raw output when no report", () => {
+	const task = fakeSnapshot("short raw output");
+	const text = taskResultText(task);
+	assert.match(text, /short raw output/);
+});
+
+test("taskResultText and taskResultsText never exceed requested maxChars, including very small budgets", () => {
+	const task = fakeSnapshot("x".repeat(20_000));
+	for (const budget of [0, 1, 5, 24, 100, 1_000, 8_000]) {
+		const single = taskResultText(task, budget);
+		assert.ok(single.length <= budget, `single budget=${budget} len=${single.length}`);
+	}
+	for (const budget of [0, 1, 10, 50, 500, 8_000]) {
+		const multi = taskResultsText([task, task, task], budget);
+		assert.ok(multi.length <= budget, `multi budget=${budget} len=${multi.length}`);
+	}
+	const empty = taskResultsText([], 3);
+	assert.ok(empty.length <= 3, `empty len=${empty.length}`);
 });
