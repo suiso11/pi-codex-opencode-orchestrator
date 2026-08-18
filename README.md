@@ -6,15 +6,20 @@ It adds background task control, safe parallel scheduling for declared file scop
 
 ## Features
 
-- `opencode_spawn`, `opencode_wait`, `opencode_check`, `opencode_cancel`, and `opencode_list`
+- `opencode_spawn`, `opencode_wait`, `opencode_check`, `opencode_cancel`, `opencode_list`, and `opencode_output`
 - Global limit of four running OpenCode workers
 - Overlapping read-only tasks can run concurrently
 - Write tasks can run concurrently only when their declared concrete paths do not overlap
 - Two-or-more-phase workflows for genuinely dependent work
 - Bounded handoff of previous-phase results to the next phase
-- Background result delivery through Pi follow-up messages
+- Background result delivery through Pi follow-up messages, batched into one follow-up after all currently running background tasks and workflows settle
+- Structured worker reports with `summary`, `files`, `findings`, and `unresolved` fields
 - Timeout handling, SIGTERM/SIGKILL cleanup, and bounded output capture
+- Up to 120k characters of raw output retained per worker; normal parent delivery capped at 8k; workflow handoff compact JSON capped at 4k
+- `opencode_output` escape hatch to fetch a retained raw output slice on demand when the compact preview is insufficient
+- `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication, with no savings claim absent a baseline
 - Default worker model: `opencode-go/glm-5.2`
+- Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides
 - Interactive `/orch-model` command for persistent parent and worker model changes
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
 
@@ -68,7 +73,12 @@ Other settings:
 
 - `PI_OPENCODE_BIN`: OpenCode executable, default `opencode`
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
+- `PI_CODEX_THINKING`: parent thinking level, default `medium`; set `high` for final risky approval or complex planning
+- `PI_OPENCODE_THINKING`: default worker thinking level, default `medium`; each task accepts a per-task `thinking` of `low|medium|high`
 - `/opencode-status`: show the current worker configuration inside Pi
+- `/opencode-usage`: report actual parent and worker token usage plus workflow handoff duplication
+
+Medium is the cost-aware default for both parent and workers, not a guarantee of sufficiency. Ambiguous, risky, or final-approval work should opt into `high` (via `PI_CODEX_THINKING=high` for the parent, or a per-task `thinking: high` for a dedicated review worker).
 
 Change models interactively inside Pi:
 
@@ -143,6 +153,27 @@ Tasks may select the `glm` or `kimi_k3` profile. Direct `model` overrides remain
 - `opencode_workflow`: requires at least two sequential phases. Tasks inside one phase fan out under the same global four-worker cap.
 
 Path enforcement is a scheduler and prompt-level guard, not an operating-system sandbox. The parent Codex agent must still inspect the final diff and run relevant tests.
+
+## Routing and token-aware delivery
+
+### When to delegate vs. stay on the parent
+
+- Trivial one-read or tiny one-file work stays on the parent. Do not spawn a worker for it.
+- Bounded, mechanical work (scoped implementation, test additions, docs updates) delegates to a worker.
+- Broad independent research parallelizes across multiple `opencode_spawn` workers (up to four).
+- Ambiguous, risky, or final-review work stays on the parent. Use `PI_CODEX_THINKING=high` (or a per-task `thinking: high` for a dedicated review worker) for these; `medium` is the cost-aware default, not a guarantee of sufficiency.
+
+### Compact results and raw output
+
+Each worker returns a structured report with `summary`, `files`, `findings`, and `unresolved` fields, targeting roughly 2–4k characters. The extension retains up to 120k characters of raw worker output, but normal delivery to the parent is capped at 8k characters, and workflow phase handoffs pass a compact JSON blob capped at 4k characters. When the compact preview is insufficient, call `opencode_output` with an offset/limit to fetch a retained raw slice on demand.
+
+### Batched background delivery
+
+Background completions are not delivered one-by-one. When the parent is idle and no background tasks or workflows remain running, settled workers and workflows are batched into a single follow-up message (capped at 8k). This avoids many small follow-ups interrupting the parent.
+
+### Usage reporting
+
+`/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication (unique chars created vs. chars injected downstream, with a duplication ratio). Totals are observed usage only; no baseline comparison is available, so token savings are not claimed.
 
 ## Development
 

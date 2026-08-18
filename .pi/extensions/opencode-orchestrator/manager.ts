@@ -7,19 +7,25 @@ import type {
 	ModelProfile,
 	TaskSnapshot,
 	TaskSpec,
+	ThinkingLevel,
 } from "./types.ts";
 import {
 	boundedAppend,
 	buildWorkerPrompt,
 	configuredModelProfiles,
+	configuredThinkingLevel,
 	decodeWorkerModel,
 	DEFAULT_MODEL,
+	extractUsageFromEvent,
 	findScopeConflict,
 	MAX_ACTIVITY_ITEMS,
 	MAX_RUNNING,
 	MAX_TRACKED,
+	mergeUsage,
 	normalizeScopes,
+	parseWorkerReport,
 	resolveModel,
+	resolveThinkingLevel,
 } from "./types.ts";
 
 interface ManagedTask {
@@ -41,14 +47,22 @@ interface ManagerOptions {
 	timeoutMs?: number;
 	piBinary?: string;
 	piBinaryArgs?: string[];
+	thinkingLevel?: ThinkingLevel;
 }
 
 function defaultPiCommand() {
-	const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
-	return {
-		binary: process.execPath,
-		args: [path.join(path.dirname(packageEntry), "cli.js")],
-	};
+	try {
+		const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+		return {
+			binary: process.execPath,
+			args: [path.join(path.dirname(packageEntry), "cli.js")],
+		};
+	} catch {
+		return {
+			binary: "pi",
+			args: [],
+		};
+	}
 }
 
 function configuredTimeout(value?: number) {
@@ -108,6 +122,7 @@ export class OpenCodeTaskManager {
 	private readonly timeoutMs: number;
 	private readonly piBinary: string;
 	private readonly piBinaryArgs: string[];
+	private thinkingLevel: ThinkingLevel;
 
 	constructor(options: ManagerOptions = {}) {
 		this.onChange = options.onChange;
@@ -116,6 +131,7 @@ export class OpenCodeTaskManager {
 		this.defaultModel = options.model ?? process.env.PI_OPENCODE_MODEL ?? DEFAULT_MODEL;
 		this.modelProfiles = configuredModelProfiles();
 		this.timeoutMs = configuredTimeout(options.timeoutMs);
+		this.thinkingLevel = options.thinkingLevel ?? configuredThinkingLevel();
 		const piCommand = defaultPiCommand();
 		this.piBinary = options.piBinary ?? piCommand.binary;
 		this.piBinaryArgs = options.piBinaryArgs ?? piCommand.args;
@@ -129,6 +145,7 @@ export class OpenCodeTaskManager {
 			profiles: { ...this.modelProfiles },
 			timeoutMs: this.timeoutMs,
 			maxRunning: MAX_RUNNING,
+			thinkingLevel: this.thinkingLevel,
 		};
 	}
 
@@ -137,6 +154,11 @@ export class OpenCodeTaskManager {
 		if (!value) throw new Error("OpenCode model must not be empty.");
 		if (target === "worker") this.defaultModel = value;
 		else this.modelProfiles[target] = value;
+		this.notify();
+	}
+
+	setThinkingLevel(level: ThinkingLevel) {
+		this.thinkingLevel = level;
 		this.notify();
 	}
 
@@ -254,6 +276,7 @@ export class OpenCodeTaskManager {
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
 		const isPiWorker = entry.snapshot.backend === "pi";
+		const thinking = resolveThinkingLevel(spec, this.thinkingLevel);
 		const binary = isPiWorker ? this.piBinary : this.binary;
 		const args = isPiWorker
 			? [
@@ -261,11 +284,12 @@ export class OpenCodeTaskManager {
 				"--approve",
 				"--no-session",
 				"--no-extensions",
-				"--print",
+				"--mode",
+				"json",
 				"--model",
 				entry.snapshot.model,
 				"--thinking",
-				"high",
+				thinking,
 				"--tools",
 				spec.mode === "read_only" ? "read,grep,find,ls" : "read,grep,find,ls,bash,edit,write",
 				prompt,
@@ -277,6 +301,8 @@ export class OpenCodeTaskManager {
 				"json",
 				"--model",
 				entry.snapshot.model,
+				"--variant",
+				thinking,
 				prompt,
 			];
 		const child = spawn(binary, args, {
@@ -312,6 +338,7 @@ export class OpenCodeTaskManager {
 			entry.buffer = "";
 			entry.snapshot.exitCode = code ?? 1;
 			entry.snapshot.settledAt = Date.now();
+			entry.snapshot.report = parseWorkerReport(entry.snapshot.output);
 			if (entry.cancelRequested) entry.snapshot.status = "cancelled";
 			else if (entry.snapshot.timedOut || code !== 0 || entry.snapshot.error) {
 				entry.snapshot.status = "error";
@@ -354,10 +381,35 @@ export class OpenCodeTaskManager {
 		const part = event.part && typeof event.part === "object"
 			? event.part as Record<string, unknown>
 			: undefined;
+		// OpenCode text streaming remains the primary output path for OpenCode workers.
 		if (event.type === "text" && part && typeof part.text === "string") {
 			const appended = boundedAppend(entry.snapshot.output, `${part.text}\n`);
 			entry.snapshot.output = appended.text;
 			entry.snapshot.truncated ||= appended.truncated;
+		}
+		// Pi JSON mode: append assistant text content at message_end (not message_update,
+		// to avoid double-counting streaming deltas). Usage is captured separately below.
+		if (event.type === "message_end") {
+			const message = event.message && typeof event.message === "object"
+				? event.message as Record<string, unknown>
+				: undefined;
+			const content = message?.content;
+			if (Array.isArray(content)) {
+				for (const item of content) {
+					if (item && typeof item === "object") {
+						const node = item as Record<string, unknown>;
+						if (node.type === "text" && typeof node.text === "string") {
+							const appended = boundedAppend(entry.snapshot.output, `${node.text}\n`);
+							entry.snapshot.output = appended.text;
+							entry.snapshot.truncated ||= appended.truncated;
+						}
+					}
+				}
+			}
+		}
+		const usage = extractUsageFromEvent(event);
+		if (usage) {
+			entry.snapshot.usage = mergeUsage(entry.snapshot.usage, usage);
 		}
 		entry.snapshot.activity.push(activityFromEvent(event));
 		if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
