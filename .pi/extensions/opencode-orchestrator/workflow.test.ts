@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { OpenCodeTaskManager } from "./manager.ts";
-import type { TaskSnapshot, WorkflowPhaseSpec, WorkflowSnapshot } from "./types.ts";
+import { configuredModelProfiles, type TaskSnapshot, type WorkflowPhaseSpec, type WorkflowSnapshot } from "./types.ts";
 import { buildPhaseHandoff, formatWorkflowResultText, OpenCodeWorkflowManager } from "./workflow.ts";
 
 async function fakeOpenCode() {
@@ -99,7 +99,7 @@ test("workflow runs phases sequentially and passes compact structured prior resu
 		assert.equal(settled.taskIds.length, 2);
 		assert.match(tasks.get(settled.taskIds[0])?.output ?? "", /PHASE_ONE_SUMMARY/);
 		const second = tasks.get(settled.taskIds[1]);
-		assert.equal(second?.model, "opencode-go/kimi-k3");
+		assert.equal(second?.model, configuredModelProfiles().kimi_k3);
 		const findings = second?.report?.findings ?? [];
 		assert.ok(findings.includes("HAS_STRUCTURED_SUMMARY"), "second phase missing structured prior summary");
 		assert.ok(findings.includes("NO_RAW_FILLER"), "second phase leaked raw filler");
