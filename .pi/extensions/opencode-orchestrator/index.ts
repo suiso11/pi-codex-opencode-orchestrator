@@ -13,6 +13,7 @@ import type {
 	TaskSnapshot,
 	TaskSpec,
 	ThinkingLevel,
+	ToolProfile,
 	WorkflowPhaseSpec,
 	WorkflowSnapshot,
 } from "./types.ts";
@@ -33,6 +34,10 @@ const ThinkingSchema = StringEnum(["low", "medium", "high"] as const, {
 	description: "Per-task thinking level override. Defaults to the configured worker thinking level.",
 });
 
+const ToolProfileSchema = StringEnum(["minimal", "coding", "research", "full"] as const, {
+	description: "Tool capability profile for OpenCode workers. minimal=read,glob,grep; coding adds edit+bash (write mode) or is reduced to read-only tools in read_only mode; research adds webfetch+websearch; full enables every OpenCode tool. Pi workers always pass explicit --tools and ignore this field. Defaults to coding.",
+});
+
 const TaskSchema = Type.Object({
 	name: Type.String({ description: "Short unique task label.", minLength: 1, maxLength: 160 }),
 	mode: ModeSchema,
@@ -50,6 +55,7 @@ const TaskSchema = Type.Object({
 	model: Type.Optional(Type.String({ description: "Optional worker model override. Prefix with pi:: to bypass OpenCode and run through Pi." })),
 	profile: Type.Optional(ProfileSchema),
 	thinking: Type.Optional(ThinkingSchema),
+	tool_profile: Type.Optional(ToolProfileSchema),
 });
 
 const IdsSchema = Type.Object({
@@ -84,6 +90,7 @@ type RawTask = {
 	model?: string;
 	profile?: ModelProfile;
 	thinking?: ThinkingLevel;
+	tool_profile?: ToolProfile;
 };
 
 function toTaskSpec(raw: RawTask): TaskSpec {
@@ -97,6 +104,7 @@ function toTaskSpec(raw: RawTask): TaskSpec {
 		model: raw.model,
 		profile: raw.profile,
 		thinking: raw.thinking,
+		toolProfile: raw.tool_profile,
 	};
 }
 

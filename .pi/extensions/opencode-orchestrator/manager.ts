@@ -1,21 +1,28 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	InternalTaskSpec,
 	ModelProfile,
+	TaskMode,
 	TaskSnapshot,
 	TaskSpec,
 	ThinkingLevel,
 } from "./types.ts";
 import {
 	boundedAppend,
+	buildAgentFrontmatter,
 	buildWorkerPrompt,
+	configuredModelCapabilities,
 	configuredModelProfiles,
 	configuredThinkingLevel,
 	decodeWorkerModel,
 	DEFAULT_MODEL,
+	DEFAULT_TOOL_PROFILE,
+	enforceToolLimit,
 	extractUsageFromEvent,
 	findScopeConflict,
 	MAX_ACTIVITY_ITEMS,
@@ -26,7 +33,35 @@ import {
 	parseWorkerReport,
 	resolveModel,
 	resolveThinkingLevel,
+	resolveToolProfile,
+	toolsForProfile,
+	type ModelCapability,
+	type ToolProfile,
 } from "./types.ts";
+
+function opencodeAgentDir(): string {
+	// OpenCode resolves agents by name from ~/.config/opencode/agent/ on every platform.
+	return path.join(os.homedir(), ".config", "opencode", "agent");
+}
+
+function writeAgentDefinition(taskId: string, profile: ToolProfile, mode: TaskMode): string {
+	const frontmatter = buildAgentFrontmatter(profile, mode);
+	const body = "You are a bounded worker delegated by a parent Pi orchestrator. Follow the repository's AGENTS.md. Do not read secrets or git-ignored runtime configuration. Stay within the declared scope and report missing scope instead of broadening the task.";
+	const dir = opencodeAgentDir();
+	mkdirSync(dir, { recursive: true });
+	const name = `pi-orch-${taskId}-${randomBytes(4).toString("hex")}`;
+	const file = path.join(dir, `${name}.md`);
+	writeFileSync(file, `${frontmatter}
+${body}
+`, { encoding: "utf-8" });
+	return name;
+}
+
+function cleanupAgentDefinition(name: string | undefined) {
+	if (!name) return;
+	const file = path.join(opencodeAgentDir(), `${name}.md`);
+	try { unlinkSync(file); } catch { /* already removed or missing */ }
+}
 
 interface ManagedTask {
 	snapshot: TaskSnapshot;
@@ -48,6 +83,8 @@ interface ManagerOptions {
 	piBinary?: string;
 	piBinaryArgs?: string[];
 	thinkingLevel?: ThinkingLevel;
+	modelCapabilities?: Record<string, ModelCapability>;
+	defaultToolProfile?: ToolProfile;
 }
 
 function defaultPiCommand() {
@@ -123,6 +160,8 @@ export class OpenCodeTaskManager {
 	private readonly piBinary: string;
 	private readonly piBinaryArgs: string[];
 	private thinkingLevel: ThinkingLevel;
+	private readonly modelCapabilities: Record<string, ModelCapability>;
+	private readonly defaultToolProfile: ToolProfile;
 
 	constructor(options: ManagerOptions = {}) {
 		this.onChange = options.onChange;
@@ -132,6 +171,8 @@ export class OpenCodeTaskManager {
 		this.modelProfiles = configuredModelProfiles();
 		this.timeoutMs = configuredTimeout(options.timeoutMs);
 		this.thinkingLevel = options.thinkingLevel ?? configuredThinkingLevel();
+		this.modelCapabilities = options.modelCapabilities ?? configuredModelCapabilities();
+		this.defaultToolProfile = options.defaultToolProfile ?? DEFAULT_TOOL_PROFILE;
 		const piCommand = defaultPiCommand();
 		this.piBinary = options.piBinary ?? piCommand.binary;
 		this.piBinaryArgs = options.piBinaryArgs ?? piCommand.args;
@@ -278,6 +319,21 @@ export class OpenCodeTaskManager {
 		const isPiWorker = entry.snapshot.backend === "pi";
 		const thinking = resolveThinkingLevel(spec, this.thinkingLevel);
 		const binary = isPiWorker ? this.piBinary : this.binary;
+		// Tool capability routing: OpenCode workers get a generated agent definition so
+		// the parent owns the tool set, instead of inheriting ambient OpenCode config.
+		// Pi workers already pass --tools explicitly.
+		let agentName: string | undefined;
+		let capabilityNotice: string | undefined;
+		if (!isPiWorker) {
+			const profile = resolveToolProfile(spec, this.defaultToolProfile);
+			const capability = this.modelCapabilities[entry.snapshot.model];
+			const tools = enforceToolLimit(toolsForProfile(profile, spec.mode), capability);
+			if (tools.reduced) capabilityNotice = tools.reason;
+			agentName = writeAgentDefinition(entry.snapshot.id, profile, spec.mode);
+			entry.snapshot.activity.push(`agent profile: ${profile} (${tools.tools.join(",")})`);
+			if (capabilityNotice) entry.snapshot.activity.push(`capability: ${capabilityNotice}`);
+			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
+		}
 		const args = isPiWorker
 			? [
 				...this.piBinaryArgs,
@@ -303,6 +359,7 @@ export class OpenCodeTaskManager {
 				entry.snapshot.model,
 				"--variant",
 				thinking,
+				...(agentName ? ["--agent", agentName] : []),
 				prompt,
 			];
 		const child = spawn(binary, args, {
@@ -318,7 +375,7 @@ export class OpenCodeTaskManager {
 			entry.snapshot.timedOut = true;
 			entry.snapshot.error = `${isPiWorker ? "Pi" : "OpenCode"} worker timed out after ${this.timeoutMs} ms.`;
 			killProcessTree(child, "SIGTERM");
-			setTimeout(() => killProcessTree(child, "SIGKILL"), 5_000).unref();
+			setTimeout(() => { killProcessTree(child, "SIGKILL"); cleanupAgentDefinition(agentName); }, 5_000).unref();
 		}, this.timeoutMs);
 		timeout.unref();
 
@@ -334,6 +391,7 @@ export class OpenCodeTaskManager {
 		});
 		child.on("close", (code) => {
 			clearTimeout(timeout);
+			cleanupAgentDefinition(agentName);
 			if (entry.buffer.trim()) this.consumeLine(entry, entry.buffer);
 			entry.buffer = "";
 			entry.snapshot.exitCode = code ?? 1;
