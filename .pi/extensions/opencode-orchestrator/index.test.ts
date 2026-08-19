@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { boundParentText, formatBatchDeliverable, formatRawOutputSlice, shouldDelayBackgroundDelivery } from "./index.ts";
+import {
+	activateToolGroup,
+	boundParentText,
+	compactInitialToolSet,
+	formatBatchDeliverable,
+	formatRawOutputSlice,
+	shouldDelayBackgroundDelivery,
+} from "./index.ts";
 import type { TaskSnapshot, WorkflowSnapshot } from "./types.ts";
 
 function task(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
@@ -52,4 +59,25 @@ test("boundParentText caps arbitrary normal tool content at 8000", () => {
 	const text = boundParentText("x".repeat(20_000));
 	assert.ok(text.length <= 8_000);
 	assert.match(text, /Parent-facing output truncated/);
+});
+
+test("compact initial tool set preserves unrelated tools and removes optional orchestrator tools", () => {
+	const active = compactInitialToolSet(["read", "subagent", "opencode_output", "opencode_workflow"]);
+	assert.ok(active.includes("read"));
+	assert.ok(active.includes("subagent"));
+	for (const core of ["opencode_task", "opencode_spawn", "opencode_wait", "opencode_tools"]) {
+		assert.ok(active.includes(core), `missing core tool ${core}`);
+	}
+	assert.ok(!active.includes("opencode_output"));
+	assert.ok(!active.includes("opencode_workflow"));
+});
+
+test("tool groups activate additively without dropping unrelated tools", () => {
+	const activation = activateToolGroup(["read", "opencode_tools", "opencode_check"], "inspection");
+	assert.ok(activation.active.includes("read"));
+	assert.ok(activation.active.includes("opencode_tools"));
+	assert.ok(activation.active.includes("opencode_output"));
+	assert.deepEqual(activation.alreadyActive, ["opencode_check"]);
+	assert.ok(activation.loaded.includes("opencode_output"));
+	assert.equal(new Set(activation.active).size, activation.active.length);
 });

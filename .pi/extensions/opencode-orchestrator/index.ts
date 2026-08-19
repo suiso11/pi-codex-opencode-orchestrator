@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { pruneOrchestrationResults } from "./context-pruning.ts";
 import { OpenCodeTaskManager } from "./manager.ts";
 import type {
 	ModelProfile,
@@ -101,6 +102,71 @@ function toTaskSpec(raw: RawTask): TaskSpec {
 
 const BATCH_DELIVERY_MAX_CHARS = 8_000;
 
+const CORE_ORCHESTRATOR_TOOLS = ["opencode_task", "opencode_spawn", "opencode_wait", "opencode_tools"] as const;
+
+const OPTIONAL_ORCHESTRATOR_TOOLS = [
+	"opencode_check",
+	"opencode_output",
+	"opencode_cancel",
+	"opencode_list",
+	"opencode_workflow",
+	"opencode_workflow_wait",
+	"opencode_workflow_check",
+	"opencode_workflow_cancel",
+	"opencode_workflow_list",
+] as const;
+
+const TOOL_GROUP_NAMES = ["inspection", "control", "workflows", "all"] as const;
+export type ToolGroupName = (typeof TOOL_GROUP_NAMES)[number];
+
+const TOOL_GROUPS: Record<ToolGroupName, readonly string[]> = {
+	inspection: [
+		"opencode_check",
+		"opencode_output",
+		"opencode_list",
+		"opencode_workflow_check",
+		"opencode_workflow_list",
+	],
+	control: ["opencode_cancel", "opencode_workflow_cancel"],
+	workflows: [
+		"opencode_workflow",
+		"opencode_workflow_wait",
+		"opencode_workflow_check",
+		"opencode_workflow_cancel",
+		"opencode_workflow_list",
+	],
+	all: [...CORE_ORCHESTRATOR_TOOLS, ...OPTIONAL_ORCHESTRATOR_TOOLS],
+};
+
+const ToolGroupSchema = StringEnum(
+	TOOL_GROUP_NAMES,
+	{
+		description:
+			"Group of OpenCode orchestration tools to activate additively. inspection adds status/output/list inspection; control adds cancellation; workflows adds phased workflow tools; all activates every OpenCode tool.",
+	},
+);
+
+function unionToolNames(...lists: (readonly string[])[]): string[] {
+	const set = new Set<string>();
+	for (const list of lists) for (const name of list) set.add(name);
+	return [...set];
+}
+
+export function compactInitialToolSet(current: readonly string[]): string[] {
+	const optional = new Set<string>(OPTIONAL_ORCHESTRATOR_TOOLS);
+	return unionToolNames(current, CORE_ORCHESTRATOR_TOOLS).filter((name) => !optional.has(name));
+}
+
+export function activateToolGroup(current: readonly string[], groupName: ToolGroupName) {
+	const group = TOOL_GROUPS[groupName];
+	const existing = new Set(current);
+	return {
+		active: unionToolNames(current, group),
+		loaded: group.filter((name) => !existing.has(name)),
+		alreadyActive: group.filter((name) => existing.has(name)),
+	};
+}
+
 export function formatBatchDeliverable(
 	readyTasks: TaskSnapshot[],
 	readyWorkflows: WorkflowSnapshot[],
@@ -179,6 +245,11 @@ export default function (pi: ExtensionAPI) {
 		cost: 0,
 	};
 
+	let latestPruningStats = {
+		prunedMessages: 0,
+		charsRemoved: 0,
+	};
+
 	const dashboardUsage = (): DashboardUsage => ({
 		parent: {
 			inputTokens: parentUsage.inputTokens,
@@ -251,10 +322,29 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	function reapplyInitialToolSet() {
+		try {
+			pi.setActiveTools(compactInitialToolSet(pi.getActiveTools()));
+		} catch {
+			// Tool-set management is best-effort; ignore if unavailable.
+		}
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		sessionContext = ctx;
 		if (ctx.hasUI) ui = ctx.ui;
+		reapplyInitialToolSet();
 		updateStatus();
+	});
+	pi.on("context", (event) => {
+		if (!event.messages || event.messages.length === 0) return;
+		const result = pruneOrchestrationResults(event.messages);
+		latestPruningStats = {
+			prunedMessages: result.prunedMessages,
+			charsRemoved: result.charsRemoved,
+		};
+		if (result.prunedMessages === 0) return;
+		return { messages: result.messages };
 	});
 	pi.on("agent_settled", deliverSettled);
 	pi.on("message_end", (event) => {
@@ -352,7 +442,6 @@ export default function (pi: ExtensionAPI) {
 		label: "Fetch OpenCode Worker Output",
 		description:
 			"Fetch a retained raw output slice from one OpenCode worker on demand. Use when the opencode_check preview is insufficient; this fetch is explicitly on-demand and does not wait.",
-		promptSnippet: "Fetch a retained raw output slice from an OpenCode worker on demand",
 		parameters: Type.Object({
 			id: Type.String({ description: "OpenCode task id." }),
 			offset: Type.Optional(Type.Integer({
@@ -430,13 +519,6 @@ export default function (pi: ExtensionAPI) {
 		label: "Run OpenCode Workflow",
 		description:
 			"Run a complex OpenCode workflow with at least two dependent phases. Phases run sequentially; tasks within a phase fan out up to the global four-worker cap. Use only when a task genuinely needs phased fan-out and synthesis, not for one small delegation.",
-		promptSnippet: "Run a complex two-or-more-phase OpenCode workflow with bounded parallel fan-out",
-		promptGuidelines: [
-			"Use opencode_workflow only for complex work with at least two dependent phases or three independent subtasks; use opencode_task/opencode_spawn for simpler work.",
-			"The glm and kimi_k3 profile names are configurable routing aliases and may use either OpenCode or Pi.",
-			"After the workflow, keep final approval with the parent; do not treat worker output as final approval.",
-			"Within an opencode_workflow phase, give write tasks non-overlapping relevant_paths; overlapping write scopes are rejected before the workflow starts.",
-		],
 		parameters: WorkflowSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const phases: WorkflowPhaseSpec[] = params.phases.map((phase) => ({
@@ -528,6 +610,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "opencode_tools",
+		label: "OpenCode Tool Groups",
+		description:
+			"Activate a group of optional OpenCode orchestration tools additively for this session. Core tools (opencode_task, opencode_spawn, opencode_wait, opencode_tools) are always active. Groups: inspection (opencode_check, opencode_output, opencode_list, opencode_workflow_check, opencode_workflow_list), control (opencode_cancel, opencode_workflow_cancel), workflows (opencode_workflow, opencode_workflow_wait, opencode_workflow_check, opencode_workflow_cancel, opencode_workflow_list), all (every OpenCode tool). Activation is additive and persists for the session; call opencode_output on demand after enabling inspection/all to fetch a retained raw output slice.",
+		promptSnippet: "Activate a group of optional OpenCode orchestration tools for this session",
+		parameters: Type.Object({ group: ToolGroupSchema }),
+		async execute(_toolCallId, params) {
+			const activation = activateToolGroup(pi.getActiveTools(), params.group);
+			pi.setActiveTools(activation.active);
+			return {
+				content: [{
+					type: "text",
+					text: boundParentText(
+						`Tool group "${params.group}" active. Loaded: ${activation.loaded.join(", ") || "(none)"}; already active: ${activation.alreadyActive.join(", ") || "(none)"}.`,
+					),
+				}],
+				details: { group: params.group, loaded: activation.loaded, alreadyActive: activation.alreadyActive },
+			};
+		},
+	});
+
 	pi.registerCommand("opencode-status", {
 		description: "Show worker routing configuration and active work",
 		handler: async (_args, ctx) => {
@@ -566,6 +670,7 @@ export default function (pi: ExtensionAPI) {
 					`Parent tokens: in ${parentUsage.inputTokens.toLocaleString()} / out ${parentUsage.outputTokens.toLocaleString()} / total ${parentUsage.totalTokens.toLocaleString()} / cost ${parentUsage.cost.toFixed(6)}`,
 					`Worker tokens: in ${worker.inputTokens.toLocaleString()} / out ${worker.outputTokens.toLocaleString()} / total ${worker.totalTokens.toLocaleString()} / cost ${worker.cost.toFixed(6)}`,
 					`Workflow handoff: ${handoffCreated.toLocaleString()} unique chars created, ${handoffInjected.toLocaleString()} chars injected downstream (duplication ratio ${duplicationRatio.toFixed(2)})`,
+					`Current context pruning: ${latestPruningStats.prunedMessages.toLocaleString()} messages, ${latestPruningStats.charsRemoved.toLocaleString()} chars removed from this model request`,
 					`Totals are observed usage; no baseline comparison is available, so token savings are not claimed.`,
 				].join("\n"),
 				"info",

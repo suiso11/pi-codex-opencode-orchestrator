@@ -7,6 +7,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 ## Features
 
 - `opencode_spawn`, `opencode_wait`, `opencode_check`, `opencode_cancel`, `opencode_list`, and `opencode_output`
+- Dynamic `opencode_tools` groups that additively activate optional inspection/control/workflow tools per session
 - Global limit of four running OpenCode workers
 - Overlapping read-only tasks can run concurrently
 - Write tasks can run concurrently only when their declared concrete paths do not overlap
@@ -17,7 +18,8 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Timeout handling, SIGTERM/SIGKILL cleanup, and bounded output capture
 - Up to 120k characters of raw output retained per worker; normal parent delivery capped at 8k; workflow handoff compact JSON capped at 4k
 - `opencode_output` escape hatch to fetch a retained raw output slice on demand when the compact preview is insufficient
-- `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication, with no savings claim absent a baseline
+- Dedicated one-turn context pruning: old orchestration results are replaced with a short placeholder for the parent model, while session history and the manager's retained raw output stay intact
+- `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication and latest pruning statistics, with no savings claim absent a baseline
 - Default worker model: `opencode-go/glm-5.2`
 - Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides
 - Interactive `/orch-model` command for persistent parent and worker model changes
@@ -171,6 +173,25 @@ Each worker returns a structured report with `summary`, `files`, `findings`, and
 
 Background completions are not delivered one-by-one. When the parent is idle and no background tasks or workflows remain running, settled workers and workflows are batched into a single follow-up message (capped at 8k). This avoids many small follow-ups interrupting the parent.
 
+### One-turn result retention and context pruning
+
+To stop the parent model from repeatedly re-reading large orchestration results, the extension hooks Pi's `context` event and replaces the model-facing content of **old** orchestration results with a short deterministic placeholder. Targets are `opencode_*` tool results and `opencode-batch-result` custom messages. A result is pruned only once it appears before the latest real user-role message, so the current turn's freshly returned worker result or background batch remains fully available for the immediate next model call and is pruned starting with the next user turn. Message ordering, roles, tool call IDs, tool names, and non-target messages are preserved; useful task/workflow IDs are kept in the placeholder when available from the result details.
+
+Pruning is non-destructive: the session JSONL and the manager's retained raw output are never changed, and `opencode_output` can still fetch any retained slice on demand. `/opencode-usage` reports the latest outbound request's pruned-message count and characters removed, avoiding repeated counting of the same historical messages.
+
+### Dynamic tool groups
+
+The core orchestration tools `opencode_task`, `opencode_spawn`, `opencode_wait`, and `opencode_tools` (plus unrelated tools owned by Pi and other extensions) are always active. Optional tools — `opencode_check`, `opencode_cancel`, `opencode_list`, `opencode_output`, and the `opencode_workflow*` family — start inactive to keep the system prompt lean and prompt caching stable, and are loaded on demand:
+
+```text
+opencode_tools group=inspection
+opencode_tools group=control
+opencode_tools group=workflows
+opencode_tools group=all
+```
+
+Activation is additive and persists for the session: each group turns on its set without disabling anything else, and the loader returns a compact loaded/already-active status. On each `session_start` the extension reapplies the compact initial active set. Use `opencode_tools group=inspection` (or `all`) before calling `opencode_output` on demand to fetch a retained raw output slice.
+
 ### Usage reporting
 
 `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication (unique chars created vs. chars injected downstream, with a duplication ratio). Totals are observed usage only; no baseline comparison is available, so token savings are not claimed.
@@ -182,7 +203,7 @@ npm test
 npm run typecheck
 ```
 
-The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, and previous-phase context handoff.
+The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, previous-phase context handoff, and one-turn orchestration context pruning.
 
 ## Design note
 
