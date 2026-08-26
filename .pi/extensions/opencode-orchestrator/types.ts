@@ -63,6 +63,7 @@ export interface TaskSpec {
 	model?: string;
 	profile?: ModelProfile;
 	thinking?: ThinkingLevel;
+	toolProfile?: ToolProfile;
 }
 
 export interface InternalTaskSpec extends TaskSpec {
@@ -562,4 +563,90 @@ export function mergeUsage(current: TaskUsage | undefined, addition: TaskUsage):
 		next.reasoningTokens = (next.reasoningTokens ?? 0) + addition.reasoningTokens;
 	}
 	return next;
+}
+
+
+// --- Tool capability routing ---
+
+export type ToolProfile = "minimal" | "coding" | "research" | "full";
+
+export const DEFAULT_TOOL_PROFILE: ToolProfile = "coding";
+
+export const TOOL_PROFILES: Record<ToolProfile, readonly string[]> = {
+	minimal: ["read", "glob", "grep"],
+	coding: ["read", "glob", "grep", "edit", "bash"],
+	research: ["read", "glob", "grep", "webfetch", "websearch"],
+	full: ["bash", "read", "edit", "glob", "grep", "webfetch", "task", "todowrite", "websearch", "lsp", "skill"],
+} as const;
+
+export interface ModelCapability {
+	maxTools?: number;
+	toolSchema?: "openai" | "restricted";
+}
+
+export const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
+	"opencode-go/deepseek-v4-flash": { maxTools: 16, toolSchema: "restricted" },
+};
+
+const ALL_OPENCODE_TOOLS = ["bash", "read", "edit", "glob", "grep", "webfetch", "task", "todowrite", "websearch", "lsp", "skill"] as const;
+
+export function resolveToolProfile(spec: Pick<TaskSpec, "toolProfile">, fallback: ToolProfile): ToolProfile {
+	return spec.toolProfile ?? fallback;
+}
+
+export function toolsForProfile(profile: ToolProfile, mode: TaskMode): readonly string[] {
+	const tools = TOOL_PROFILES[profile];
+	if (mode === "read_only") {
+		return tools.filter((t) => t !== "edit" && t !== "bash");
+	}
+	return tools;
+}
+
+export function configuredModelCapabilities(env: NodeJS.ProcessEnv = process.env): Record<string, ModelCapability> {
+	const base: Record<string, ModelCapability> = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (!key.startsWith("PI_OPENCODE_MODEL_CAP_") || !value) continue;
+		const model = key.slice("PI_OPENCODE_MODEL_CAP_".length).replace(/__/g, "/");
+		const parts = value.split(",");
+		const cap: ModelCapability = {};
+		for (const part of parts) {
+			const [k, v] = part.split("=");
+			if (!k || !v) continue;
+			if (k === "maxTools") cap.maxTools = Number(v);
+			else if (k === "toolSchema") cap.toolSchema = v as "openai" | "restricted";
+		}
+		base[model] = cap;
+	}
+	return { ...MODEL_CAPABILITIES, ...base };
+}
+
+export function enforceToolLimit(
+	tools: readonly string[],
+	capability?: ModelCapability,
+): { tools: string[]; reduced: boolean; reason?: string } {
+	if (!capability?.maxTools || tools.length <= capability.maxTools) {
+		return { tools: [...tools], reduced: false };
+	}
+	const kept = tools.slice(0, capability.maxTools);
+	return {
+		tools: kept,
+		reduced: true,
+		reason: `tool count ${tools.length} exceeds model maxTools ${capability.maxTools}; reduced to ${kept.length}`,
+	};
+}
+
+export function buildAgentFrontmatter(profile: ToolProfile, mode: TaskMode): string {
+	const allowed = new Set(toolsForProfile(profile, mode));
+	const denied = ALL_OPENCODE_TOOLS.filter((t) => !allowed.has(t));
+	const permBlock = denied.length > 0
+		? denied.map((t) => `  ${t}: deny`).join("\n")
+		: "  # all tools allowed";
+	return [
+		"---",
+		"description: Pi orchestrator bounded worker",
+		"mode: primary",
+		"permission:",
+		permBlock,
+		"---",
+	].join("\n");
 }

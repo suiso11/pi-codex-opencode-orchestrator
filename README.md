@@ -133,6 +133,44 @@ codex exec -m gpt-5.6-sol --sandbox read-only "$(cat /tmp/codex_prompt.md)"
 
 Kimi K3 provides a different review perspective but does not grant final approval.
 
+## Tool capability routing
+
+OpenCode workers do not inherit ambient OpenCode config. The parent owns the worker tool set via **tool profiles** and per-model **capability metadata**, so provider-specific limits (e.g. `deepseek-v4-flash`'s 16-tool / restricted-schema constraint) never surface as opaque aborts.
+
+### Tool profiles
+
+Pass `tool_profile` on `opencode_task` / `opencode_spawn`:
+
+| Profile | Tools | Notes |
+| --- | --- | --- |
+| `minimal` | read, glob, grep | read-only recon |
+| `coding` | read, glob, grep, edit, bash | **default**; `read_only` mode auto-strips edit/bash |
+| `research` | read, glob, grep, webfetch, websearch | investigation with web access |
+| `full` | every OpenCode tool | explicit opt-in only |
+
+Pi workers always pass explicit `--tools` and ignore `tool_profile`.
+
+### Model capability metadata
+
+Built-in:
+
+```ts
+opencode-go/deepseek-v4-flash: { maxTools: 16, toolSchema: "restricted" }
+```
+
+Override or extend from the environment (model slashes as `__`):
+
+```bash
+PI_OPENCODE_MODEL_CAP_opencode-go__deepseek-v4-flash=maxTools=8,toolSchema=restricted
+```
+
+When a profile's tool count exceeds `maxTools`, the manager trims to the limit and records a `capability:` notice in worker activity.
+
+### How it reaches OpenCode
+
+OpenCode resolves agents by **name** from `~/.config/opencode/agent/<name>.md`. Per spawn, the manager writes a frontmatter-only agent definition with `permission:` deny blocks for tools outside the profile, passes `--agent <name>`, and removes the file on close/timeout. The parent decides the tool set; ambient global/project/`.opencode` config no longer affects worker tool availability.
+
+
 ## Using it in another repository
 
 Copy the extension directory into that repository:

@@ -3,11 +3,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+	buildAgentFrontmatter,
 	buildWorkerPrompt,
+	configuredModelCapabilities,
 	configuredModelProfiles,
 	configuredThinkingLevel,
 	decodeWorkerModel,
+	DEFAULT_TOOL_PROFILE,
 	encodeWorkerModel,
+	enforceToolLimit,
 	extractUsageFromEvent,
 	findScopeConflict,
 	mergeUsage,
@@ -16,9 +20,11 @@ import {
 	parseWorkerReport,
 	resolveModel,
 	resolveThinkingLevel,
+	resolveToolProfile,
 	scopeOverlaps,
 	taskResultText,
 	taskResultsText,
+	toolsForProfile,
 	validateWorkflowPhases,
 } from "./types.ts";
 import type { TaskSnapshot } from "./types.ts";
@@ -343,4 +349,67 @@ test("taskResultText and taskResultsText never exceed requested maxChars, includ
 	}
 	const empty = taskResultsText([], 3);
 	assert.ok(empty.length <= 3, `empty len=${empty.length}`);
+});
+
+
+test("tool profiles map to the expected tool sets", () => {
+	assert.deepEqual([...toolsForProfile("minimal", "write")], ["read", "glob", "grep"]);
+	assert.deepEqual([...toolsForProfile("coding", "write")], ["read", "glob", "grep", "edit", "bash"]);
+	// read_only strips edit and bash even when the profile would include them
+	assert.deepEqual([...toolsForProfile("coding", "read_only")], ["read", "glob", "grep"]);
+	assert.deepEqual([...toolsForProfile("research", "write")], ["read", "glob", "grep", "webfetch", "websearch"]);
+	assert.deepEqual([...toolsForProfile("research", "read_only")], ["read", "glob", "grep", "webfetch", "websearch"]);
+	assert.ok(toolsForProfile("full", "write").length > toolsForProfile("coding", "write").length);
+});
+
+test("resolveToolProfile prefers spec over fallback", () => {
+	assert.equal(resolveToolProfile({ toolProfile: "research" }, "coding"), "research");
+	assert.equal(resolveToolProfile({}, "coding"), "coding");
+	assert.equal(resolveToolProfile({}, DEFAULT_TOOL_PROFILE), DEFAULT_TOOL_PROFILE);
+});
+
+test("enforceToolLimit keeps tools when within capability and trims when over", () => {
+	const within = enforceToolLimit(["read", "glob", "grep"], { maxTools: 16 });
+	assert.equal(within.reduced, false);
+	assert.deepEqual(within.tools, ["read", "glob", "grep"]);
+	const over = enforceToolLimit(["read", "glob", "grep", "edit", "bash"], { maxTools: 3 });
+	assert.equal(over.reduced, true);
+	assert.equal(over.tools.length, 3);
+	assert.ok(over.reason?.includes("exceeds"));
+	// no capability means no limit
+	const noCap = enforceToolLimit(["a", "b", "c"], undefined);
+	assert.equal(noCap.reduced, false);
+});
+
+test("configuredModelCapabilities reads PI_OPENCODE_MODEL_CAP_ env overrides", () => {
+	const caps = configuredModelCapabilities({
+		"PI_OPENCODE_MODEL_CAP_opencode-go__deepseek-v4-flash": "maxTools=8,toolSchema=restricted",
+	});
+	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.maxTools, 8);
+	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.toolSchema, "restricted");
+	// built-in default still present
+	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.maxTools, 8);
+});
+
+test("buildAgentFrontmatter denies tools outside the profile and allows the rest", () => {
+	const coding = buildAgentFrontmatter("coding", "write");
+	assert.match(coding, /^---\ndescription:/);
+	assert.match(coding, /mode: primary/);
+	// edit and read are allowed (no deny line for them)
+	assert.doesNotMatch(coding, /\nread: deny/);
+	assert.doesNotMatch(coding, /\nedit: deny/);
+	// webfetch, websearch, task, todowrite, lsp, skill are denied
+	assert.match(coding, /webfetch: deny/);
+	assert.match(coding, /websearch: deny/);
+	assert.match(coding, /task: deny/);
+	assert.match(coding, /todowrite: deny/);
+	assert.match(coding, /lsp: deny/);
+	assert.match(coding, /skill: deny/);
+	// read_only mode denies bash and edit too
+	const ro = buildAgentFrontmatter("coding", "read_only");
+	assert.match(ro, /bash: deny/);
+	assert.match(ro, /edit: deny/);
+	// full profile denies nothing
+	const full = buildAgentFrontmatter("full", "write");
+	assert.doesNotMatch(full, /: deny/);
 });

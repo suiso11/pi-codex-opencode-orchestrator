@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -378,6 +379,76 @@ test("manager captures Pi JSON message_end report output and usage", async () =>
 		assert.deepEqual(settled.report?.files, ["x.ts"]);
 		assert.deepEqual(settled.report?.findings, ["ok"]);
 		assert.deepEqual(settled.report?.unresolved, []);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+
+test("manager passes --agent with a generated definition file to OpenCode workers", async () => {
+	const fake = await fakeEchoArgs();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		const started = manager.spawn(spec("agent-probe", "write", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const args = JSON.parse(settled.output.trim());
+		const agentIdx = args.indexOf("--agent");
+		assert.ok(agentIdx >= 0, "--agent not passed to OpenCode worker");
+		const agentName = args[agentIdx + 1];
+		assert.ok(typeof agentName === "string" && agentName.startsWith("pi-orch-"), "agent name must start with pi-orch-");
+		// OpenCode resolves agents from ~/.config/opencode/agent/<name>.md
+		const agentFile = path.join(os.homedir(), ".config", "opencode", "agent", `${agentName}.md`);
+		// close 時に削除されていること
+		assert.equal(existsSync(agentFile), false, "agent definition must be cleaned up after close");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager does not pass --agent to Pi workers", async () => {
+	const fake = await fakeEchoArgs();
+	const manager = new OpenCodeTaskManager({
+		piBinary: fake.binary,
+		piBinaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		manager.setModelSetting("worker", "pi::anthropic/example");
+		const started = manager.spawn(spec("pi-agent-probe", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const args = JSON.parse(settled.output.trim());
+		assert.equal(args.indexOf("--agent"), -1, "--agent must not be passed to Pi workers");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("manager records agent profile and capability notice in activity", async () => {
+	const fake = await fakeEchoArgs();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+		modelCapabilities: { "opencode-go/test-flash": { maxTools: 2, toolSchema: "restricted" } },
+	});
+	try {
+		manager.setModelSetting("worker", "opencode-go/test-flash");
+		const started = manager.spawn(spec("cap-probe", "write", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const profileActivity = settled.activity.find((a) => a.startsWith("agent profile: coding"));
+		assert.ok(profileActivity, "activity must record the agent profile and tool set");
+		const capActivity = settled.activity.find((a) => a.startsWith("capability:"));
+		assert.ok(capActivity, "activity must record the capability reduction notice");
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();
