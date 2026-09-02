@@ -220,6 +220,79 @@ test("registered spawn schema round-trips worktree into toTaskSpec", () => {
 	assert.equal(spec.worktree, true);
 });
 
+test("registered schemas accept boolean executor and reject non-boolean values", () => {
+	const { tools } = activateExtension();
+	for (const toolName of ["opencode_spawn", "opencode_task"]) {
+		const schema = tools.get(toolName)?.parameters;
+		assert.ok(schema, `${toolName} not registered`);
+		assert.equal(Value.Check(schema, taskPayload({ executor: true })), true, `${toolName} rejected executor: true`);
+		assert.equal(Value.Check(schema, taskPayload({ executor: false })), true, `${toolName} rejected executor: false`);
+		assert.equal(Value.Check(schema, taskPayload({ executor: "yes" })), false, `${toolName} accepted string executor`);
+		assert.equal(Value.Check(schema, taskPayload({ executor: 1 })), false, `${toolName} accepted numeric executor`);
+	}
+	const workflowSchema = tools.get("opencode_workflow")?.parameters;
+	assert.ok(workflowSchema, "opencode_workflow not registered");
+	const workflow = (executor: unknown) => ({
+		name: "executor-workflow",
+		phases: [
+			{ name: "one", tasks: [taskPayload({ role: "implementer", executor })] },
+			{ name: "two", tasks: [taskPayload()] },
+		],
+	});
+	assert.equal(Value.Check(workflowSchema, workflow(true)), true, "workflow rejected executor: true");
+	assert.equal(Value.Check(workflowSchema, workflow(false)), true, "workflow rejected executor: false");
+	assert.equal(Value.Check(workflowSchema, workflow("yes")), false, "workflow accepted string executor");
+});
+
+test("registered task and workflow schemas round-trip executor into toTaskSpec", () => {
+	const { tools } = activateExtension();
+	const executorTask = taskPayload({ role: "implementer", executor: true });
+	const plainTask = taskPayload();
+	for (const toolName of ["opencode_spawn", "opencode_task"]) {
+		const schema = tools.get(toolName)?.parameters;
+		assert.ok(schema, `${toolName} not registered`);
+		assert.equal(Value.Check(schema, executorTask), true, `${toolName} rejected a valid executor task`);
+		const spec = toTaskSpec(executorTask as unknown as Parameters<typeof toTaskSpec>[0]);
+		assert.equal(spec.executor, true, `${toolName} dropped executor during conversion`);
+	}
+	const workflowSchema = tools.get("opencode_workflow")?.parameters;
+	assert.ok(workflowSchema, "opencode_workflow not registered");
+	const workflow = {
+		name: "executor-workflow",
+		phases: [
+			{ name: "one", tasks: [executorTask] },
+			{ name: "two", tasks: [plainTask] },
+		],
+	};
+	assert.equal(Value.Check(workflowSchema, workflow), true, "workflow rejected a valid executor task");
+	const phaseTasks = workflow.phases.flatMap((phase) => phase.tasks);
+	const workflowSpecs = phaseTasks.map((raw) => toTaskSpec(raw as unknown as Parameters<typeof toTaskSpec>[0]));
+	assert.equal(workflowSpecs[0].executor, true, "workflow dropped executor during conversion");
+	assert.equal(workflowSpecs[1].executor, undefined, "workflow invented executor for a plain task");
+});
+
+test("toTaskSpec forwards executor and omits it for bare tasks", () => {
+	const spec = toTaskSpec({
+		name: "executor-task",
+		mode: "write",
+		objective: "Implement with executor",
+		relevant_paths: ["src"],
+		expected_output: "result",
+		role: "implementer",
+		executor: true,
+	});
+	assert.equal(spec.executor, true);
+
+	const bare = toTaskSpec({
+		name: "bare",
+		mode: "read_only",
+		objective: "Bare",
+		relevant_paths: ["src"],
+		expected_output: "result",
+	});
+	assert.equal(bare.executor, undefined);
+});
+
 test("worktree state surfaces in status text and details without leaking into worker prompts", () => {
 	const snapshot = task({
 		worktree: { isolated: true, baseHead: "abc1234", status: "pending", changedPaths: [] },

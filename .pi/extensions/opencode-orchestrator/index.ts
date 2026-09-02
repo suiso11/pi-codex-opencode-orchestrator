@@ -67,6 +67,9 @@ const TaskSchema = Type.Object({
 	worktree: Type.Optional(Type.Boolean({
 		description: "Opt-in write isolation. Valid only for mode=write: the worker runs in a detached git worktree and changes integrate through a per-repo ID-ordered queue after the worker exits.",
 	})),
+	executor: Type.Optional(Type.Boolean({
+		description: "Opt-in Executor MCP gateway. Requires PI_ORCH_ENABLE_EXECUTOR=1 plus the OpenCode backend with an explicit implementer role; any other combination fails before spawning.",
+	})),
 });
 
 const IdsSchema = Type.Object({
@@ -104,6 +107,7 @@ export interface RawTask {
 	thinking?: ThinkingLevel;
 	tool_profile?: ToolProfile;
 	worktree?: boolean;
+	executor?: boolean;
 }
 
 export function toTaskSpec(raw: RawTask): TaskSpec {
@@ -120,6 +124,7 @@ export function toTaskSpec(raw: RawTask): TaskSpec {
 		thinking: raw.thinking,
 		toolProfile: raw.tool_profile,
 		worktree: raw.worktree,
+		executor: raw.executor,
 	};
 }
 
