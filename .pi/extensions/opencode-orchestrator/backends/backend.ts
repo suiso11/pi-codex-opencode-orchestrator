@@ -10,6 +10,10 @@ export interface BackendSpawnInput {
 	model: string;
 	thinking: ThinkingLevel;
 	prompt: string;
+	// Child working directory. For worktree tasks this is the manager-created
+	// isolated worktree path; backends that pass --cwd (e.g. Collie) forward it
+	// verbatim. It is never placed into prompts.
+	cwd: string;
 }
 
 // Backend-prepared spawn state. `agentName` is the backend-scoped tool
@@ -55,6 +59,16 @@ export function activityFromEvent(event: Record<string, unknown>): string {
 	return `${type}: ${String(part.type ?? "unknown")}`;
 }
 
+// Decoded result for one raw stderr chunk from the worker child. `text` is
+// what the manager bounds and stores as snapshot.stderr; `activity` items are
+// appended to the snapshot's activity list. The manager owns bounding and
+// snapshot application; adapters own backend-specific stderr decoding (e.g.
+// extracting activity labels from NDJSON diagnostic events).
+export interface BackendDecodedStderrChunk {
+	text: string;
+	activity: string[];
+}
+
 // Backend-specific child-process construction boundary. Implementations must
 // preserve the exact public CLI argument, environment, and permission
 // semantics for their backend, including pi:: model encoding handled upstream
@@ -80,10 +94,11 @@ export interface WorkerBackendAdapter {
 	// Implementations must preserve the exact raw-output text and activity
 	// decoding of their backend for both raw and structured lines.
 	decodeStdoutLine(line: string, event: Record<string, unknown> | undefined): BackendDecodedLine;
-	// Decode one raw stderr chunk from the worker child. The returned text is
-	// what the manager bounds and stores as snapshot.stderr; identity by
-	// default for the current backends.
-	decodeStderrChunk(chunk: string): string;
+	// Decode one raw stderr chunk from the worker child. `text` is what the
+	// manager bounds and stores as snapshot.stderr (identity for the current
+	// OpenCode/Pi backends); `activity` items become bounded snapshot activity
+	// labels without changing the retained raw stderr text.
+	decodeStderrChunk(chunk: string): BackendDecodedStderrChunk;
 	// Normalize the structured report parsed from the final raw output at child
 	// exit, before any manager-owned worktree path normalization. Identity for
 	// the current backends; this is the exit-time normalization hook.

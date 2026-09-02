@@ -46,11 +46,13 @@ import {
 import type { BackendPreparation, WorkerBackendAdapter } from "./backends/backend.ts";
 import { OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter } from "./backends/pi.ts";
+import { CollieBackendAdapter, collieGateError, collieModelParts } from "./backends/collie.ts";
 
 interface ManagedTask {
 	snapshot: TaskSnapshot;
 	child?: ChildProcess;
 	buffer: string;
+	stderrBuffer: string;
 	settleListeners: Set<() => void>;
 	waiters: number;
 	consumed: boolean;
@@ -140,6 +142,8 @@ interface ManagerOptions {
 	timeoutMs?: number;
 	piBinary?: string;
 	piBinaryArgs?: string[];
+	collieBinary?: string;
+	collieBinaryArgs?: string[];
 	thinkingLevel?: ThinkingLevel;
 	modelCapabilities?: Record<string, ModelCapability>;
 	defaultToolProfile?: ToolProfile;
@@ -481,6 +485,8 @@ export class OpenCodeTaskManager {
 	private readonly timeoutMs: number;
 	private readonly piBinary: string;
 	private readonly piBinaryArgs: string[];
+	private readonly collieBinary: string;
+	private readonly collieBinaryArgs: string[];
 	private thinkingLevel: ThinkingLevel;
 	private readonly modelCapabilities: Record<string, ModelCapability>;
 	private readonly defaultToolProfile: ToolProfile;
@@ -506,6 +512,8 @@ export class OpenCodeTaskManager {
 		const piCommand = defaultPiCommand();
 		this.piBinary = options.piBinary ?? piCommand.binary;
 		this.piBinaryArgs = options.piBinaryArgs ?? piCommand.args;
+		this.collieBinary = options.collieBinary ?? process.env.PI_COLLIE_BIN ?? "collie";
+		this.collieBinaryArgs = options.collieBinaryArgs ?? [];
 		this.backends = {
 			opencode: new OpenCodeBackendAdapter({
 				binary: this.binary,
@@ -514,6 +522,7 @@ export class OpenCodeTaskManager {
 				modelCapabilities: this.modelCapabilities,
 			}),
 			pi: new PiBackendAdapter({ binary: this.piBinary, binaryArgs: this.piBinaryArgs }),
+			collie: new CollieBackendAdapter({ binary: this.collieBinary, binaryArgs: this.collieBinaryArgs }),
 		};
 	}
 
@@ -521,6 +530,7 @@ export class OpenCodeTaskManager {
 		return {
 			binary: this.binary,
 			piBinary: this.piBinary,
+			collieBinary: this.collieBinary,
 			model: this.defaultModel,
 			profiles: { ...this.modelProfiles },
 			testerProfile: this.testerModel,
@@ -607,8 +617,15 @@ export class OpenCodeTaskManager {
 			throw new Error("Worktree isolation (worktree=true) requires mode write.");
 		}
 		const scopes = normalizeScopes(cwd, spec.relevantPaths);
-		const id = `oc-${++this.counter}`;
 		const selection = decodeWorkerModel(resolveModel(spec, this.defaultModel, this.modelProfiles, this.testerModel));
+		if (selection.backend === "collie") {
+			const gate = collieGateError({ spec });
+			if (gate) throw new Error(gate);
+			// Validate the provider/model split before creating a worktree or task
+			// entry; malformed Collie routes fail closed with no launch side effect.
+			collieModelParts(selection.model);
+		}
+		const id = `oc-${++this.counter}`;
 		const snapshot: TaskSnapshot = {
 			id,
 			name: spec.name.trim().slice(0, 160) || id,
@@ -632,6 +649,7 @@ export class OpenCodeTaskManager {
 		const entry: ManagedTask = {
 			snapshot,
 			buffer: "",
+			stderrBuffer: "",
 			settleListeners: new Set(),
 			waiters: 0,
 			consumed: false,
@@ -721,6 +739,7 @@ export class OpenCodeTaskManager {
 			model: entry.snapshot.model,
 			thinking,
 			prompt,
+			cwd,
 		};
 		const preparation: BackendPreparation = adapter.prepare(spawnInput);
 		const agentName = preparation.agentName;
@@ -750,12 +769,8 @@ export class OpenCodeTaskManager {
 		timeout.unref();
 
 		child.stdout?.on("data", (data: Buffer) => this.consumeStdout(entry, data.toString("utf8")));
-		child.stderr?.on("data", (data: Buffer) => {
-			const appended = boundedAppend(entry.snapshot.stderr, adapter.decodeStderrChunk(data.toString("utf8")));
-			entry.snapshot.stderr = appended.text;
-			entry.snapshot.truncated ||= appended.truncated;
-			this.notify();
-		});
+		child.stderr?.on("data", (data: Buffer) => this.consumeStderr(entry, data.toString("utf8")));
+
 		child.on("error", (error) => {
 			entry.snapshot.error = `Failed to start ${backendName} worker: ${processError(error)}`;
 		});
@@ -764,6 +779,8 @@ export class OpenCodeTaskManager {
 			adapter.cleanupAgent(agentName);
 			if (entry.buffer.trim()) this.consumeLine(entry, entry.buffer);
 			entry.buffer = "";
+			if (entry.stderrBuffer.trim()) this.consumeStderrLine(entry, entry.stderrBuffer);
+			entry.stderrBuffer = "";
 			entry.snapshot.exitCode = code ?? 1;
 			// Exit-time report normalization: parse stays manager-owned; the
 			// backend adapter may normalize the backend-specific report shape
@@ -1266,6 +1283,28 @@ export class OpenCodeTaskManager {
 		entry.buffer = lines.pop() ?? "";
 		for (const line of lines) this.consumeLine(entry, line);
 		this.notify();
+	}
+
+	private consumeStderr(entry: ManagedTask, chunk: string) {
+		const appended = boundedAppend(entry.snapshot.stderr, chunk);
+		entry.snapshot.stderr = appended.text;
+		entry.snapshot.truncated ||= appended.truncated;
+		entry.stderrBuffer += chunk;
+		const lines = entry.stderrBuffer.split("\n");
+		entry.stderrBuffer = lines.pop() ?? "";
+		for (const line of lines) this.consumeStderrLine(entry, line);
+		// Keep the raw stderr channel byte-for-byte bounded while decoding only
+		// complete NDJSON records into activity labels.
+		this.notify();
+	}
+
+	private consumeStderrLine(entry: ManagedTask, line: string) {
+		if (!line.trim()) return;
+		const adapter = this.backends[entry.snapshot.backend];
+		for (const item of adapter.decodeStderrChunk(`${line}\n`).activity) {
+			entry.snapshot.activity.push(item);
+			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
+		}
 	}
 
 	private consumeLine(entry: ManagedTask, line: string) {

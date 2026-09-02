@@ -1,5 +1,5 @@
 import type { TaskSpec, WorkerReport } from "../types.ts";
-import { activityFromEvent, type BackendDecodedLine, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
+import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 // Exact Pi child tool lists. Existing unroled read/write behavior is preserved;
 // tester additionally gets bash (but no edit/write), and reviewer is strictly
@@ -87,8 +87,8 @@ export class PiBackendAdapter implements WorkerBackendAdapter {
 		return { output, activity: [activityFromEvent(event)] };
 	}
 
-	decodeStderrChunk(chunk: string): string {
-		return chunk;
+	decodeStderrChunk(chunk: string): BackendDecodedStderrChunk {
+		return { text: chunk, activity: [] };
 	}
 
 	normalizeExitReport(report: WorkerReport): WorkerReport {

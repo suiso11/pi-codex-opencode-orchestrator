@@ -16,7 +16,7 @@ export type TaskStatus = "running" | "done" | "error" | "cancelled";
 export type WorkflowStatus = "running" | "done" | "error" | "cancelled";
 export type ModelProfile = keyof typeof MODEL_PROFILE_DEFAULTS;
 export type WorkerRole = "implementer" | "tester" | "reviewer";
-export type WorkerBackend = "opencode" | "pi";
+export type WorkerBackend = "opencode" | "pi" | "collie";
 export type ThinkingLevel = "low" | "medium" | "high";
 
 export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
@@ -85,19 +85,21 @@ export interface WorkerReport {
 
 const PI_WORKER_PREFIX = "pi::";
 const OPENCODE_MODEL_PREFIX = "opencode:";
+const COLLIE_MODEL_PREFIX = "collie::";
 
 /**
  * Canonical worker model representation. OpenCode workers use the raw
- * `provider/model` value; Pi workers use `pi::provider/model`. `opencode:` is
- * display-only and must never reach persistence, manager state, snapshot.model,
- * task summaries, or the OpenCode CLI --model flag. Trims and collapses any
- * repeated leading `opencode:` prefix on non-Pi values while preserving `pi::`
- * values verbatim. Returns "" for values that normalize away entirely so
- * callers can reject them.
+ * `provider/model` value; Pi workers use `pi::provider/model`; experimental
+ * Collie workers use `collie::provider/model`. `opencode:` is display-only and
+ * must never reach persistence, manager state, snapshot.model, task summaries,
+ * or the OpenCode CLI --model flag. Trims and collapses any repeated leading
+ * `opencode:` prefix on non-Pi/non-Collie values while preserving `pi::` and
+ * `collie::` values verbatim. Returns "" for values that normalize away
+ * entirely so callers can reject them.
  */
 export function normalizeWorkerModelValue(value: string): string {
 	const trimmed = value.trim();
-	if (trimmed.startsWith(PI_WORKER_PREFIX)) return trimmed;
+	if (trimmed.startsWith(PI_WORKER_PREFIX) || trimmed.startsWith(COLLIE_MODEL_PREFIX)) return trimmed;
 	let normalized = trimmed;
 	while (normalized.startsWith(OPENCODE_MODEL_PREFIX)) {
 		normalized = normalized.slice(OPENCODE_MODEL_PREFIX.length).trimStart();
@@ -111,6 +113,9 @@ export function encodeWorkerModel(backend: WorkerBackend, model: string) {
 	if (backend === "pi") {
 		return value.startsWith(PI_WORKER_PREFIX) ? value : `${PI_WORKER_PREFIX}${value}`;
 	}
+	if (backend === "collie") {
+		return value.startsWith(COLLIE_MODEL_PREFIX) ? value : `${COLLIE_MODEL_PREFIX}${value}`;
+	}
 	return value;
 }
 
@@ -119,6 +124,9 @@ export function decodeWorkerModel(value: string): { backend: WorkerBackend; mode
 	if (!normalized) throw new Error("Worker model must not be empty.");
 	if (normalized.startsWith(PI_WORKER_PREFIX)) {
 		return { backend: "pi", model: normalized.slice(PI_WORKER_PREFIX.length) };
+	}
+	if (normalized.startsWith(COLLIE_MODEL_PREFIX)) {
+		return { backend: "collie", model: normalized.slice(COLLIE_MODEL_PREFIX.length) };
 	}
 	return { backend: "opencode", model: normalized };
 }
@@ -360,7 +368,7 @@ export function taskSummary(task: TaskSnapshot) {
 	// repeated "pi::" wrapper that could double the display backend label,
 	// guaranteeing exactly one display backend prefix in the summary even for
 	// malformed legacy snapshots.
-	const modelPart = normalizeWorkerModelValue(task.model).replace(/^(?:pi::)+/, "");
+	const modelPart = normalizeWorkerModelValue(task.model).replace(/^(?:(?:pi|collie)::)+/, "");
 	return `${task.id} [${task.status}] ${task.mode}${worktreeMark} "${task.name}" (${Math.round(elapsed / 1000)}s, ${task.backend}:${modelPart})`;
 }
 
@@ -693,6 +701,29 @@ export function extractUsageFromEvent(event: Record<string, unknown>): TaskUsage
 		const result: TaskUsage = {
 			inputTokens: pickNumber(usage, ["input", "inputTokens", "input_tokens", "prompt_tokens"]),
 			outputTokens: pickNumber(usage, ["output", "outputTokens", "output_tokens", "completion_tokens"]),
+			totalTokens: pickNumber(usage, ["total", "totalTokens", "total_tokens"]),
+			reasoningTokens: pickNumber(usage, ["reasoning", "reasoningTokens", "reasoning_tokens"]),
+			cacheReadTokens: pickNumber(usage, ["cacheRead", "cacheReadTokens", "cache_read", "cache_read_tokens"]),
+			cacheWriteTokens: pickNumber(usage, ["cacheWrite", "cacheWriteTokens", "cache_write", "cache_write_tokens"]),
+		};
+		const cost = pickCost(usage.cost);
+		if (cost !== undefined) result.cost = cost;
+		return result;
+	}
+
+	// Experimental Collie final result JSON: the last stdout line is a
+	// top-level object carrying `answer` and/or `error` plus `usage`. Usage is
+	// extracted from `usage` with the shared numeric key aliases; answer/error
+	// text flows through the backend adapter into the raw output and report
+	// parsing, not through here. Object answers are accepted as well as strings.
+	if (Object.prototype.hasOwnProperty.call(event, "answer") || Object.prototype.hasOwnProperty.call(event, "error")) {
+		const usage = event.usage && typeof event.usage === "object" && !Array.isArray(event.usage)
+			? event.usage as Record<string, unknown>
+			: undefined;
+		if (!usage) return undefined;
+		const result: TaskUsage = {
+			inputTokens: pickNumber(usage, ["input", "inputTokens", "input_tokens", "prompt", "prompt_tokens"]),
+			outputTokens: pickNumber(usage, ["output", "outputTokens", "output_tokens", "completion", "completion_tokens"]),
 			totalTokens: pickNumber(usage, ["total", "totalTokens", "total_tokens"]),
 			reasoningTokens: pickNumber(usage, ["reasoning", "reasoningTokens", "reasoning_tokens"]),
 			cacheReadTokens: pickNumber(usage, ["cacheRead", "cacheReadTokens", "cache_read", "cache_read_tokens"]),

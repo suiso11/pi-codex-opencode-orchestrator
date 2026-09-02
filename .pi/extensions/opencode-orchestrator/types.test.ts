@@ -35,9 +35,10 @@ import type { TaskSnapshot } from "./types.ts";
 
 const cwd = path.join(os.tmpdir(), "pi-opencode-test-repo");
 
-test("worker model routes encode Pi opt-out without changing OpenCode model IDs", () => {
+test("worker model routes encode Pi and opt-in Collie without changing OpenCode model IDs", () => {
 	assert.equal(encodeWorkerModel("opencode", "opencode-go/glm-5.2"), "opencode-go/glm-5.2");
 	assert.equal(encodeWorkerModel("pi", "anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.equal(encodeWorkerModel("collie", "provider/model"), "collie::provider/model");
 	assert.deepEqual(decodeWorkerModel("opencode-go/glm-5.2"), {
 		backend: "opencode",
 		model: "opencode-go/glm-5.2",
@@ -45,6 +46,10 @@ test("worker model routes encode Pi opt-out without changing OpenCode model IDs"
 	assert.deepEqual(decodeWorkerModel("pi::anthropic/claude-example"), {
 		backend: "pi",
 		model: "anthropic/claude-example",
+	});
+	assert.deepEqual(decodeWorkerModel("collie::provider/model"), {
+		backend: "collie",
+		model: "provider/model",
 	});
 });
 
@@ -56,9 +61,10 @@ test("normalizeWorkerModelValue trims and collapses repeated opencode: prefixes 
 	// Repeated prefixes: every leading "opencode:" is collapsed.
 	assert.equal(normalizeWorkerModelValue("opencode:opencode:opencode-go/glm-5.2"), "opencode-go/glm-5.2");
 	assert.equal(normalizeWorkerModelValue("  opencode:opencode:opencode-go/glm-5.2  "), "opencode-go/glm-5.2");
-	// Pi values are preserved verbatim (after trim), never treated as OpenCode.
+	// Pi and Collie values are preserved verbatim (after trim), never treated as OpenCode.
 	assert.equal(normalizeWorkerModelValue("pi::anthropic/claude-example"), "pi::anthropic/claude-example");
 	assert.equal(normalizeWorkerModelValue("  pi::anthropic/claude-example  "), "pi::anthropic/claude-example");
+	assert.equal(normalizeWorkerModelValue("  collie::provider/model  "), "collie::provider/model");
 	// Values that normalize away entirely yield "".
 	assert.equal(normalizeWorkerModelValue("opencode:"), "");
 	assert.equal(normalizeWorkerModelValue("  "), "");
@@ -71,9 +77,11 @@ test("encode/decode yield a raw OpenCode snapshot model and the raw Pi model aft
 	assert.equal(encodeWorkerModel("pi", "anthropic/claude-example"), "pi::anthropic/claude-example");
 	assert.equal(encodeWorkerModel("pi", "pi::anthropic/claude-example"), "pi::anthropic/claude-example");
 	assert.equal(encodeWorkerModel("pi", "opencode:anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.equal(encodeWorkerModel("collie", "provider/model"), "collie::provider/model");
 	assert.deepEqual(decodeWorkerModel("opencode-go/glm-5.2"), { backend: "opencode", model: "opencode-go/glm-5.2" });
 	assert.deepEqual(decodeWorkerModel("opencode:opencode-go/glm-5.2"), { backend: "opencode", model: "opencode-go/glm-5.2" });
 	assert.deepEqual(decodeWorkerModel("pi::anthropic/claude-example"), { backend: "pi", model: "anthropic/claude-example" });
+	assert.deepEqual(decodeWorkerModel("collie::provider/model"), { backend: "collie", model: "provider/model" });
 	assert.throws(() => encodeWorkerModel("opencode", ""), /must not be empty/);
 	assert.throws(() => encodeWorkerModel("pi", "opencode:"), /must not be empty/);
 	assert.throws(() => decodeWorkerModel("opencode:"), /must not be empty/);
@@ -810,7 +818,7 @@ test("taskSummary and taskResultText expose worktree state without leaking the w
 });
 
 test("taskSummary renders exactly one backend prefix, never doubling legacy prefixes", () => {
-	const summary = (backend: "opencode" | "pi", model: string) =>
+	const summary = (backend: "opencode" | "pi" | "collie", model: string) =>
 		taskSummary({ ...fakeSnapshot(""), backend, model });
 	// Legacy snapshots may persist a stray display prefix (or several): the
 	// summary must still show exactly "opencode:provider/model", not doubled.
@@ -825,5 +833,12 @@ test("taskSummary renders exactly one backend prefix, never doubling legacy pref
 		const text = summary("pi", model);
 		assert.match(text, /\(0s, pi:provider\/model\)$/);
 		assert.doesNotMatch(text, /pi:pi::/);
+	}
+	// Collie snapshots keep their wrapper or not; repeated "collie::" is
+	// collapsed so the display label is exactly "collie:provider/model".
+	for (const model of ["collie::provider/model", "provider/model", "collie::collie::provider/model"]) {
+		const text = summary("collie", model);
+		assert.match(text, /\(0s, collie:provider\/model\)$/);
+		assert.doesNotMatch(text, /collie:collie::/);
 	}
 });

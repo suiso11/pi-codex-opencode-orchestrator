@@ -3,6 +3,7 @@ import test from "node:test";
 import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } from "./backends/backend.ts";
 import { buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
+import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
 import type { TaskSpec, WorkerReport } from "./types.ts";
 
 function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInput {
@@ -19,6 +20,7 @@ function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInp
 		model: "opencode-go/glm-5.2",
 		thinking: "high",
 		prompt: "PROMPT",
+		cwd: "/tmp/worktree",
 		...overrides,
 	};
 }
@@ -215,7 +217,52 @@ test("output protocol decodes stderr chunks unchanged and normalizes exit report
 	];
 	const report: WorkerReport = { summary: "s", files: ["f"], findings: ["x"], unresolved: ["y"] };
 	for (const adapter of adapters) {
-		assert.equal(adapter.decodeStderrChunk("raw chunk\n"), "raw chunk\n");
+		assert.deepEqual(adapter.decodeStderrChunk("raw chunk\n"), { text: "raw chunk\n", activity: [] });
 		assert.deepEqual(adapter.normalizeExitReport(report), report);
 	}
+});
+
+test("CollieBackendAdapter is fail-closed and builds the exact isolated command", () => {
+	const adapter = new CollieBackendAdapter({ binary: "collie", binaryArgs: ["--wrapper"] });
+	const input = spawnInput({
+		model: "provider/model-name",
+		spec: { ...spawnInput().spec, mode: "write", role: "implementer", worktree: true },
+	});
+	assert.deepEqual(adapter.buildArgs(input, { activity: [] }), [
+		"--wrapper", "run", "PROMPT", "--provider", "provider", "--model", "model-name",
+		"--cwd", "/tmp/worktree", "--mode", "auto", "--json", "--stream-json",
+	]);
+	assert.deepEqual(adapter.decodeStdoutLine("", { answer: JSON.stringify({ summary: "ok", files: [], findings: [], unresolved: [] }), usage: { input: 1 } }).activity, ["event"]);
+	assert.match(adapter.decodeStdoutLine("", { answer: "plain answer" }).output ?? "", /plain answer/);
+	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ type: "progress", message: "working" }) + "\n").activity, ["progress: working"]);
+	assert.match(collieGateError({ spec: { ...input.spec, mode: "read_only" } }, { PI_ORCH_ENABLE_COLLIE: "1" }) ?? "", /mode=write/);
+	assert.match(collieGateError({ spec: input.spec }, {}) ?? "", /disabled/);
+});
+
+test("CollieBackendAdapter normalizes stdout reports and stderr NDJSON diagnostics", () => {
+	const adapter = new CollieBackendAdapter({ binary: "collie", binaryArgs: [] });
+	// Non-JSON stdout lines append nothing (Collie stdout is final-JSON only).
+	assert.deepEqual(adapter.decodeStdoutLine("plain line", undefined), { output: undefined, activity: [] });
+	// Plain string answers are wrapped into the common report shape.
+	assert.equal(
+		adapter.decodeStdoutLine("", { answer: "done quickly" }).output,
+		`${JSON.stringify({ summary: "done quickly", files: [], findings: [], unresolved: [] })}\n`,
+	);
+	// Error strings become unresolved findings in the normalized report.
+	assert.equal(
+		adapter.decodeStdoutLine("", { error: "boom" }).output,
+		`${JSON.stringify({ summary: "Collie worker error", files: [], findings: [], unresolved: ["boom"] })}\n`,
+	);
+	// Stderr NDJSON: activity strings, part-based tool labels, and status
+	// fields decode to labels; non-JSON lines add no activity while raw text
+	// is always retained verbatim.
+	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ activity: "hand-running" }) + "\n").activity, ["hand-running"]);
+	assert.deepEqual(
+		adapter.decodeStderrChunk(JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "edit", state: { status: "done" } } }) + "\n").activity,
+		["edit: done"],
+	);
+	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ type: "state", status: "starting" }) + "\n").activity, ["state: starting"]);
+	const raw = adapter.decodeStderrChunk("not json\n");
+	assert.equal(raw.text, "not json\n");
+	assert.deepEqual(raw.activity, []);
 });

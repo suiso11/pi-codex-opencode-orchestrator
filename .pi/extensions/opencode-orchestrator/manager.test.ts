@@ -65,6 +65,25 @@ process.stdout.write(JSON.stringify({ type: "step_finish", part: { type: "step-f
 	};
 }
 
+async function fakeCollie() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-collie-"));
+	const script = path.join(dir, "collie.mjs");
+	await writeFile(
+		script,
+		`
+const args = process.argv.slice(2);
+const report = { summary: "collie done", files: ["src/collie.ts"], findings: ["ok"], unresolved: [] };
+process.stderr.write(JSON.stringify({ type: "progress", message: "streaming", args }) + "\\n");
+process.stdout.write(JSON.stringify({ answer: JSON.stringify(report), usage: { input: 11, output: 7, total: 18, cost: 0.004 } }) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
 async function fakePiMessageEnd() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-pi-msgend-"));
 	const script = path.join(dir, "msgend.mjs");
@@ -342,6 +361,73 @@ test("manager canonicalizes legacy opencode: prefixed models across env, options
 		else process.env.PI_OPENCODE_PROFILE_REVIEWER = originalRev;
 		if (originalTester === undefined) delete process.env.PI_OPENCODE_PROFILE_TESTER;
 		else process.env.PI_OPENCODE_PROFILE_TESTER = originalTester;
+	}
+});
+
+test("manager runs an opt-in Collie worker only in an isolated implementer worktree", async () => {
+	const fake = await fakeCollie();
+	const repo = await fakeGitRepo();
+	const original = process.env.PI_ORCH_ENABLE_COLLIE;
+	process.env.PI_ORCH_ENABLE_COLLIE = "1";
+	const manager = new OpenCodeTaskManager({
+		collieBinary: fake.binary,
+		collieBinaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	try {
+		const started = manager.spawn({
+			...spec("collie-worker", "write", ["src/collie.ts"]),
+			model: "collie::provider/model-name",
+			role: "implementer",
+			worktree: true,
+		}, repo.dir);
+		assert.equal(started.backend, "collie");
+		assert.equal(started.model, "provider/model-name");
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(settled.report?.summary, "collie done");
+		assert.deepEqual(settled.usage, { inputTokens: 11, outputTokens: 7, totalTokens: 18, cost: 0.004 });
+		assert.ok(settled.activity.includes("progress: streaming"));
+		const args = (JSON.parse(settled.stderr.trim()) as { args: string[] }).args;
+		assert.equal(args[0], "run");
+		assert.match(args[1] ?? "", /Task name: collie-worker/);
+		assert.equal(args[args.indexOf("--provider") + 1], "provider");
+		assert.equal(args[args.indexOf("--model") + 1], "model-name");
+		assert.equal(args[args.indexOf("--mode") + 1], "auto");
+		assert.equal(args.at(-2), "--json");
+		assert.equal(args.at(-1), "--stream-json");
+	} finally {
+		await manager.dispose();
+		if (original === undefined) delete process.env.PI_ORCH_ENABLE_COLLIE;
+		else process.env.PI_ORCH_ENABLE_COLLIE = original;
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("manager rejects disabled and unsafe Collie routes before creating a task", async () => {
+	const manager = new OpenCodeTaskManager({ collieBinary: "must-not-launch" });
+	try {
+		const base = { ...spec("collie-gate", "write", ["src/a.ts"]), model: "collie::provider/model", role: "implementer" as const, worktree: true };
+		const original = process.env.PI_ORCH_ENABLE_COLLIE;
+		delete process.env.PI_ORCH_ENABLE_COLLIE;
+		try {
+			assert.throws(() => manager.spawn(base, process.cwd()), /Collie backend is disabled/);
+			assert.equal(manager.list().length, 0);
+			process.env.PI_ORCH_ENABLE_COLLIE = "1";
+			assert.throws(() => manager.spawn({ ...base, worktree: false }, process.cwd()), /worktree=true/);
+			assert.throws(() => manager.spawn({ ...base, mode: "read_only", role: "tester", worktree: false }, process.cwd()), /role=implementer/);
+			assert.throws(
+				() => manager.spawn({ ...base, model: "collie::model-without-slash" }, process.cwd()),
+				/Collie model must use provider\/model format/,
+			);
+			assert.equal(manager.list().length, 0);
+		} finally {
+			if (original === undefined) delete process.env.PI_ORCH_ENABLE_COLLIE;
+			else process.env.PI_ORCH_ENABLE_COLLIE = original;
+		}
+	} finally {
+		await manager.dispose();
 	}
 });
 

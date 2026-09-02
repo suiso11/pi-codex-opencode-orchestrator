@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ModelCapability, TaskMode, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
 import { buildAgentFrontmatter, enforceToolLimit, resolveToolProfile, toolsForProfile } from "../types.ts";
-import { activityFromEvent, type BackendDecodedLine, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
+import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 function opencodeAgentDir(): string {
 	// OpenCode resolves agents by name from ~/.config/opencode/agent/ on every platform.
@@ -162,8 +162,8 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		return { output, activity: [activityFromEvent(event)] };
 	}
 
-	decodeStderrChunk(chunk: string): string {
-		return chunk;
+	decodeStderrChunk(chunk: string): BackendDecodedStderrChunk {
+		return { text: chunk, activity: [] };
 	}
 
 	normalizeExitReport(report: WorkerReport): WorkerReport {

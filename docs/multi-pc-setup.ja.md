@@ -132,6 +132,8 @@ Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対
 
 `pi` backendはOpenCodeを完全に迂回し、Piで認証済みのClaude、Codexなどを直接workerとして起動する。`opencode` backendを選んだ経路だけがOpenCode CLIを使用する。
 
+実験的なCollie backendは、タスクの `model` を `collie::provider/model` とし、`PI_ORCH_ENABLE_COLLIE=1` を明示した場合だけ利用できる。安全上、`mode: write`・`role: implementer`・`worktree: true` の組み合わせ以外は、workerやworktreeを開始する前に拒否される。実行ファイルは `PI_COLLIE_BIN`（未指定時は `collie`）。構造化promptを渡して `collie run ... --provider ... --model ... --cwd <管理対象worktree> --mode auto --json --stream-json` を起動する。stdoutの最終JSON（`answer`/`error`/`usage`）は共通report/usageへ正規化し、stderrのNDJSONはraw診断として保持しつつactivityへ要約する。Collieにtool allowlistがあるとは主張せず、既存のworktreeスコープ・統合ゲートを使う（worktreeはOSサンドボックスではない）。Collieのインストールはこのプロジェクトでは行わない。
+
 `tester` プロファイルのモデルも同じ仕組みで設定できる: `pi-orch model tester [pi|opencode] <provider/model>`、環境変数 `PI_OPENCODE_PROFILE_TESTER`、または保存された設定。`/opencode-status` で現在のtesterプロファイルを確認できる。
 
 ロールはタスク名から推測されない。明示的なロールは次のとおり。

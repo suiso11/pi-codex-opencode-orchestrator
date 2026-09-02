@@ -157,6 +157,10 @@ The skill uses progressive disclosure and adds no scripts, dependencies, or netw
 
 Each worker route can use either the OpenCode backend or the Pi backend. The Pi backend launches a bounded, non-interactive Pi worker with the selected Pi provider/model and never starts OpenCode. Read-only Pi workers receive only read/search tools; write workers receive the editing toolset.
 
+### Experimental Collie backend
+
+Collie is an opt-in isolated route selected with `model: "collie::provider/model"`. It launches only when `PI_ORCH_ENABLE_COLLIE=1` and the task is exactly `mode: "write"`, `role: "implementer"`, and `worktree: true`; every other Collie request is rejected before the child process or worktree starts. The executable is `PI_COLLIE_BIN` or `collie` by default. The adapter invokes `collie run <structured prompt> --provider <provider> --model <model> --cwd <managed worktree> --mode auto --json --stream-json`. Collie has no claimed tool allowlist: isolation and the existing worktree scope/integration gates remain the security boundary, and worktree isolation is not an OS sandbox. Final stdout JSON (`answer`/`error`/`usage`) is normalized to the common report/usage fields; NDJSON stderr is retained as raw diagnostics and summarized as activity.
+
 The default routes remain `opencode-go/glm-5.2` and `opencode-go/kimi-k3`. The `implementer`, `tester`, and `reviewer` profile names are role-based aliases and do not force any specific model family. The `tester` profile defaults to the default worker model (`opencode-go/glm-5.2`) and is configurable through `PI_OPENCODE_PROFILE_TESTER` or `pi-orch model tester [pi|opencode] <provider/model>`.
 
 Override any profile when needed:
