@@ -95,6 +95,9 @@ test("report and release args use the official CLI protocol with source and agen
 
 // Fake Herdr CLI: a cross-platform Node script that logs its CLI args as JSONL
 // to the file given through HERDR_FAKE_LOG, optionally exiting non-zero.
+// HERDR_FAKE_MODE="slow-first" delays the seq-1 call's log write past any later
+// calls: if dispatches overlap, later seqs land first and the log order
+// reverses; a serialized reporter always keeps seq order.
 async function fakeHerdr() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-herdr-"));
 	const script = path.join(dir, "herdr.mjs");
@@ -103,7 +106,11 @@ async function fakeHerdr() {
 		script,
 		`
 import { appendFileSync } from "node:fs";
-appendFileSync(process.env.HERDR_FAKE_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+const args = process.argv.slice(2);
+const write = () => appendFileSync(process.env.HERDR_FAKE_LOG, JSON.stringify(args) + "\\n");
+const seqIndex = args.indexOf("--seq");
+const slow = process.env.HERDR_FAKE_MODE === "slow-first" && args[seqIndex + 1] === "1";
+if (slow) setTimeout(write, 250); else write();
 if (process.env.HERDR_FAKE_MODE === "fail") process.exit(2);
 `,
 	);
@@ -148,6 +155,33 @@ test("reporter sends report-agent only on status change and release-agent at shu
 		assert.equal(lines[2][1], "release-agent");
 		assert.match(lines[2].join(" "), /--seq 3/);
 		assert.equal(reporter.lastStatus?.state, "idle");
+		assert.equal(reporter.diagnostics.length, 0);
+	} finally {
+		delete process.env.HERDR_FAKE_LOG;
+		delete process.env.HERDR_FAKE_MODE;
+		await fake.cleanup();
+	}
+});
+
+test("reporter serializes dispatches: a slow seq-1 CLI call cannot be overtaken by later seqs", async () => {
+	const fake = await fakeHerdr();
+	process.env.HERDR_FAKE_LOG = fake.log;
+	process.env.HERDR_FAKE_MODE = "slow-first";
+	try {
+		const reporter = new HerdrStatusReporter({
+			env: { paneId: "w1:p1", binPath: process.execPath },
+			binArgs: [path.join(fake.dir, "herdr.mjs")],
+		});
+		reporter.report([task({ status: "running" })], []);
+		reporter.report([], []);
+		reporter.release();
+		await reporter.flush();
+		const lines = (await readFile(fake.log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(lines.map((line) => line[1]), ["report-agent", "report-agent", "release-agent"]);
+		assert.deepEqual(
+			lines.map((line) => line[line.indexOf("--seq") + 1]),
+			["1", "2", "3"],
+		);
 		assert.equal(reporter.diagnostics.length, 0);
 	} finally {
 		delete process.env.HERDR_FAKE_LOG;

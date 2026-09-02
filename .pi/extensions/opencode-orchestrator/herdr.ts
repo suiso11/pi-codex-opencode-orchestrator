@@ -148,6 +148,7 @@ export class HerdrStatusReporter {
 
 	/** Resolves once every dispatched CLI subprocess has settled (success or failure). */
 	async flush(): Promise<void> {
+		await this.tail;
 		while (this.inflight.size > 0) {
 			await Promise.allSettled([...this.inflight]);
 		}
@@ -164,24 +165,31 @@ export class HerdrStatusReporter {
 		});
 		this.inflight.add(done);
 		// Dispatches are serialized: Herdr applies statuses by seq, so concurrent
-		// CLI calls could land out of order and let a stale state win. Spawning
-		// the next call only after the previous one settled keeps seq order.
-		this.tail = this.tail.then(() => {
-			try {
-				execFile(
-					this.options.env.binPath,
-					[...(this.options.binArgs ?? []), ...args],
-					{ windowsHide: true, timeout: CLI_TIMEOUT_MS },
-					(error) => {
+		// CLI calls could land out of order and let a stale state win. The chain
+		// link must resolve only when the previous execFile callback fired (not
+		// merely when it was spawned), so the next call starts after the previous
+		// one settled and seq order holds.
+		this.tail = this.tail.then(
+			() =>
+				new Promise<void>((resolve) => {
+					try {
+						execFile(
+							this.options.env.binPath,
+							[...(this.options.binArgs ?? []), ...args],
+							{ windowsHide: true, timeout: CLI_TIMEOUT_MS },
+							(error) => {
+								record(error);
+								settle();
+								resolve();
+							},
+						);
+					} catch (error) {
 						record(error);
 						settle();
-					},
-				);
-			} catch (error) {
-				record(error);
-				settle();
-			}
-		});
+						resolve();
+					}
+				}),
+		);
 	}
 
 	/** Bounded, path-free diagnostic: error code only, never a message with paths. */
