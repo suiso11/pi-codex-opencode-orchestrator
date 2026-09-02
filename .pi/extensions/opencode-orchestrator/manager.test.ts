@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { buildOpenCodeConfigContent } from "./backends/opencode.ts";
-import { OpenCodeTaskManager } from "./manager.ts";
+import { captureGitFingerprint, OpenCodeTaskManager } from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
 import { buildWorkerEnv } from "./worker-env.ts";
 
@@ -19,7 +19,7 @@ async function fakeOpenCode() {
 		script,
 		`
 const prompt = process.argv.at(-1) || "";
-const delay = prompt.includes("slow") ? 500 : 20;
+const delay = prompt.includes("queue-block") ? 30_000 : prompt.includes("slow") ? 500 : 20;
 setTimeout(() => {
   process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: "FAKE_OK" } }) + "\\n");
 }, delay);
@@ -175,6 +175,24 @@ async function fakeGitRepo() {
 	};
 }
 
+test("GitFingerprint requires HEAD identity and observes a same-commit branch switch", async () => {
+	const repo = await fakeGitRepo();
+	try {
+		const before = captureGitFingerprint(repo.dir);
+		assert.ok(before);
+		assert.match(before.headOid, /^[0-9a-f]{40}$/);
+		assert.ok(before.headRef);
+		repo.git(["branch", "same-commit"]);
+		repo.git(["checkout", "-q", "same-commit"]);
+		const after = captureGitFingerprint(repo.dir);
+		assert.ok(after);
+		assert.equal(after.headOid, before.headOid, "the test branch intentionally points at the same commit");
+		assert.notEqual(after.headRef, before.headRef, "the symbolic HEAD identity must still change");
+	} finally {
+		await repo.cleanup();
+	}
+});
+
 async function fakeMutatingOpenCode(mutation = `writeFileSync("mutated.txt", "changed\\n", "utf8");`) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-mutate-"));
 	const script = path.join(dir, "mutate.mjs");
@@ -254,7 +272,7 @@ test("cancellation after worker exit prevents queued worktree integration", asyn
 	const repo = await fakeGitRepo();
 	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
 	try {
-		const first = manager.spawn({ ...spec("queue-first", "write", ["src/a"], "slow"), worktree: true }, repo.dir);
+		const first = manager.spawn({ ...spec("queue-first", "write", ["src/a"], "queue-block"), worktree: true }, repo.dir);
 		const queued = manager.spawn({ ...spec("queue-cancel", "write", ["src/b"], "quick"), worktree: true }, repo.dir);
 		for (let attempt = 0; attempt < 40 && !manager.get(queued.id)?.output.includes("FAKE_OK"); attempt++) {
 			await new Promise((resolve) => setTimeout(resolve, 25));
@@ -263,10 +281,12 @@ test("cancellation after worker exit prevents queued worktree integration", asyn
 		const [cancelled] = await manager.cancel([queued.id]);
 		assert.equal(cancelled.status, "cancelled");
 		assert.equal(cancelled.worktree?.status, "retained");
-		const [settledFirst] = await manager.wait([first.id]);
-		assert.equal(settledFirst.status, "done");
+		const [cancelledFirst] = await manager.cancel([first.id]);
+		assert.equal(cancelledFirst.status, "cancelled");
+		assert.equal(cancelledFirst.worktree?.status, "retained");
 		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "base\n");
 		manager.discardRetainedWorktree(queued.id);
+		manager.discardRetainedWorktree(first.id);
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();

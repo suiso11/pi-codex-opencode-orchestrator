@@ -766,6 +766,30 @@ test("external root mutation before integration conflicts and retains both workt
 	}
 });
 
+test("same-commit branch switch poisons integration even when the root stays clean", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	let id = "";
+	try {
+		const started = manager.spawn(
+			{ ...spec("wt-branch-switch", "write", ["src/a.txt"], "WRITE_SRC_A SLOW"), worktree: true },
+			repo.dir,
+		);
+		id = started.id;
+		repo.git(["branch", "same-commit"]);
+		repo.git(["checkout", "-q", "same-commit"]);
+		const [settled] = await manager.wait([id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.worktree?.error ?? "", /External mutation detected at the repository root/);
+		assert.equal(await readFile(path.join(repo.dir, "src", "a.txt"), "utf8"), "a\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
 test("successful no-op integration removes the worktree and temp patch", async () => {
 	const fake = await fakeWorker();
 	const repo = await fakeGitRepo();
@@ -845,8 +869,11 @@ async function retainedIntegrationFailure(manager: OpenCodeTaskManager, repoDir:
 	const [settled] = await manager.wait([started.id]);
 	assert.equal(settled.status, "error");
 	assert.match(settled.worktree?.error ?? "", /External mutation detected at the repository root/);
+	// Retry deliberately accepts only a clean root at the original base HEAD.
+	// Restore the external sentinel after producing the retained failure.
+	await writeFile(path.join(repoDir, "base.txt"), "base\n", "utf8");
 	const view = manager.getRetainedWorktree(started.id);
-	assert.equal(view.retryable, true, "validated patch with unmodified root must be retryable");
+	assert.equal(view.retryable, true, "validated patch with a clean original-base root must be retryable");
 	return started.id;
 }
 
@@ -1026,9 +1053,9 @@ test("retry conflict never mutates the repository root", async () => {
 		id = await retainedIntegrationFailure(manager, repo.dir, "wt-retry-conflict");
 		// Introduce a conflicting root change so the patch no longer applies.
 		await writeFile(path.join(repo.dir, "src", "a.txt"), "conflict\n", "utf8");
-		assert.throws(() => manager.retryRetainedWorktree(id), /no longer applies/);
+		assert.throws(() => manager.retryRetainedWorktree(id), /clean repository root/);
 		assert.equal(await readFile(path.join(repo.dir, "src", "a.txt"), "utf8"), "conflict\n", "root must be untouched");
-		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "ext\n");
+		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "base\n");
 		const still = manager.getRetainedWorktree(id);
 		assert.equal(still.retryable, true, "entry remains retryable after a clean rejection");
 	} finally {
@@ -1093,7 +1120,7 @@ test("retry is blocked while any task runs or a batch is open in the same reposi
 		// Restore the external mutation so a new batch can open in the same repo.
 		await writeFile(path.join(repo.dir, "base.txt"), "base\n", "utf8");
 		const blocker = manager.spawn(
-			{ ...spec("wt-block-b", "write", ["src/b.txt"], "WRITE_SRC_B SLOW"), worktree: true },
+			{ ...spec("wt-block-b", "write", ["src/b.txt"], "SLOW"), worktree: true },
 			repo.dir,
 		);
 		blockerId = blocker.id;

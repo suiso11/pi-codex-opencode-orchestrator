@@ -268,7 +268,7 @@ For genuinely parallel writes that touch disjoint paths, opt each write task int
 ### Batch setup and integration
 
 - The first worktree task in a batch requires a clean Git root (no tracked, staged, or nonignored-untracked changes); a dirty root is refused. Later worktree tasks in the same batch share that base and must be spawned while the batch is still open — that is, before the batch settles.
-- Integration applies each worker's Git binary patch to the repository root in task-ID order, without committing, stashing, or resetting. Before each apply the extension fingerprints the root; if the root changed externally since the batch base, it poisons the batch and aborts integration for that task and the remaining ones.
+- Integration applies each worker's Git binary patch to the repository root in task-ID order, without committing, stashing, or resetting. The batch retains its starting HEAD and the buffers of successful integrations. Before each apply, a temporary detached shadow worktree replays those buffers plus the current patch from the batch base HEAD to calculate the exact expected fingerprint (including HEAD OID); the root must match its prior fingerprint before `git apply --check`, between check/apply, and must exactly match the shadow postcondition afterward. Any HEAD change, extra/same-path mutation, mismatch, or shadow cleanup failure poisons the batch and aborts without automatic revert.
 - Because integration mutates the root, the root becomes dirty after a worktree batch settles. Commit or clean it before starting another worktree batch.
 
 ### JSON examples
@@ -395,7 +395,8 @@ Manage retained or conflicted worktrees in the running session with `/opencode-w
 - Retry safety:
   - The retried patch is the validated patch captured from the original current-session run; a replacement patch is never accepted.
   - A retry is rejected while any task or batch for the same repository is active.
-  - Before apply, the extension re-checks a fingerprint of the root and runs `git apply --check`; integration never uses reset, stash, commit, or a 3-way merge.
+  - Retry is permitted only when the root is clean and its HEAD OID still equals the retained original base HEAD. A detached shadow replays the validated buffer to establish the exact expected postcondition; the root is checked before and after `git apply --check`, and after `git apply`.
+  - Integration never uses reset, stash, commit, or a 3-way merge; any postcondition failure leaves the root untouched when possible and never automatically reverts it.
   - The extension does not attempt automatic conflict resolution. Conflicted integrations are surfaced for manual resolution or discard.
 - Behavior on failed cleanup or successful root integration: when a worktree cannot be cleaned up (`cleanup-failed`) it stays registered for a later attempt; when the patch is applied to the root (`rootIntegrated`) the retained worktree is removed and the root is left dirty for you to commit or clean.
 - Read-only inspection is available to agents through the `inspection` tool group as `opencode_worktree_list` and `opencode_worktree_status`; these return no filesystem paths in model-facing output.

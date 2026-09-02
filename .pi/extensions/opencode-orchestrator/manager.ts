@@ -82,6 +82,13 @@ interface ManagedTask {
 }
 
 interface GitFingerprint {
+	// HEAD is part of the fingerprint, not merely an informational field. This
+	// makes a checkout/reset/branch switch observable even when the resulting
+	// tree is clean. The symbolic ref catches a branch switch that happens to
+	// point at the same commit; detached shadows normalize it to the root ref
+	// before comparison.
+	headOid: string;
+	headRef?: string;
 	hash: string;
 	paths: string[];
 	// Per-path content/state hashes let us distinguish a worker mutation from a
@@ -118,8 +125,14 @@ interface WorktreeRuntime {
 interface WorktreeBatch {
 	repoRoot: string;
 	key: string;
+	// The immutable batch start HEAD is also the base for every shadow
+	// postcondition calculation.
 	baseHead: string;
 	expectedFingerprint: GitFingerprint;
+	// Only buffers whose root apply has passed its exact postcondition are kept.
+	// They let a later shadow replay the root's complete expected state without
+	// trusting the live worktree or a mutable archive.
+	integratedPatchBuffers: Buffer[];
 	tasks: ManagedTask[];
 	poisoned: boolean;
 	open: boolean;
@@ -135,6 +148,7 @@ interface RetainedWorktree {
 	path: string;
 	repoRoot: string;
 	baseHead: string;
+	baseHeadRef?: string;
 	scopes: string[];
 	changedPaths: string[];
 	conflictPaths: string[];
@@ -311,6 +325,16 @@ function isCleanFingerprint(fp: GitFingerprint) {
 	return fp.paths.length === 0;
 }
 
+function sameGitFingerprint(left: GitFingerprint, right: GitFingerprint): boolean {
+	if (left.headOid !== right.headOid || left.headRef !== right.headRef || left.hash !== right.hash) return false;
+	if (left.paths.length !== right.paths.length || left.paths.some((item, index) => item !== right.paths[index])) return false;
+	if (left.pathHashes.size !== right.pathHashes.size) return false;
+	for (const [relative, hash] of left.pathHashes) {
+		if (right.pathHashes.get(relative) !== hash) return false;
+	}
+	return true;
+}
+
 function pathWithinScope(fileAbs: string, scope: string) {
 	// Containment is decided with path.relative (not a string prefix) so that
 	// Japanese/space-containing paths and prefix lookalikes (e.g. scope "src/a"
@@ -439,7 +463,15 @@ function createPatchArchive(baseDir: string, patch: Buffer): string {
 export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 	const worktreeCheck = requiredGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
 	if (!worktreeCheck || worktreeCheck.toString("utf8").trim() !== "true") return undefined;
+	const head = requiredGit(cwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
+	const headOid = head?.toString("utf8").trim();
+	if (!headOid) return undefined;
+	const headRefResult = runGitResult(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	const headRef = headRefResult.ok ? headRefResult.stdout.toString("utf8").trim() || undefined : undefined;
 	const hash = createHash("sha256");
+	hash.update(Buffer.from("head-oid\0"));
+	hash.update(Buffer.from(headOid, "utf8"));
+	hash.update(Buffer.from("\0"));
 	const paths = new Set<string>();
 
 	hash.update(Buffer.from("worktree-diff\0"));
@@ -506,7 +538,7 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 		pathHash.update(staged);
 		pathHashes.set(relative, pathHash.digest("hex"));
 	}
-	return { hash: hash.digest("hex"), paths: [...paths].sort(), pathHashes };
+	return { headOid, headRef, hash: hash.digest("hex"), paths: [...paths].sort(), pathHashes };
 }
 
 function compareGitFingerprint(baseline: GitFingerprint, cwd: string): GitFingerprintComparison {
@@ -524,7 +556,7 @@ function compareGitFingerprint(baseline: GitFingerprint, cwd: string): GitFinger
 		.filter((relative) => baseline.pathHashes.get(relative) !== after.pathHashes.get(relative))
 		.sort();
 	return {
-		mutated: after.hash !== baseline.hash || changedPaths.length > 0,
+		mutated: !sameGitFingerprint(baseline, after) || changedPaths.length > 0,
 		changedPaths,
 		currentPaths: after.paths,
 	};
@@ -1051,6 +1083,7 @@ export class OpenCodeTaskManager {
 				key,
 				baseHead: headBuffer.toString("utf8").trim(),
 				expectedFingerprint: clean,
+				integratedPatchBuffers: [],
 				tasks: [],
 				poisoned: false,
 				open: true,
@@ -1187,9 +1220,75 @@ export class OpenCodeTaskManager {
 		}
 	}
 
-	// Apply at the repository root without staging/root reset/stash: fingerprint
-	// guard, `git apply --check`, then `git apply`. Update the batch's expected
-	// fingerprint and remove/prune the successfully integrated worktree.
+	// Rebuild the expected postcondition in a disposable detached worktree. The
+	// shadow always starts at the immutable batch base and replays only manager-
+	// held, successfully integrated buffers plus the current buffer. Its path
+	// never enters a snapshot or an error; cleanup is mandatory and any cleanup
+	// failure aborts before the live root is touched.
+	private shadowPostcondition(
+		repoRoot: string,
+		baseHead: string,
+		patches: readonly Buffer[],
+		expectedHeadRef?: string,
+	): GitFingerprint {
+		const baseDir = worktreeRootDir(repoRoot);
+		const shadowPath = path.join(baseDir, `.shadow-${randomBytes(24).toString("hex")}`);
+		let added = false;
+		try {
+			mkdirSync(baseDir, { recursive: true });
+			const add = runGitResult(repoRoot, ["worktree", "add", "--detach", shadowPath, baseHead]);
+			if (!add.ok) {
+				throw new RetentionError(
+					"integration-conflict",
+					`Unable to create the integration shadow worktree: ${redactAbsolutePaths(add.stderr.toString("utf8").trim(), [baseDir, shadowPath]) || "git worktree add failed"}`,
+				);
+			}
+			added = true;
+			for (const patch of patches) {
+				if (patch.length === 0) continue;
+				const check = runGitResult(shadowPath, ["apply", "--check", "-"], patch);
+				if (!check.ok) {
+					throw new RetentionError(
+						"integration-conflict",
+						`Unable to reproduce the expected integration state in the shadow worktree: ${redactAbsolutePaths(check.stderr.toString("utf8").trim(), [baseDir, shadowPath]) || "patch does not apply cleanly"}`,
+					);
+				}
+				const apply = runGitResult(shadowPath, ["apply", "-"], patch);
+				if (!apply.ok) {
+					throw new RetentionError(
+						"integration-conflict",
+						`Unable to reproduce the expected integration state in the shadow worktree: ${redactAbsolutePaths(apply.stderr.toString("utf8").trim(), [baseDir, shadowPath]) || "patch apply failed"}`,
+					);
+				}
+			}
+			const fingerprint = captureGitFingerprint(shadowPath);
+			if (!fingerprint || fingerprint.headOid !== baseHead) {
+				throw new RetentionError("integration-conflict", "Unable to capture the expected integration fingerprint from the shadow worktree; refusing to apply.");
+			}
+			// The shadow is intentionally detached. Normalize only this metadata to
+			// the live root's retained ref so exact comparison also rejects a
+			// same-commit branch switch at the root.
+			return expectedHeadRef === undefined
+				? fingerprint
+				: { ...fingerprint, headRef: expectedHeadRef };
+		} finally {
+			if (added) {
+				const remove = runGitResult(repoRoot, ["worktree", "remove", "--force", shadowPath]);
+				const prune = runGitResult(repoRoot, ["worktree", "prune"]);
+				if (!remove.ok || !prune.ok) {
+					throw new RetentionError(
+						"integration-conflict",
+						"Integration shadow worktree cleanup failed; refusing to apply the patch.",
+					);
+				}
+			}
+		}
+	}
+
+	// Apply at the repository root without staging/root reset/stash. The exact
+	// expected fingerprint is calculated in a detached shadow first, then the
+	// root is checked before and after `git apply`. A mismatch poisons the batch;
+	// the root is deliberately never auto-reverted.
 	private applyPatch(entry: ManagedTask): void {
 		this.throwIfCancelled(entry, "immediately before root integration");
 		const wt = entry.worktree!;
@@ -1197,38 +1296,62 @@ export class OpenCodeTaskManager {
 		if (batch.poisoned) {
 			throw new RetentionError("integration-conflict", "Batch integration aborted after an external root mutation; refusing to apply.");
 		}
-		const fp = captureGitFingerprint(wt.repoRoot);
-		if (!fp) throw new Error("Unable to capture the repository root fingerprint before integration.");
-		if (fp.hash !== batch.expectedFingerprint.hash) {
+		const patch = wt.patchBuffer ?? Buffer.alloc(0);
+		let expected: GitFingerprint;
+		try {
+			expected = this.shadowPostcondition(
+				wt.repoRoot,
+				batch.baseHead,
+				[...batch.integratedPatchBuffers, patch],
+				batch.expectedFingerprint.headRef,
+			);
+		} catch (error) {
+			batch.poisoned = true;
+			if (error instanceof RetentionError) throw error;
+			throw new RetentionError("integration-conflict", `Unable to calculate the expected integration postcondition: ${processError(error)}`);
+		}
+
+		const before = captureGitFingerprint(wt.repoRoot);
+		if (!before) {
+			batch.poisoned = true;
+			throw new RetentionError("integration-conflict", "Unable to capture the repository root fingerprint before integration; refusing to apply.");
+		}
+		if (!sameGitFingerprint(before, batch.expectedFingerprint)) {
 			batch.poisoned = true;
 			throw new RetentionError("integration-conflict", "External mutation detected at the repository root; integration aborted for this batch and its remaining tasks.");
 		}
-		const patch = wt.patchBuffer ?? Buffer.alloc(0);
 		if (patch.length > 0) {
 			this.throwIfCancelled(entry, "before git apply --check");
 			const check = runGitResult(wt.repoRoot, ["apply", "--check", "-"], patch);
 			if (!check.ok) {
+				batch.poisoned = true;
 				throw new RetentionError("integration-conflict", `git apply --check rejected the isolated patch: ${check.stderr.toString("utf8").trim() || "patch does not apply cleanly"}`);
 			}
 			// --check executes a separate Git process, so re-capture immediately
-			// afterward and again require the batch baseline before applying.
+			// afterward and require the complete expected precondition again.
 			const checkedFingerprint = captureGitFingerprint(wt.repoRoot);
-			if (!checkedFingerprint || checkedFingerprint.hash !== batch.expectedFingerprint.hash) {
+			if (!checkedFingerprint || !sameGitFingerprint(checkedFingerprint, batch.expectedFingerprint)) {
 				batch.poisoned = true;
 				throw new RetentionError("integration-conflict", "External mutation detected between git apply --check and root integration; batch integration aborted.");
 			}
 			this.throwIfCancelled(entry, "before root git apply");
 			const apply = runGitResult(wt.repoRoot, ["apply", "-"], patch);
 			if (!apply.ok) {
+				batch.poisoned = true;
 				throw new RetentionError("integration-conflict", `git apply failed: ${apply.stderr.toString("utf8").trim() || "apply error"}`);
 			}
-			const after = captureGitFingerprint(wt.repoRoot);
-			if (!after) {
-				batch.poisoned = true;
-				throw new RetentionError("post-integration-fingerprint", "Repository fingerprint failed after integration; batch integration is halted and the result is retained without retry.");
-			}
-			batch.expectedFingerprint = after;
 		}
+
+		// This postcondition is checked even for a no-op patch. It detects HEAD
+		// movement, extra/same-path root mutation, and any apply-time mutation;
+		// there is intentionally no automatic revert on failure.
+		const after = captureGitFingerprint(wt.repoRoot);
+		if (!after || !sameGitFingerprint(after, expected)) {
+			batch.poisoned = true;
+			throw new RetentionError("integration-conflict", "Repository post-integration fingerprint mismatch; batch integration is halted and the root was NOT reverted.");
+		}
+		batch.expectedFingerprint = after;
+		batch.integratedPatchBuffers.push(Buffer.from(patch));
 		this.completeIntegration(entry);
 	}
 
@@ -1384,6 +1507,7 @@ export class OpenCodeTaskManager {
 			path: wt.path,
 			repoRoot: wt.repoRoot,
 			baseHead: wt.baseHead,
+			baseHeadRef: wt.batch.expectedFingerprint.headRef,
 			scopes: wt.scopes.map((scope) => this.repoRelative(wt.repoRoot, scope)),
 			changedPaths: [...(wt.changedPaths ?? [])],
 			conflictPaths: [...(wt.conflictPaths ?? [])],
@@ -1614,10 +1738,9 @@ export class OpenCodeTaskManager {
 
 	// User-driven retry of a retained integration failure. Only current-session
 	// retained entries whose patch was previously validated and whose root was
-	// not integrated are eligible. The fingerprint guard + stdin-fed
-	// `git apply --check` + apply are performed synchronously with no await
-	// between the final fingerprint capture and the apply, so the root cannot
-	// change under us.
+	// not integrated are eligible. To keep retry simple and fail closed, the
+	// root must be clean and still point at the retained original base HEAD.
+	// The expected postcondition is independently replayed in a detached shadow.
 	retryRetainedWorktree(taskId: string): RetainedWorktreeView {
 		if (this.disposed) throw new Error("OpenCode task manager is shut down.");
 		const retained = this.retainedWorktrees.get(taskId);
@@ -1636,24 +1759,33 @@ export class OpenCodeTaskManager {
 		const block = this.sameRepoActivityBlock(retained.repoRoot);
 		if (block) throw new Error(block);
 
-		// Synchronous fingerprint guard: capture, apply --check, re-capture and
-		// require the fingerprint is unchanged, then apply. No 3way/reset/stash/
-		// commit/overwrite and no await between the final fingerprint and apply.
 		const before = captureGitFingerprint(retained.repoRoot);
 		if (!before) {
 			throw new Error("Unable to capture the repository root fingerprint before retry.");
 		}
+		if (!isCleanFingerprint(before)) {
+			throw new Error("Retry requires a clean repository root; refusing to apply the retained patch.");
+		}
+		if (before.headOid !== retained.baseHead || before.headRef !== retained.baseHeadRef) {
+			throw new Error("Retry requires the repository HEAD to match the retained original base HEAD; refusing to apply.");
+		}
 		// The retained archive is intentionally never read or rewritten. It may
 		// have been changed by an external actor; the immutable manager buffer is
 		// the only input accepted by Git.
+		let expected: GitFingerprint;
+		try {
+			expected = this.shadowPostcondition(retained.repoRoot, retained.baseHead, [retained.patchBuffer], retained.baseHeadRef);
+		} catch (error) {
+			throw new Error(`Retry rejected: unable to calculate the expected postcondition: ${processError(error)}`);
+		}
 		const check = runGitResult(retained.repoRoot, ["apply", "--check", "-"], retained.patchBuffer);
 		if (!check.ok) {
 			throw new Error(
 				`Retry rejected: the patch no longer applies; git apply --check reported: ${redactAbsolutePaths(check.stderr.toString("utf8").trim(), [retained.path, retained.patchPath]) || "patch does not apply cleanly"}`,
 			);
 		}
-		const after = captureGitFingerprint(retained.repoRoot);
-		if (!after || after.hash !== before.hash) {
+		const afterCheck = captureGitFingerprint(retained.repoRoot);
+		if (!afterCheck || !sameGitFingerprint(afterCheck, before)) {
 			throw new Error("Repository fingerprint changed between pre-check and apply; retry aborted without applying.");
 		}
 		const apply = runGitResult(retained.repoRoot, ["apply", "-"], retained.patchBuffer);
@@ -1663,27 +1795,8 @@ export class OpenCodeTaskManager {
 			);
 		}
 		const postApply = captureGitFingerprint(retained.repoRoot);
-		if (!postApply) {
-			const error = "Repository fingerprint failed after retry integration; the result is retained without retry.";
-			const entry = this.tasks.get(taskId);
-			if (entry) {
-				entry.snapshot.status = "error";
-				entry.snapshot.error = error;
-				if (entry.snapshot.worktree) {
-					entry.snapshot.worktree.status = "cleanup-failed";
-					entry.snapshot.worktree.error = error;
-				}
-			}
-			this.retainedWorktrees.set(taskId, {
-				...retained,
-				status: "error",
-				error,
-				kind: "cleanup-failed",
-				retryable: false,
-				rootIntegrated: true,
-				patchBuffer: undefined,
-			});
-			throw new Error(error);
+		if (!postApply || !sameGitFingerprint(postApply, expected)) {
+			throw new Error("Retry post-integration fingerprint mismatch; the root was NOT reverted and retry remains refused until the root is clean at the original base HEAD.");
 		}
 
 		// Success: update the original snapshot to done/integrated and clear the
