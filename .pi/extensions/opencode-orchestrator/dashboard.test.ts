@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	countRetainedWorktrees,
 	formatDashboard,
 	formatElapsed,
 	formatLatestActivity,
+	formatRetainedWorktreeWarning,
 	formatTokenTotals,
 	formatWorkerRow,
 	formatWorkflowPhase,
@@ -135,4 +137,73 @@ test("formatTokenTotals omits parent section when no parent usage is supplied", 
 test("formatTokenTotals handles tasks with no usage as zeros", () => {
 	const line = formatTokenTotals([task(), task({ id: "oc-2" })]);
 	assert.match(line, /^Tokens: workers in 0\/out 0\/0$/);
+});
+
+test("countRetainedWorktrees counts retained and cleanup-failed, not integrated", () => {
+	const tasks = [
+		task({ id: "oc-a", worktree: { isolated: true, status: "retained" } }),
+		task({ id: "oc-b", worktree: { isolated: true, status: "cleanup-failed" } }),
+		task({ id: "oc-c", worktree: { isolated: true, status: "integrated" } }),
+		task({ id: "oc-d", worktree: { isolated: true, status: "pending" } }),
+		task({ id: "oc-e" }),
+	];
+	const count = countRetainedWorktrees(tasks);
+	assert.equal(count.total, 2);
+	assert.equal(count.cleanupFailed, 1);
+});
+
+test("retained warning is omitted when no worktree is retained", () => {
+	assert.equal(formatRetainedWorktreeWarning([task(), task({ id: "oc-2" })]), undefined);
+	assert.equal(countRetainedWorktrees([task(), task({ id: "oc-2" })]).total, 0);
+});
+
+test("retained warning reports count and cleanup-failed without paths", () => {
+	const warning = formatRetainedWorktreeWarning([
+		task({ id: "oc-a", worktree: { isolated: true, status: "retained" } }),
+		task({ id: "oc-b", worktree: { isolated: true, status: "cleanup-failed" } }),
+	]);
+	assert.ok(warning);
+	assert.match(warning, /WARNING: 2 retained worktree\(s\)/);
+	assert.match(warning, /1 cleanup-failed/);
+	assert.match(warning, /inspect with \/opencode-worktrees list$/);
+	// No absolute paths or task ids leak into the warning.
+	assert.doesNotMatch(warning, /oc-a|oc-b/);
+	assert.doesNotMatch(warning, /(?:[A-Za-z]:[\\/])|\b(?:\/home|\/Users|\/root|\/tmp|\/var)[\\/]/);
+});
+
+test("integrated worktrees are not counted as retained", () => {
+	const tasks = [
+		task({ id: "oc-a", worktree: { isolated: true, status: "integrated" } }),
+		task({ id: "oc-b", worktree: { isolated: true, status: "integrated" } }),
+	];
+	assert.equal(countRetainedWorktrees(tasks).total, 0);
+	assert.equal(formatRetainedWorktreeWarning(tasks), undefined);
+});
+
+test("dashboard shows retained warning only when count is nonzero and honors idle behavior", () => {
+	// Idle with no retained worktrees disappears.
+	assert.equal(formatDashboard([task({ status: "done" })], [workflow({ status: "done" })], 66_000), undefined);
+
+	// Idle but with a retained worktree still renders a dashboard warning.
+	const retained = task({ id: "oc-r", status: "done", settledAt: 2_000, worktree: { isolated: true, status: "retained" } });
+	const lines = formatDashboard([retained], [], 66_000);
+	assert.ok(lines);
+	assert.match(lines[0], /Worker activity: 0 worker\(s\), 0 workflow\(s\)/);
+	assert.ok(lines.some((line) => /WARNING: 1 retained worktree\(s\)/.test(line)));
+	assert.doesNotMatch(lines.join("\n"), /oc-r/);
+});
+
+test("retained warning stays within the Pi widget line limit alongside running work", () => {
+	const workers = Array.from({ length: 4 }, (_, index) => task({ id: `oc-${index + 1}` }));
+	const workflows = Array.from({ length: 7 }, (_, index) => workflow({ id: `wf-${index + 1}` }));
+	const lines = formatDashboard(workers, workflows, 66_000);
+	assert.ok(lines);
+	// Existing layout without retained worktrees is unchanged.
+	assert.equal(lines.length, 10);
+
+	const retained = task({ id: "oc-r", status: "done", settledAt: 2_000, worktree: { isolated: true, status: "cleanup-failed" } });
+	const bounded = formatDashboard([...workers, retained], workflows, 66_000);
+	assert.ok(bounded);
+	assert.ok(bounded.length <= 10);
+	assert.ok(bounded.some((line) => /WARNING: 1 retained worktree\(s\)/.test(line)));
 });

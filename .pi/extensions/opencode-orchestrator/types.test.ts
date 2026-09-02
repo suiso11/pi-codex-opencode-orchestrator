@@ -7,7 +7,9 @@ import {
 	buildWorkerPrompt,
 	configuredModelCapabilities,
 	configuredModelProfiles,
+	configuredTesterProfile,
 	configuredThinkingLevel,
+	DEFAULT_MODEL,
 	decodeWorkerModel,
 	DEFAULT_TOOL_PROFILE,
 	encodeWorkerModel,
@@ -16,6 +18,7 @@ import {
 	findScopeConflict,
 	mergeUsage,
 	normalizeScopes,
+	normalizeWorkerModelValue,
 	pathForScopeComparison,
 	parseWorkerReport,
 	resolveModel,
@@ -25,6 +28,7 @@ import {
 	taskResultText,
 	taskResultsText,
 	toolsForProfile,
+	taskSummary,
 	validateWorkflowPhases,
 } from "./types.ts";
 import type { TaskSnapshot } from "./types.ts";
@@ -44,15 +48,46 @@ test("worker model routes encode Pi opt-out without changing OpenCode model IDs"
 	});
 });
 
+test("normalizeWorkerModelValue trims and collapses repeated opencode: prefixes while preserving pi::", () => {
+	// Zero prefix: kept as-is (after trim).
+	assert.equal(normalizeWorkerModelValue("opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	// One prefix: stripped.
+	assert.equal(normalizeWorkerModelValue("opencode:opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	// Repeated prefixes: every leading "opencode:" is collapsed.
+	assert.equal(normalizeWorkerModelValue("opencode:opencode:opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	assert.equal(normalizeWorkerModelValue("  opencode:opencode:opencode-go/glm-5.2  "), "opencode-go/glm-5.2");
+	// Pi values are preserved verbatim (after trim), never treated as OpenCode.
+	assert.equal(normalizeWorkerModelValue("pi::anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.equal(normalizeWorkerModelValue("  pi::anthropic/claude-example  "), "pi::anthropic/claude-example");
+	// Values that normalize away entirely yield "".
+	assert.equal(normalizeWorkerModelValue("opencode:"), "");
+	assert.equal(normalizeWorkerModelValue("  "), "");
+});
+
+test("encode/decode yield a raw OpenCode snapshot model and the raw Pi model after pi:: decode", () => {
+	assert.equal(encodeWorkerModel("opencode", "opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	assert.equal(encodeWorkerModel("opencode", "opencode:opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	assert.equal(encodeWorkerModel("opencode", "opencode:opencode:opencode-go/glm-5.2"), "opencode-go/glm-5.2");
+	assert.equal(encodeWorkerModel("pi", "anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.equal(encodeWorkerModel("pi", "pi::anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.equal(encodeWorkerModel("pi", "opencode:anthropic/claude-example"), "pi::anthropic/claude-example");
+	assert.deepEqual(decodeWorkerModel("opencode-go/glm-5.2"), { backend: "opencode", model: "opencode-go/glm-5.2" });
+	assert.deepEqual(decodeWorkerModel("opencode:opencode-go/glm-5.2"), { backend: "opencode", model: "opencode-go/glm-5.2" });
+	assert.deepEqual(decodeWorkerModel("pi::anthropic/claude-example"), { backend: "pi", model: "anthropic/claude-example" });
+	assert.throws(() => encodeWorkerModel("opencode", ""), /must not be empty/);
+	assert.throws(() => encodeWorkerModel("pi", "opencode:"), /must not be empty/);
+	assert.throws(() => decodeWorkerModel("opencode:"), /must not be empty/);
+});
+
 test("model profiles resolve with explicit model precedence and environment overrides", () => {
 	const profiles = configuredModelProfiles({
-		PI_OPENCODE_PROFILE_GLM: "custom/glm",
-		PI_OPENCODE_PROFILE_KIMI_K3: "custom/kimi",
+		PI_OPENCODE_PROFILE_IMPLEMENTER: "custom/implementer",
+		PI_OPENCODE_PROFILE_REVIEWER: "custom/reviewer",
 	});
-	assert.equal(resolveModel({ profile: "glm" }, "fallback/model", profiles), "custom/glm");
-	assert.equal(resolveModel({ profile: "kimi_k3" }, "fallback/model", profiles), "custom/kimi");
+	assert.equal(resolveModel({ profile: "implementer" }, "fallback/model", profiles), "custom/implementer");
+	assert.equal(resolveModel({ profile: "reviewer" }, "fallback/model", profiles), "custom/reviewer");
 	assert.equal(
-		resolveModel({ model: "explicit/model", profile: "kimi_k3" }, "fallback/model", profiles),
+		resolveModel({ model: "explicit/model", profile: "reviewer" }, "fallback/model", profiles),
 		"explicit/model",
 	);
 	assert.equal(resolveModel({}, "fallback/model", profiles), "fallback/model");
@@ -60,6 +95,36 @@ test("model profiles resolve with explicit model precedence and environment over
 		() => resolveModel({ profile: "missing" as never }, "fallback/model", profiles),
 		/Unknown OpenCode model profile/,
 	);
+});
+
+test("model precedence is explicit model, then explicit profile, then role-matching profile, then default worker", () => {
+	const profiles = configuredModelProfiles({
+		PI_OPENCODE_PROFILE_IMPLEMENTER: "custom/implementer",
+		PI_OPENCODE_PROFILE_REVIEWER: "custom/reviewer",
+	});
+	const tester = "custom/tester";
+	assert.equal(
+		resolveModel({ model: "explicit/model", role: "tester" }, "fallback/model", profiles, tester),
+		"explicit/model",
+	);
+	assert.equal(
+		resolveModel({ model: "explicit/model", profile: "implementer", role: "tester" }, "fallback/model", profiles, tester),
+		"explicit/model",
+	);
+	assert.equal(
+		resolveModel({ profile: "implementer", role: "tester" }, "fallback/model", profiles, tester),
+		"custom/implementer",
+	);
+	assert.equal(resolveModel({ role: "tester" }, "fallback/model", profiles, tester), "custom/tester");
+	assert.equal(resolveModel({ role: "reviewer" }, "fallback/model", profiles, tester), "custom/reviewer");
+	assert.equal(resolveModel({ role: "implementer" }, "fallback/model", profiles, tester), "custom/implementer");
+	assert.equal(resolveModel({}, "fallback/model", profiles, tester), "fallback/model");
+});
+
+test("configuredTesterProfile uses PI_OPENCODE_PROFILE_TESTER with the default worker model fallback", () => {
+	assert.equal(configuredTesterProfile({ PI_OPENCODE_PROFILE_TESTER: "custom/tester" }), "custom/tester");
+	assert.equal(configuredTesterProfile({ PI_OPENCODE_PROFILE_TESTER: "  " }), DEFAULT_MODEL);
+	assert.equal(configuredTesterProfile({}), DEFAULT_MODEL);
 });
 
 test("normalizeScopes keeps concrete paths inside cwd", () => {
@@ -269,6 +334,290 @@ test("resolveThinkingLevel prefers spec over fallback", () => {
 	assert.equal(resolveThinkingLevel({}, "low"), "low");
 });
 
+test("resolveThinkingLevel forces high for reviewer and preserves explicit thinking for other roles", () => {
+	assert.equal(resolveThinkingLevel({ role: "reviewer" }, "medium"), "high");
+	assert.equal(resolveThinkingLevel({ role: "reviewer", thinking: "low" }, "medium"), "high");
+	assert.equal(resolveThinkingLevel({ role: "tester", thinking: "low" }, "medium"), "low");
+	assert.equal(resolveThinkingLevel({ role: "tester" }, "medium"), "medium");
+	assert.equal(resolveThinkingLevel({ role: "implementer", thinking: "high" }, "medium"), "high");
+	assert.equal(resolveThinkingLevel({ thinking: "high" }, "medium"), "high");
+});
+
+test("workflow rejects tester and reviewer roles in write mode", () => {
+	const roleTask = (role: "tester" | "reviewer") => ({
+		name: role,
+		mode: "write" as const,
+		objective: role,
+		relevantPaths: ["src/a.ts"],
+		constraints: [],
+		expectedOutput: "result",
+		role,
+	});
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [roleTask("tester")] },
+			{ name: "verify", tasks: [{ ...roleTask("tester"), mode: "read_only" as const }] },
+		]),
+		/requires read_only/,
+	);
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [roleTask("reviewer")] },
+			{ name: "verify", tasks: [{ ...roleTask("reviewer"), mode: "read_only" as const }] },
+		]),
+		/requires read_only/,
+	);
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "edit", tasks: [{ ...roleTask("tester"), mode: "read_only" as const }] },
+		{ name: "verify", tasks: [{ ...roleTask("reviewer"), mode: "read_only" as const }] },
+	]));
+});
+
+test("worker prompt documents tester mutation guard and reviewer read-only role", () => {
+	const base = {
+		name: "verify",
+		mode: "read_only" as const,
+		objective: "Verify",
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "Findings",
+	};
+	const tester = buildWorkerPrompt({ ...base, role: "tester" });
+	assert.match(tester, /Role: tester/);
+	assert.match(tester, /mutation guard/);
+	assert.match(tester, /outside-repo or ignored side effects are not prevented/);
+	const reviewer = buildWorkerPrompt({ ...base, role: "reviewer" });
+	assert.match(reviewer, /Role: reviewer/);
+	assert.match(reviewer, /without modifying, creating, or deleting files/);
+});
+
+test("worktree prompt instructs isolated Git worktree only for write mode", () => {
+	const write = {
+		name: "implement",
+		mode: "write" as const,
+		objective: "Implement",
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+	};
+	const isolated = buildWorkerPrompt({ ...write, worktree: true });
+	assert.match(isolated, /isolated Git worktree/);
+	assert.match(isolated, /Do not run git commit, reset, stash, add, or branch operations/);
+	assert.doesNotMatch(isolated, /oc-worktrees/);
+	const direct = buildWorkerPrompt({ ...write, worktree: false });
+	assert.doesNotMatch(direct, /isolated Git worktree/);
+	const readOnly = buildWorkerPrompt({ ...write, mode: "read_only", worktree: true });
+	assert.doesNotMatch(readOnly, /isolated Git worktree/);
+});
+
+test("workflow validation propagates worktree isolation on write tasks", () => {
+	const write = (name: string, relevantPaths: string[], worktree: boolean) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+		worktree,
+	});
+	// Worktree write tasks with disjoint scopes validate; the field flows through the spec.
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "edit", tasks: [write("a", ["src/a.ts"], true), write("b", ["src/b.ts"], true)] },
+		{ name: "verify", tasks: [{ ...write("verify", ["tests"], false), mode: "read_only" as const }] },
+	]));
+	// Overlap checks still apply to worktree-isolated write tasks in the same phase.
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [write("a", ["src"], true), write("b", ["src/a.ts"], true)] },
+			{ name: "verify", tasks: [{ ...write("verify", ["tests"], false), mode: "read_only" as const }] },
+		]),
+		/overlap/,
+	);
+});
+
+test("workflow validation rejects worktree=true for read_only tasks", () => {
+	const readOnly = (name: string) => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+	});
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [{ ...readOnly("inspect"), worktree: true }] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/requires mode write/,
+	);
+});
+
+test("workflow validation rejects mixing direct writes, read-only, tester, and reviewer tasks into a worktree-write phase", () => {
+	const worktreeWrite = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+		worktree: true,
+	});
+	const readOnly = (name: string, role?: "tester" | "reviewer") => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+		...(role ? { role } : {}),
+	});
+	// A direct (non-worktree) write mixed into a worktree-write phase is rejected.
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{
+				name: "edit",
+				tasks: [
+					worktreeWrite("isolated", ["src/a.ts"]),
+					{ ...worktreeWrite("direct", ["src/b.ts"]), worktree: false },
+				],
+			},
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/mixes worktree-isolated writes with other tasks/,
+	);
+	// A plain read-only task mixed into a worktree-write phase is rejected.
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [worktreeWrite("isolated", ["src/a.ts"]), readOnly("inspect")] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/mixes worktree-isolated writes with other tasks/,
+	);
+	// A tester task mixed into a worktree-write phase is rejected.
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [worktreeWrite("isolated", ["src/a.ts"]), readOnly("test", "tester")] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/mixes worktree-isolated writes with other tasks/,
+	);
+	// A reviewer task mixed into a worktree-write phase is rejected.
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit", tasks: [worktreeWrite("isolated", ["src/a.ts"]), readOnly("review", "reviewer")] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/mixes worktree-isolated writes with other tasks/,
+	);
+	// Multiple disjoint worktree writes in the same phase remain allowed.
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "edit", tasks: [worktreeWrite("a", ["src/a.ts"]), worktreeWrite("b", ["src/b.ts"])] },
+		{ name: "verify", tasks: [readOnly("verify")] },
+	]));
+});
+
+test("workflow validation rejects a second worktree-write phase", () => {
+	const worktreeWrite = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+		worktree: true,
+	});
+	const readOnly = (name: string) => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+	});
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "edit-a", tasks: [worktreeWrite("a", ["src/a.ts"])] },
+			{ name: "edit-b", tasks: [worktreeWrite("b", ["src/b.ts"])] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/at most one worktree-write phase/,
+	);
+});
+
+test("workflow validation rejects a worktree-write phase after an earlier direct/write phase", () => {
+	const directWrite = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+	});
+	const worktreeWrite = (name: string, relevantPaths: string[]) => ({
+		...directWrite(name, relevantPaths),
+		worktree: true,
+	});
+	const readOnly = (name: string) => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+	});
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "direct", tasks: [directWrite("d", ["src/d.ts"])] },
+			{ name: "worktree", tasks: [worktreeWrite("w", ["src/w.ts"])] },
+			{ name: "verify", tasks: [readOnly("verify")] },
+		]),
+		/must be preceded only by read-only phases/,
+	);
+});
+
+test("workflow validation allows a read-only phase, one worktree-write phase, then later read-only/direct-write phases", () => {
+	const worktreeWrite = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+		worktree: true,
+	});
+	const directWrite = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "write" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+	});
+	const readOnly = (name: string) => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths: ["src"],
+		constraints: [],
+		expectedOutput: "result",
+	});
+	// Read-only before, one worktree-write in the middle, then read-only and a
+	// direct-write after the worktree phase — all allowed.
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "inspect", tasks: [readOnly("inspect")] },
+		{ name: "isolated", tasks: [worktreeWrite("w", ["src/w.ts"])] },
+		{ name: "verify", tasks: [readOnly("verify")] },
+		{ name: "apply", tasks: [directWrite("apply", ["src/apply.ts"])] },
+	]));
+	// Multiple disjoint worktree writes in the single worktree phase still validate.
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "inspect", tasks: [readOnly("inspect")] },
+		{ name: "isolated", tasks: [worktreeWrite("a", ["src/a.ts"]), worktreeWrite("b", ["src/b.ts"])] },
+		{ name: "verify", tasks: [readOnly("verify")] },
+	]));
+});
+
 function fakeSnapshot(output: string, report?: TaskSnapshot["report"]): TaskSnapshot {
 	return {
 		id: "oc-test",
@@ -351,7 +700,6 @@ test("taskResultText and taskResultsText never exceed requested maxChars, includ
 	assert.ok(empty.length <= 3, `empty len=${empty.length}`);
 });
 
-
 test("tool profiles map to the expected tool sets", () => {
 	assert.deepEqual([...toolsForProfile("minimal", "write")], ["read", "glob", "grep"]);
 	assert.deepEqual([...toolsForProfile("coding", "write")], ["read", "glob", "grep", "edit", "bash"]);
@@ -412,4 +760,34 @@ test("buildAgentFrontmatter denies tools outside the profile and allows the rest
 	// full profile denies nothing
 	const full = buildAgentFrontmatter("full", "write");
 	assert.doesNotMatch(full, /: deny/);
+});
+
+test("taskSummary and taskResultText expose worktree state without leaking the worktree path", () => {
+	const task = fakeSnapshot("raw", { summary: "done", files: ["a.ts"], findings: [], unresolved: [] });
+	task.worktree = { isolated: true, baseHead: "abc1234", status: "integrated", changedPaths: ["a.ts"] };
+	assert.match(taskSummary(task), /\[worktree:integrated\]/);
+	assert.equal("path" in task.worktree, false, "the worktree path must not be part of the public snapshot");
+	const text = taskResultText(task);
+	assert.match(text, /\[worktree:integrated\]/);
+	assert.doesNotMatch(text, /oc-worktrees|abc1234/, "worktree path/base head must not leak into result text");
+	assert.doesNotMatch(taskSummary(task), /oc-worktrees/, "worktree path must not leak into status text");
+});
+
+test("taskSummary renders exactly one backend prefix, never doubling legacy prefixes", () => {
+	const summary = (backend: "opencode" | "pi", model: string) =>
+		taskSummary({ ...fakeSnapshot(""), backend, model });
+	// Legacy snapshots may persist a stray display prefix (or several): the
+	// summary must still show exactly "opencode:provider/model", not doubled.
+	for (const model of ["provider/model", "opencode:provider/model", "opencode:opencode:provider/model"]) {
+		const text = summary("opencode", model);
+		assert.match(text, /\(0s, opencode:provider\/model\)$/);
+		assert.doesNotMatch(text, /opencode:opencode/);
+	}
+	// Pi snapshots keep their wrapper or not; repeated "pi::" is collapsed so
+	// the display label is exactly "pi:provider/model".
+	for (const model of ["pi::provider/model", "provider/model", "pi::pi::provider/model"]) {
+		const text = summary("pi", model);
+		assert.match(text, /\(0s, pi:provider\/model\)$/);
+		assert.doesNotMatch(text, /pi:pi::/);
+	}
 });

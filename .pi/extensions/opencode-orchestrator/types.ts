@@ -2,8 +2,8 @@ import * as path from "node:path";
 
 export const DEFAULT_MODEL = "opencode-go/glm-5.2";
 export const MODEL_PROFILE_DEFAULTS = {
-	glm: "opencode-go/glm-5.2",
-	kimi_k3: "opencode-go/kimi-k3",
+	implementer: "opencode-go/glm-5.2",
+	reviewer: "opencode-go/kimi-k3",
 } as const;
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -15,6 +15,7 @@ export type TaskMode = "read_only" | "write";
 export type TaskStatus = "running" | "done" | "error" | "cancelled";
 export type WorkflowStatus = "running" | "done" | "error" | "cancelled";
 export type ModelProfile = keyof typeof MODEL_PROFILE_DEFAULTS;
+export type WorkerRole = "implementer" | "tester" | "reviewer";
 export type WorkerBackend = "opencode" | "pi";
 export type ThinkingLevel = "low" | "medium" | "high";
 
@@ -30,6 +31,51 @@ export interface TaskUsage {
 	reasoningTokens?: number;
 }
 
+// Worktree isolation metadata carried on TaskSnapshot. It intentionally never
+// contains the absolute worktree path so model-facing serialization stays safe.
+export type WorktreeIsolationStatus = "pending" | "integrated" | "cleanup-failed" | "retained";
+
+export interface WorktreeSnapshotInfo {
+	isolated: boolean;
+	baseHead?: string;
+	status?: WorktreeIsolationStatus;
+	changedPaths?: string[];
+	error?: string;
+}
+
+// Why a retained worktree was kept. Only "integration-failure" (a previously
+// validated patch whose apply was rejected, with the root left unmodified) is
+// retryable by the user; every other retention is a terminal state.
+export type WorktreeRetentionKind =
+	| "integration-failure"
+	| "worker-failure"
+	| "cancel"
+	| "commit"
+	| "out-of-scope"
+	| "gitlink"
+	| "cleanup-failed";
+
+// Public, serializable view of a retained worktree. It never contains the
+// absolute OS-temp worktree/state/patch path: repo is the repository basename,
+// baseHead is a short SHA, and scopes/changedPaths/conflictPaths are all
+// repo-relative. Error strings are already redacted of any temp path spelling.
+export interface RetainedWorktreeView {
+	taskId: string;
+	name: string;
+	status: TaskStatus;
+	error?: string;
+	repo: string;
+	baseHead: string;
+	scopes: string[];
+	changedPaths: string[];
+	conflictPaths: string[];
+	createdAt: number;
+	patchAvailable: boolean;
+	retryable: boolean;
+	rootIntegrated: boolean;
+	kind: WorktreeRetentionKind;
+}
+
 export interface WorkerReport {
 	summary: string;
 	files: string[];
@@ -38,15 +84,39 @@ export interface WorkerReport {
 }
 
 const PI_WORKER_PREFIX = "pi::";
+const OPENCODE_MODEL_PREFIX = "opencode:";
+
+/**
+ * Canonical worker model representation. OpenCode workers use the raw
+ * `provider/model` value; Pi workers use `pi::provider/model`. `opencode:` is
+ * display-only and must never reach persistence, manager state, snapshot.model,
+ * task summaries, or the OpenCode CLI --model flag. Trims and collapses any
+ * repeated leading `opencode:` prefix on non-Pi values while preserving `pi::`
+ * values verbatim. Returns "" for values that normalize away entirely so
+ * callers can reject them.
+ */
+export function normalizeWorkerModelValue(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed.startsWith(PI_WORKER_PREFIX)) return trimmed;
+	let normalized = trimmed;
+	while (normalized.startsWith(OPENCODE_MODEL_PREFIX)) {
+		normalized = normalized.slice(OPENCODE_MODEL_PREFIX.length).trimStart();
+	}
+	return normalized;
+}
 
 export function encodeWorkerModel(backend: WorkerBackend, model: string) {
-	const value = model.trim();
+	const value = normalizeWorkerModelValue(model);
 	if (!value) throw new Error("Worker model must not be empty.");
-	return backend === "pi" ? `${PI_WORKER_PREFIX}${value}` : value;
+	if (backend === "pi") {
+		return value.startsWith(PI_WORKER_PREFIX) ? value : `${PI_WORKER_PREFIX}${value}`;
+	}
+	return value;
 }
 
 export function decodeWorkerModel(value: string): { backend: WorkerBackend; model: string } {
-	const normalized = value.trim();
+	const normalized = normalizeWorkerModelValue(value);
+	if (!normalized) throw new Error("Worker model must not be empty.");
 	if (normalized.startsWith(PI_WORKER_PREFIX)) {
 		return { backend: "pi", model: normalized.slice(PI_WORKER_PREFIX.length) };
 	}
@@ -62,8 +132,13 @@ export interface TaskSpec {
 	expectedOutput: string;
 	model?: string;
 	profile?: ModelProfile;
+	role?: WorkerRole;
 	thinking?: ThinkingLevel;
 	toolProfile?: ToolProfile;
+	// Opt-in write isolation: valid only for mode=write. The worker runs in a
+	// detached git worktree and its changes are integrated via a per-repo
+	// ID-ordered queue. No absolute worktree path is ever exposed to prompts.
+	worktree?: boolean;
 }
 
 export interface InternalTaskSpec extends TaskSpec {
@@ -80,6 +155,7 @@ export interface TaskSnapshot {
 	scopes: string[];
 	model: string;
 	backend: WorkerBackend;
+	role?: WorkerRole;
 	workflowId?: string;
 	createdAt: number;
 	settledAt?: number;
@@ -92,6 +168,7 @@ export interface TaskSnapshot {
 	truncated: boolean;
 	usage?: TaskUsage;
 	report?: WorkerReport;
+	worktree?: WorktreeSnapshotInfo;
 }
 
 export interface WorkflowPhaseSpec {
@@ -115,9 +192,16 @@ export interface WorkflowSnapshot {
 
 export function configuredModelProfiles(env: NodeJS.ProcessEnv = process.env): Record<ModelProfile, string> {
 	return {
-		glm: env.PI_OPENCODE_PROFILE_GLM?.trim() || MODEL_PROFILE_DEFAULTS.glm,
-		kimi_k3: env.PI_OPENCODE_PROFILE_KIMI_K3?.trim() || MODEL_PROFILE_DEFAULTS.kimi_k3,
+		implementer: normalizeWorkerModelValue(env.PI_OPENCODE_PROFILE_IMPLEMENTER ?? "") || MODEL_PROFILE_DEFAULTS.implementer,
+		reviewer: normalizeWorkerModelValue(env.PI_OPENCODE_PROFILE_REVIEWER ?? "") || MODEL_PROFILE_DEFAULTS.reviewer,
 	};
+}
+
+// The tester profile is configurable only through PI_OPENCODE_PROFILE_TESTER and
+// falls back to the existing default worker model; no new provider/model value
+// is introduced here.
+export function configuredTesterProfile(env: NodeJS.ProcessEnv = process.env): string {
+	return normalizeWorkerModelValue(env.PI_OPENCODE_PROFILE_TESTER ?? "") || DEFAULT_MODEL;
 }
 
 export function configuredThinkingLevel(env: NodeJS.ProcessEnv = process.env): ThinkingLevel {
@@ -127,22 +211,46 @@ export function configuredThinkingLevel(env: NodeJS.ProcessEnv = process.env): T
 }
 
 export function resolveModel(
-	spec: Pick<TaskSpec, "model" | "profile">,
+	spec: Pick<TaskSpec, "model" | "profile" | "role">,
 	fallback: string,
 	profiles: Readonly<Record<ModelProfile, string>> = configuredModelProfiles(),
+	testerModel = configuredTesterProfile(),
 ) {
-	const explicit = spec.model?.trim();
+	const explicit = normalizeWorkerModelValue(spec.model ?? "");
 	if (explicit) return explicit;
-	if (!spec.profile) return fallback;
-	const resolved = profiles[spec.profile];
-	if (!resolved) throw new Error(`Unknown OpenCode model profile: ${spec.profile}`);
-	return resolved;
+	if (spec.profile) {
+		const resolved = profiles[spec.profile];
+		if (!resolved) throw new Error(`Unknown OpenCode model profile: ${spec.profile}`);
+		const normalized = normalizeWorkerModelValue(resolved);
+		if (!normalized) throw new Error(`Unknown OpenCode model profile: ${spec.profile}`);
+		return normalized;
+	}
+	// No task-name inference: only an explicit role selects the role-matching
+	// profile. The tester role resolves its own configurable profile, while
+	// implementer/reviewer roles reuse the matching named profiles.
+	if (spec.role) {
+		if (spec.role === "tester") {
+			const normalized = normalizeWorkerModelValue(testerModel);
+			return normalized || testerModel;
+		}
+		const resolved = profiles[spec.role];
+		if (!resolved) throw new Error(`Unknown OpenCode model profile: ${spec.role}`);
+		const normalized = normalizeWorkerModelValue(resolved);
+		if (!normalized) throw new Error(`Unknown OpenCode model profile: ${spec.role}`);
+		return normalized;
+	}
+	const normalized = normalizeWorkerModelValue(fallback);
+	return normalized || fallback;
 }
 
 export function resolveThinkingLevel(
-	spec: Pick<TaskSpec, "thinking">,
+	spec: Pick<TaskSpec, "thinking" | "role">,
 	fallback: ThinkingLevel,
 ): ThinkingLevel {
+	// The reviewer role always resolves the orchestrator's maximum supported
+	// thinking level; every other role preserves explicit thinking and then the
+	// configured fallback.
+	if (spec.role === "reviewer") return "high";
 	return spec.thinking ?? fallback;
 }
 
@@ -196,6 +304,18 @@ export function buildWorkerPrompt(spec: TaskSpec) {
 	const modeInstruction = spec.mode === "read_only"
 		? "This is read-only work. Do not modify, create, rename, or delete any file."
 		: "You may edit files, but only within the declared relevant paths. Preserve unrelated user changes.";
+	const worktreeInstruction = spec.worktree && spec.mode === "write"
+		? "This task runs in an isolated Git worktree detached at the repository base commit. Do not run git commit, reset, stash, add, or branch operations; leave all changes in the working tree."
+		: "";
+	const roleLines: string[] = [];
+	if (spec.role === "tester") {
+		roleLines.push("Role: tester (independent read-only verification). Bash is enabled for running tests and verification commands.");
+		roleLines.push("A repository mutation guard marks this task as error if tracked worktree, staged, or nonignored untracked files change. Bash can mutate during execution, and outside-repo or ignored side effects are not prevented.");
+	} else if (spec.role === "reviewer") {
+		roleLines.push("Role: reviewer (independent read-only review). Review diffs, code, and requirements without modifying, creating, or deleting files.");
+	} else if (spec.role === "implementer") {
+		roleLines.push("Role: implementer.");
+	}
 	const constraints = spec.constraints.length > 0
 		? spec.constraints.map((item) => `- ${item}`).join("\n")
 		: "- No additional task-specific constraints.";
@@ -205,6 +325,8 @@ export function buildWorkerPrompt(spec: TaskSpec) {
 		"Follow the repository's AGENTS.md.",
 		"Do not read secrets or git-ignored runtime configuration such as config/*.env.",
 		modeInstruction,
+		...(worktreeInstruction ? [worktreeInstruction] : []),
+		...roleLines,
 		"Do not broaden the task. If the declared scope is insufficient, stop and report what is missing.",
 		"",
 		`Task name: ${spec.name}`,
@@ -230,7 +352,16 @@ export function buildWorkerPrompt(spec: TaskSpec) {
 
 export function taskSummary(task: TaskSnapshot) {
 	const elapsed = Math.max(0, (task.settledAt ?? Date.now()) - task.createdAt);
-	return `${task.id} [${task.status}] ${task.mode} "${task.name}" (${Math.round(elapsed / 1000)}s, ${task.backend}:${task.model})`;
+	const worktreeMark = task.worktree
+		? ` [worktree${task.worktree.status ? `:${task.worktree.status}` : ""}]`
+		: "";
+	// The display backend prefix is added here, so the stored model part must be
+	// canonical: strip any stray legacy "opencode:" prefix and collapse any
+	// repeated "pi::" wrapper that could double the display backend label,
+	// guaranteeing exactly one display backend prefix in the summary even for
+	// malformed legacy snapshots.
+	const modelPart = normalizeWorkerModelValue(task.model).replace(/^(?:pi::)+/, "");
+	return `${task.id} [${task.status}] ${task.mode}${worktreeMark} "${task.name}" (${Math.round(elapsed / 1000)}s, ${task.backend}:${modelPart})`;
 }
 
 function taskUsageText(usage: TaskUsage) {
@@ -314,9 +445,18 @@ export function taskResultsText(tasks: TaskSnapshot[], maxChars = MAX_PARENT_OUT
 
 export function validateWorkflowPhases(cwd: string, phases: WorkflowPhaseSpec[]) {
 	if (phases.length < 2) throw new Error("A workflow requires at least two phases.");
+	let worktreeWritePhaseIndex: number | undefined;
 	for (const [phaseIndex, phase] of phases.entries()) {
 		if (!phase.name.trim()) throw new Error(`Phase ${phaseIndex + 1} needs a name.`);
 		if (phase.tasks.length === 0) throw new Error(`Phase "${phase.name}" has no tasks.`);
+		for (const task of phase.tasks) {
+			if ((task.role === "tester" || task.role === "reviewer") && task.mode !== "read_only") {
+				throw new Error(`Task "${task.name}" in phase "${phase.name}" uses role ${task.role} which requires read_only mode.`);
+			}
+			if (task.worktree && task.mode !== "write") {
+				throw new Error(`Worktree isolation (worktree=true) requires mode write; task "${task.name}" in phase "${phase.name}" is not a write task.`);
+			}
+		}
 		const writes = phase.tasks
 			.filter((task) => task.mode === "write")
 			.map((task) => ({ task, scopes: normalizeScopes(cwd, task.relevantPaths) }));
@@ -328,6 +468,27 @@ export function validateWorkflowPhases(cwd: string, phases: WorkflowPhaseSpec[])
 						`Write tasks "${writes[i].task.name}" and "${writes[j].task.name}" overlap in phase "${phase.name}".`,
 					);
 				}
+			}
+		}
+		const hasWorktreeWrite = writes.some(({ task }) => task.worktree === true);
+		if (hasWorktreeWrite) {
+			const nonWorktreeTask = phase.tasks.find((task) => !(task.mode === "write" && task.worktree === true));
+			if (nonWorktreeTask) {
+				throw new Error(
+					`Phase "${phase.name}" mixes worktree-isolated writes with other tasks; every task in a worktree-write phase must be a worktree write (worktree=true), including "${nonWorktreeTask.name}".`,
+				);
+			}
+			if (worktreeWritePhaseIndex !== undefined) {
+				throw new Error(
+					`Workflow may contain at most one worktree-write phase, but both "${phases[worktreeWritePhaseIndex].name}" and "${phase.name}" contain worktree writes.`,
+				);
+			}
+			worktreeWritePhaseIndex = phaseIndex;
+			const earlierWritePhase = phases.slice(0, phaseIndex).find((item) => item.tasks.some((task) => task.mode === "write"));
+			if (earlierWritePhase) {
+				throw new Error(
+					`Worktree-write phase "${phase.name}" must be preceded only by read-only phases; earlier phase "${earlierWritePhase.name}" contains write tasks.`,
+				);
 			}
 		}
 	}
