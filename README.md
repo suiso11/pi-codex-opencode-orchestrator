@@ -21,8 +21,9 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Dedicated one-turn context pruning: old orchestration results are replaced with a short placeholder for the parent model, while session history and the manager's retained raw output stay intact
 - `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication and latest pruning statistics, with no savings claim absent a baseline
 - Default worker model: `opencode-go/glm-5.2`
-- Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides
-- Interactive `/orch-model` command for persistent parent and worker model changes
+- Explicit worker roles: `implementer`, `tester`, and `reviewer` with role-specific tool sets, model profiles, and safety behavior
+- Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides; the `reviewer` role always resolves to `high`
+- Interactive `/orch-model` command for persistent parent and worker model changes applied to running sessions without restarting the orchestrator
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
 
 ## Requirements
@@ -94,12 +95,23 @@ The command can also be used directly:
 /orch-model show
 /orch-model parent openai-codex/gpt-5.6-sol
 /orch-model worker opencode opencode-go/glm-5.2
-/orch-model glm pi anthropic/claude-sonnet-4-5
-/orch-model kimi pi openai-codex/gpt-5.6-sol
+/orch-model implementer pi anthropic/claude-sonnet-4-5
+/orch-model reviewer pi openai-codex/gpt-5.6-sol
 /orch-model reset worker
 ```
 
-For worker routes, `opencode` runs the OpenCode CLI and `pi` bypasses OpenCode completely, using Pi's authenticated providers directly. Selections are saved to the per-user `pi-orch/models.json` config and apply immediately to the parent or to newly started workers.
+For worker routes, `opencode` runs the OpenCode CLI and `pi` bypasses OpenCode completely, using Pi's authenticated providers directly. Selections are saved to the per-user `pi-orch/models.json` config and are applied to the running Pi session without an orchestrator restart. The same settings can also be changed from outside Pi with the `pi-orch model` command (for example `pi-orch model parent openai-codex/gpt-5.6-sol` or `pi-orch model tester opencode-go/glm-5.2`), and those changes likewise apply to an already running Pi session without restarting the orchestrator.
+
+The `tester` profile model is configured through the same surfaces: `pi-orch model tester [pi|opencode] <provider/model>`, the `PI_OPENCODE_PROFILE_TESTER` environment variable, or the saved per-user config. `/opencode-status` shows the active tester profile. `tester` and `reviewer` require `read_only` mode and are never inferred from the task name.
+
+After updating the extension code itself (for example `git pull` plus `npm install`), restart or reload Pi once so the running session uses the new extension code. Once that reload has happened, subsequent model changes through `/orch-model` or `pi-orch model` remain live without another restart.
+
+How changes apply to a running session:
+
+- `parent` switches immediately after validation; the next parent request uses the new model.
+- `worker`, `implementer`, `reviewer`, and `tester` changes affect newly started workers only; workers already running keep the model they were started with and stay unchanged.
+- `reset` (for example `/orch-model reset worker` or `pi-orch model reset worker`) or deleting the saved setting returns that target to its startup baseline: the launcher's environment-variable override (`PI_CODEX_MODEL`, `PI_OPENCODE_MODEL`, `PI_OPENCODE_PROFILE_IMPLEMENTER`, `PI_OPENCODE_PROFILE_REVIEWER`, `PI_OPENCODE_PROFILE_TESTER`) if set, otherwise the built-in default.
+- Environment-variable overrides continue to take effect from the next orchestrator launch on; a change made in the running session takes precedence until then.
 
 ## Live activity dashboard
 
@@ -111,17 +123,34 @@ While worker tasks are running, Pi shows a widget above the editor. It refreshes
 
 The widget disappears automatically when no OpenCode work remains. The compact footer status and `/opencode-status` command remain available.
 
+## Coordinator-only parent enforcement
+
+The parent agent runs in a coordinator-only mode that is enabled by default with no opt-out. The parent's active tools are limited to safe planning reads (`read`, `grep`, `find`, `ls`) plus the `opencode_*` orchestration tools. All other or unknown tool calls — including `bash`, `edit`, `write`, `apply_patch`, and `patch` — are blocked at execution even if another preset reactivates them. A direct user `!` or `!!` bash command from the parent is cancelled.
+
+Every agent turn receives coordinator-contract guidance in its system prompt. Implementation and command-based testing/verification must be delegated to the `implementer`, `tester`, or `reviewer` roles. Trivial read-only inspection remains allowed when needed for planning or a final judgment.
+
+Slash commands such as `/orch-model`, `/opencode-status`, `/opencode-usage`, and the live dashboard remain available to the parent. Child workers are separate processes and are unaffected by this parent-only restriction.
+
+Activating this behavior requires the new extension code: after updating the extension, reload or restart Pi once. This is a coordinator-contract guard, not a security sandbox; it does not claim to sandbox the parent, and later extensions can still alter the system prompt.
+
+## Document coordinator skill
+
+A project-trusted Pi skill is available for documentation work. Pi auto-discovers it from `.pi/skills/orchestrator-role-coordinator/SKILL.md`; no `package.json` registration is needed for project discovery. Invoke it explicitly with `/skill:orchestrator-role-coordinator` when planning multi-worker roles, worktree batches/recovery, or model routing.
+
+The skill uses progressive disclosure and adds no scripts, dependencies, or network access. It grants no tools and never overrides the coordinator-only, tool, or worktree runtime gates. Because discovery happens at session start, an already-running Pi process must be reloaded or restarted once before the newly added skill is found.
+
 ## Worker backends and models
 
 Each worker route can use either the OpenCode backend or the Pi backend. The Pi backend launches a bounded, non-interactive Pi worker with the selected Pi provider/model and never starts OpenCode. Read-only Pi workers receive only read/search tools; write workers receive the editing toolset.
 
-The default routes remain `opencode-go/glm-5.2` and `opencode-go/kimi-k3`. The profile names are compatibility aliases and do not force those model families.
+The default routes remain `opencode-go/glm-5.2` and `opencode-go/kimi-k3`. The `implementer`, `tester`, and `reviewer` profile names are role-based aliases and do not force any specific model family. The `tester` profile defaults to the default worker model (`opencode-go/glm-5.2`) and is configurable through `PI_OPENCODE_PROFILE_TESTER` or `pi-orch model tester [pi|opencode] <provider/model>`.
 
-Override either profile when needed:
+Override any profile when needed:
 
 ```bash
-PI_OPENCODE_PROFILE_GLM=opencode-go/glm-5.2 \
-PI_OPENCODE_PROFILE_KIMI_K3=opencode-go/kimi-k3 \
+PI_OPENCODE_PROFILE_IMPLEMENTER=opencode-go/glm-5.2 \
+PI_OPENCODE_PROFILE_REVIEWER=opencode-go/kimi-k3 \
+PI_OPENCODE_PROFILE_TESTER=opencode-go/glm-5.2 \
 pi-orch
 ```
 
@@ -131,7 +160,7 @@ Final approval remains with GPT-5.6 Sol through the parent or a separate Codex C
 codex exec -m gpt-5.6-sol --sandbox read-only "$(cat /tmp/codex_prompt.md)"
 ```
 
-Kimi K3 provides a different review perspective but does not grant final approval.
+The reviewer profile provides a different review perspective but does not grant final approval.
 
 ## Tool capability routing
 
@@ -186,13 +215,150 @@ You may also copy `scripts/pi_codex_orchestrator.sh` or launch Pi with the same 
 
 Each worker receives a structured objective, mode, relevant paths, constraints, and expected output.
 
-Tasks may select the `glm` or `kimi_k3` profile. Direct `model` overrides remain available for any OpenCode provider/model ID.
+Tasks may select the `implementer`, `tester`, or `reviewer` role. A role is never inferred from the task name. Direct `model` overrides remain available for any OpenCode provider/model ID. `tester` and `reviewer` roles require `read_only` mode.
+
+Explicit roles:
+
+- `implementer`: a write-capable role alias. It honors the declared-path write rules below; beyond the task's mode there are no additional tool restrictions.
+- `tester`: independent read-only verification. Bash is enabled for running tests and verification commands, but the edit/write toolset is denied. A tester spawn requires a Git worktree: a content-based Git fingerprint (tracked worktree diff, staged diff, and nonignored untracked files) is captured before the run and compared afterwards. Any tracked, staged, or nonignored untracked mutation marks the task as an error without auto-reverting. This is post-run detection, not a sandbox: bash can mutate during execution, and outside-repo or ignored side effects are not prevented.
+- `reviewer`: strictly read-only review with no bash and no edit tools. It always resolves to `high` thinking for a stronger independent perspective.
 
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
 - `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship.
 - `opencode_workflow`: requires at least two sequential phases. Tasks inside one phase fan out under the same global four-worker cap.
 
 Path enforcement is a scheduler and prompt-level guard, not an operating-system sandbox. The parent Codex agent must still inspect the final diff and run relevant tests.
+
+## Opt-in worktree write isolation
+
+For genuinely parallel writes that touch disjoint paths, opt each write task into isolated worktree execution with `worktree: true` (valid only for `mode: write`). The worker runs in a detached Git worktree under the OS temp directory, so parallel workers never touch the live working tree. When a worktree task finishes cleanly, its changes are extracted as a Git binary patch and applied to the repository root.
+
+### Single direct write vs. parallel isolated writes
+
+- A single direct (non-worktree) write on a dirty tree is still supported. Direct writes are never routed through the worktree integration queue.
+- Concurrent writes are rejected unless every currently running write task — and the new one — opts into worktree isolation (`worktree: true`) **and** their concrete relevant paths are disjoint (no file or containing-directory overlap).
+- Trying to run writes concurrently without isolating them makes the extension reject the spawn with guidance to opt into `worktree=true`.
+
+### Batch setup and integration
+
+- The first worktree task in a batch requires a clean Git root (no tracked, staged, or nonignored-untracked changes); a dirty root is refused. Later worktree tasks in the same batch share that base and must be spawned while the batch is still open — that is, before the batch settles.
+- Integration applies each worker's Git binary patch to the repository root in task-ID order, without committing, stashing, or resetting. Before each apply the extension fingerprints the root; if the root changed externally since the batch base, it poisons the batch and aborts integration for that task and the remaining ones.
+- Because integration mutates the root, the root becomes dirty after a worktree batch settles. Commit or clean it before starting another worktree batch.
+
+### JSON examples
+
+A single isolated write spawn:
+
+```json
+opencode_spawn({
+  "name": "isolated-edit",
+  "mode": "write",
+  "worktree": true,
+  "objective": "Implement the requested change only inside src/a.ts.",
+  "relevant_paths": ["src/a.ts"],
+  "expected_output": "Report the changed file and a short summary."
+})
+```
+
+A workflow with a read-only phase, one worktree-write phase, then a read-only verification phase:
+
+```json
+opencode_workflow({
+  "name": "isolated-workflow",
+  "phases": [
+    {
+      "name": "research",
+      "tasks": [
+        {
+          "name": "inspect",
+          "mode": "read_only",
+          "objective": "Inspect the relevant modules and summarize constraints.",
+          "relevant_paths": ["src/"],
+          "expected_output": "A concise plan."
+        }
+      ]
+    },
+    {
+      "name": "edit",
+      "tasks": [
+        {
+          "name": "edit-a",
+          "mode": "write",
+          "worktree": true,
+          "objective": "Apply change A.",
+          "relevant_paths": ["src/a.ts"],
+          "expected_output": "Report changed file A."
+        },
+        {
+          "name": "edit-b",
+          "mode": "write",
+          "worktree": true,
+          "objective": "Apply change B.",
+          "relevant_paths": ["src/b.ts"],
+          "expected_output": "Report changed file B."
+        }
+      ]
+    },
+    {
+      "name": "verify",
+      "tasks": [
+        {
+          "name": "test",
+          "mode": "read_only",
+          "role": "tester",
+          "objective": "Run the tests after integration.",
+          "relevant_paths": ["src/"],
+          "expected_output": "Test results."
+        }
+      ]
+    }
+  ]
+})
+```
+
+### Workflow phase restrictions
+
+Worktree writes integrate through the root, so workflows constrain them tightly:
+
+- At most one worktree-write phase per workflow.
+- A worktree-write phase may contain only worktree writes (`mode: write` with `worktree: true`); no read-only, tester, reviewer, or direct-write task may be mixed into it.
+- Only read-only phases may precede the worktree-write phase.
+- Read/test/review and direct-write phases may follow it; the worktree phase must fully settle and integrate before a later phase starts.
+
+### Failure and retention
+
+- A worktree task that fails, is cancelled, times out, moves its own HEAD (commits inside the worktree), changes out-of-scope paths, contains submodule/gitlink changes, or whose patch is rejected is never integrated and never auto-reverted. Its worktree and patch are retained, with the error, in a current-session-only registry for manual cleanup.
+- After successful integration, the worktree and its temporary patch file are removed. On Windows, removing a worktree can leave an empty `oc-worktrees` temp directory behind — harmless.
+
+### Worktree cleanup and conflict UI
+
+Manage retained or conflicted worktrees in the running session with `/opencode-worktrees`:
+
+```text
+/opencode-worktrees list
+/opencode-worktrees status <worktree-id>
+/opencode-worktrees inspect <worktree-id>
+/opencode-worktrees retry <worktree-id>
+/opencode-worktrees discard <worktree-id>
+```
+
+- `list` shows retained worktrees and their state. `status` reports a single worktree's detail; `inspect` surfaces its error and conflict context. `retry` re-attempts integration; `discard` removes the retained worktree and patch.
+- Confirmation requirements: destructive operations are confirmed through the TUI; RPC/REST callers must pass an explicit confirmation flag. `discard` and `retry` are destructive and refuse to run without explicit confirmation.
+- Retry safety:
+  - The retried patch is the validated patch captured from the original current-session run; a replacement patch is never accepted.
+  - A retry is rejected while any task or batch for the same repository is active.
+  - Before apply, the extension re-checks a fingerprint of the root and runs `git apply --check`; integration never uses reset, stash, commit, or a 3-way merge.
+  - The extension does not attempt automatic conflict resolution. Conflicted integrations are surfaced for manual resolution or discard.
+- Behavior on failed cleanup or successful root integration: when a worktree cannot be cleaned up (`cleanup-failed`) it stays registered for a later attempt; when the patch is applied to the root (`rootIntegrated`) the retained worktree is removed and the root is left dirty for you to commit or clean.
+- Read-only inspection is available to agents through the `inspection` tool group as `opencode_worktree_list` and `opencode_worktree_status`; these return no filesystem paths in model-facing output.
+- The dashboard may retain a "worktree cleanup needed" warning while retained worktrees exist. There is no automatic cleanup on orchestrator shutdown.
+- The registry is current-session-only. Restart/crash recovery and cross-session garbage collection are deferred; on a restart, temp artifacts may remain for the OS to clean up and are not listed, and no path is exposed in model-facing output.
+- Worktree isolation isolates the working tree; it is not a sandbox. It does not prevent a worker's bash from running arbitrary commands or writing outside the worktree during execution. Only the final staged patch within declared scopes is integrated.
+
+### Roles and extension reload
+
+- `tester` and `reviewer` roles are unchanged and remain read-only; they are not affected by worktree write isolation.
+- This feature requires the new extension code. After updating the extension (for example `git pull` plus `npm install`), reload Pi once so the running session uses the new code.
 
 ## Routing and token-aware delivery
 
