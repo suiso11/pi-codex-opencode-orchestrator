@@ -806,51 +806,62 @@ export function toolsForProfile(profile: ToolProfile, mode: TaskMode): readonly 
 	return tools;
 }
 
+function validMaxTools(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+
 export function configuredModelCapabilities(env: NodeJS.ProcessEnv = process.env): Record<string, ModelCapability> {
-	const base: Record<string, ModelCapability> = {};
+	const base: Record<string, ModelCapability> = Object.fromEntries(
+		Object.entries(MODEL_CAPABILITIES).map(([model, capability]) => [model, { ...capability }]),
+	);
 	for (const [key, value] of Object.entries(env)) {
 		if (!key.startsWith("PI_OPENCODE_MODEL_CAP_") || !value) continue;
 		const model = key.slice("PI_OPENCODE_MODEL_CAP_".length).replace(/__/g, "/");
-		const parts = value.split(",");
-		const cap: ModelCapability = {};
-		for (const part of parts) {
+		const cap: ModelCapability = { ...(base[model] ?? {}) };
+		for (const part of value.split(",")) {
 			const [k, v] = part.split("=");
 			if (!k || !v) continue;
-			if (k === "maxTools") cap.maxTools = Number(v);
-			else if (k === "toolSchema") cap.toolSchema = v as "openai" | "restricted";
+			if (k === "maxTools") {
+				const parsed = Number(v.trim());
+				const maxTools = validMaxTools(parsed);
+				if (maxTools !== undefined) cap.maxTools = maxTools;
+			} else if (k === "toolSchema" && (v === "openai" || v === "restricted")) {
+				cap.toolSchema = v;
+			}
 		}
-		base[model] = cap;
+		if (Object.keys(cap).length > 0) base[model] = cap;
 	}
-	return { ...MODEL_CAPABILITIES, ...base };
+	return base;
 }
 
 export function enforceToolLimit(
 	tools: readonly string[],
 	capability?: ModelCapability,
 ): { tools: string[]; reduced: boolean; reason?: string } {
-	if (!capability?.maxTools || tools.length <= capability.maxTools) {
+	const maxTools = validMaxTools(capability?.maxTools);
+	if (maxTools === undefined || tools.length <= maxTools) {
 		return { tools: [...tools], reduced: false };
 	}
-	const kept = tools.slice(0, capability.maxTools);
+	const kept = tools.slice(0, maxTools);
 	return {
 		tools: kept,
 		reduced: true,
-		reason: `tool count ${tools.length} exceeds model maxTools ${capability.maxTools}; reduced to ${kept.length}`,
+		reason: `tool count ${tools.length} exceeds model maxTools ${maxTools}; reduced to ${kept.length}`,
 	};
 }
 
 export function buildAgentFrontmatter(profile: ToolProfile, mode: TaskMode): string {
 	const allowed = new Set(toolsForProfile(profile, mode));
-	const denied = ALL_OPENCODE_TOOLS.filter((t) => !allowed.has(t));
-	const permBlock = denied.length > 0
-		? denied.map((t) => `  ${t}: deny`).join("\n")
-		: "  # all tools allowed";
+	const allowedEntries = ALL_OPENCODE_TOOLS
+		.filter((tool) => allowed.has(tool))
+		.map((tool) => `  ${tool}: allow`);
 	return [
 		"---",
 		"description: Pi orchestrator bounded worker",
 		"mode: primary",
 		"permission:",
-		permBlock,
+		'  "*": deny',
+		...allowedEntries,
 		"---",
 	].join("\n");
 }

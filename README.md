@@ -162,7 +162,7 @@ Each worker route can use either the OpenCode backend or the Pi backend. The Pi 
 
 ### Opt-in Executor MCP gateway
 
-Set `PI_ORCH_ENABLE_EXECUTOR=1` and set `executor: true` on a task to add a local `mcp.executor` server to the generated OpenCode config. It is accepted only for the OpenCode backend with an explicit `role: "implementer"`; disabled, Pi/Collie, reviewer/tester, and no-role requests fail before spawning. The command is fixed to `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]`, and the generated entry overrides only `mcp.executor` while preserving unrelated config. Executor failures are terminal; there is no fallback backend. Keep authentication and other secrets out of task prompts and reports. Worker children receive a small runtime-only environment allowlist rather than the full parent environment. Provider environment keys should normally not be needed because workers use saved CLI authentication; if one is required, add its name explicitly to `PI_ORCH_WORKER_ENV_ALLOWLIST` (values and variable names are never included in worker reports).
+Set `PI_ORCH_ENABLE_EXECUTOR=1` and set `executor: true` on a task to add a local `mcp.executor` server to the generated OpenCode config. It is accepted only for the OpenCode backend with an explicit `role: "implementer"`; disabled, Pi/Collie, reviewer/tester, and no-role requests fail before spawning. The command is fixed to `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]`, and the generated config removes ambient MCP servers; it contains only the manager-generated `mcp.executor` entry when opted in (no other MCP server is inherited). Executor failures are terminal; there is no fallback backend. Keep authentication and other secrets out of task prompts and reports. Worker children receive a small runtime-only environment allowlist rather than the full parent environment. Provider environment keys should normally not be needed because workers use saved CLI authentication; if one is required, add its name explicitly to `PI_ORCH_WORKER_ENV_ALLOWLIST` (values and variable names are never included in worker reports).
 
 ### Experimental Collie backend
 
@@ -218,11 +218,11 @@ Override or extend from the environment (model slashes as `__`):
 PI_OPENCODE_MODEL_CAP_opencode-go__deepseek-v4-flash=maxTools=8,toolSchema=restricted
 ```
 
-When a profile's tool count exceeds `maxTools`, the manager trims to the limit and records a `capability:` notice in worker activity. The trimmed tools are also denied in the generated agent definition, so the activity display and the worker's effective permissions match. `toolSchema` is capability metadata only: it is parsed and kept for diagnostics, but no schema shaping is applied to worker requests.
+When a profile's tool count exceeds a valid `maxTools` (a finite positive integer), the manager trims to the limit and records a `capability:` notice in worker activity. Invalid values such as zero, negative, fractional, `NaN`, or `Infinity` are ignored. The trimmed tools remain denied by the generated agent's wildcard permission, so the activity display and the worker's effective permissions match. `toolSchema` is capability metadata only: it is parsed and kept for diagnostics, but no schema shaping is applied to worker requests.
 
 ### How it reaches OpenCode
 
-OpenCode resolves agents by **name** from `~/.config/opencode/agent/<name>.md`. Per spawn, the manager writes a frontmatter-only agent definition with `permission:` deny blocks for every OpenCode tool outside the effective tool set (the profile after any `maxTools` reduction), passes `--agent <name>`, and removes the file on close/timeout. The parent decides the tool set; ambient global/project/`.opencode` config no longer affects worker tool availability.
+OpenCode resolves agents by **name** from `~/.config/opencode/agent/<name>.md`. Per spawn, the manager writes a frontmatter-only agent definition with a first/default `"*": deny` permission followed by explicit `allow` entries for only the effective tool set (the profile after any `maxTools` reduction), passes `--agent <name>`, and removes the file on close/timeout. The Executor task additionally allows only the `mcp.executor.*` pattern. The parent decides the tool set; ambient global/project/`.opencode` config no longer affects worker tool availability.
 
 
 ## Using it in another repository

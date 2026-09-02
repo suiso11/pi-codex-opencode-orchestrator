@@ -11,27 +11,29 @@ function opencodeAgentDir(): string {
 	return path.join(os.homedir(), ".config", "opencode", "agent");
 }
 
-// The OpenCode tool universe is the "full" profile: every OpenCode tool. The
-// generated agent definition denies exactly the complement of the effective
-// (post-maxTools) allowlist, so activity display and enforced permissions match.
-export function agentFrontmatterFromTools(allowed: readonly string[]): string {
+// The OpenCode tool universe is the "full" profile. Start with a default
+// deny so tools added by OpenCode, providers, or MCP cannot become ambiently
+// available; explicit effective tools are allowed after that rule. MCP is
+// separately opt-in because it is not part of the regular tool profiles.
+export function agentFrontmatterFromTools(allowed: readonly string[], executor = false): string {
 	const allowedSet = new Set(allowed);
-	const denied = TOOL_PROFILES.full.filter((tool) => !allowedSet.has(tool));
-	const permBlock = denied.length > 0
-		? denied.map((tool) => `  ${tool}: deny`).join("\n")
-		: "  # all tools allowed";
+	const allowedEntries = TOOL_PROFILES.full
+		.filter((tool) => allowedSet.has(tool))
+		.map((tool) => `  ${tool}: allow`);
+	if (executor) allowedEntries.push('  "mcp.executor.*": allow');
 	return [
 		"---",
 		"description: Pi orchestrator bounded worker",
 		"mode: primary",
 		"permission:",
-		permBlock,
+		'  "*": deny',
+		...allowedEntries,
 		"---",
 	].join("\n");
 }
 
-function writeAgentDefinition(taskId: string, allowedTools: readonly string[]): string {
-	const frontmatter = agentFrontmatterFromTools(allowedTools);
+function writeAgentDefinition(taskId: string, allowedTools: readonly string[], executor = false): string {
+	const frontmatter = agentFrontmatterFromTools(allowedTools, executor);
 	const body = "You are a bounded worker delegated by a parent Pi orchestrator. Follow the repository's AGENTS.md. Do not read secrets or git-ignored runtime configuration. Stay within the declared scope and report missing scope instead of broadening the task.";
 	const dir = opencodeAgentDir();
 	mkdirSync(dir, { recursive: true });
@@ -90,9 +92,10 @@ function rolePermissionOverride(role: WorkerRole | undefined): RolePermissionOve
 /**
  * Merge a valid existing OPENCODE_CONFIG_CONTENT with the role-specific
  * permission override for the OpenCode child. Any existing top-level keys and
- * non-forced permission keys are preserved; an invalid existing value is
- * ignored in favor of the forced override. Returns undefined when no override
- * applies and nothing valid is present.
+ * non-forced permission keys are preserved, except ambient MCP servers; an
+ * invalid existing value is ignored in favor of the forced override. Executor
+ * mode installs only the manager-generated mcp.executor entry. Returns
+ * undefined when no existing config or forced setting is present.
  */
 export function buildOpenCodeConfigContent(
 	role: WorkerRole | undefined,
@@ -101,18 +104,26 @@ export function buildOpenCodeConfigContent(
 	env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
 	const override = rolePermissionOverride(role);
-	if (!override && !executor) return existingContent;
+	if (!override && !executor && !existingContent) return undefined;
 	let base: Record<string, unknown> = {};
+	let parsedExisting = false;
 	if (existingContent) {
 		try {
 			const parsed: unknown = JSON.parse(existingContent);
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
 				base = parsed as Record<string, unknown>;
+				parsedExisting = true;
 			}
 		} catch {
-			// Invalid existing inline config is ignored; the override still applies.
+			// Invalid existing inline config is ignored when a forced config is
+			// needed; otherwise preserve it so OpenCode reports the parse error.
+			if (!override && !executor) return existingContent;
 		}
 	}
+	// Never inherit ambient MCP servers. The only MCP entry a worker may see is
+	// the manager-generated Executor gateway below when explicitly opted in.
+	const hadAmbientMcp = Object.prototype.hasOwnProperty.call(base, "mcp");
+	delete base.mcp;
 	let permission: Record<string, unknown> | undefined;
 	if (override) {
 		permission = base.permission && typeof base.permission === "object" && !Array.isArray(base.permission)
@@ -139,6 +150,7 @@ export function buildOpenCodeConfigContent(
 		mcp[EXECUTOR_CONFIG_KEY] = { type: "local", command: executorCommand(env) };
 		base.mcp = mcp;
 	}
+	if (!override && !executor && parsedExisting && !hadAmbientMcp) return existingContent;
 	return JSON.stringify({ ...base, ...(override ? { permission } : {}) });
 }
 
@@ -172,7 +184,7 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		const profile = resolveToolProfile(input.spec, this.defaultToolProfile);
 		const capability = this.modelCapabilities[input.model];
 		const tools = enforceToolLimit(toolsForProfile(profile, input.spec.mode), capability);
-		const agentName = writeAgentDefinition(input.taskId, tools.tools);
+		const agentName = writeAgentDefinition(input.taskId, tools.tools, input.spec.executor === true);
 		const activity = [`agent profile: ${profile} (${tools.tools.join(",")})`];
 		if (tools.reduced && tools.reason) activity.push(`capability: ${tools.reason}`);
 		return { agentName, activity };

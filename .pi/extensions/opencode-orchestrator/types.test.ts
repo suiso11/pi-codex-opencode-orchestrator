@@ -768,42 +768,58 @@ test("enforceToolLimit keeps tools when within capability and trims when over", 
 	assert.equal(over.reduced, true);
 	assert.equal(over.tools.length, 3);
 	assert.ok(over.reason?.includes("exceeds"));
-	// no capability means no limit
+	// no capability means no limit; malformed caps are ignored rather than
+	// coercing slice() with fractional, negative, or non-finite values.
 	const noCap = enforceToolLimit(["a", "b", "c"], undefined);
 	assert.equal(noCap.reduced, false);
+	for (const maxTools of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+		assert.deepEqual(enforceToolLimit(["a", "b", "c"], { maxTools }), {
+			tools: ["a", "b", "c"],
+			reduced: false,
+		});
+	}
 });
 
-test("configuredModelCapabilities reads PI_OPENCODE_MODEL_CAP_ env overrides", () => {
+test("configuredModelCapabilities reads overrides and ignores invalid maxTools metadata", () => {
 	const caps = configuredModelCapabilities({
 		"PI_OPENCODE_MODEL_CAP_opencode-go__deepseek-v4-flash": "maxTools=8,toolSchema=restricted",
 	});
 	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.maxTools, 8);
 	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.toolSchema, "restricted");
-	// built-in default still present
-	assert.equal(caps["opencode-go/deepseek-v4-flash"]?.maxTools, 8);
+
+	for (const value of ["0", "-1", "1.5", "NaN", "Infinity"]) {
+		const invalid = configuredModelCapabilities({
+			[`PI_OPENCODE_MODEL_CAP_custom__${value}`]: `maxTools=${value}`,
+		});
+		assert.equal(invalid[`custom/${value}`]?.maxTools, undefined, `invalid maxTools=${value} must be ignored`);
+	}
+	// An invalid override must not disable a built-in valid cap.
+	const builtIn = configuredModelCapabilities({
+		"PI_OPENCODE_MODEL_CAP_opencode-go__deepseek-v4-flash": "maxTools=0",
+	});
+	assert.equal(builtIn["opencode-go/deepseek-v4-flash"]?.maxTools, 16);
 });
 
-test("buildAgentFrontmatter denies tools outside the profile and allows the rest", () => {
+test("buildAgentFrontmatter defaults to deny and explicitly allows only the profile", () => {
 	const coding = buildAgentFrontmatter("coding", "write");
 	assert.match(coding, /^---\ndescription:/);
 	assert.match(coding, /mode: primary/);
-	// edit and read are allowed (no deny line for them)
-	assert.doesNotMatch(coding, /\nread: deny/);
-	assert.doesNotMatch(coding, /\nedit: deny/);
-	// webfetch, websearch, task, todowrite, lsp, skill are denied
-	assert.match(coding, /webfetch: deny/);
-	assert.match(coding, /websearch: deny/);
-	assert.match(coding, /task: deny/);
-	assert.match(coding, /todowrite: deny/);
-	assert.match(coding, /lsp: deny/);
-	assert.match(coding, /skill: deny/);
-	// read_only mode denies bash and edit too
+	assert.ok(coding.includes('  "*": deny'));
+	assert.match(coding, /\n {2}read: allow/);
+	assert.match(coding, /\n {2}edit: allow/);
+	assert.doesNotMatch(coding, /\nwebfetch: allow/);
+	assert.doesNotMatch(coding, /\nwebsearch: allow/);
+	assert.doesNotMatch(coding, /\ntask: allow/);
+	assert.doesNotMatch(coding, /\nskill: allow/);
+	// read_only mode denies bash and edit through the default wildcard.
 	const ro = buildAgentFrontmatter("coding", "read_only");
-	assert.match(ro, /bash: deny/);
-	assert.match(ro, /edit: deny/);
-	// full profile denies nothing
+	assert.ok(ro.includes('  "*": deny'));
+	assert.doesNotMatch(ro, /\nbash: allow/);
+	assert.doesNotMatch(ro, /\nedit: allow/);
+	// Even full is fail-closed for tools outside the known universe.
 	const full = buildAgentFrontmatter("full", "write");
-	assert.doesNotMatch(full, /: deny/);
+	assert.ok(full.includes('  "*": deny'));
+	assert.match(full, /\n {2}skill: allow/);
 });
 
 test("taskSummary and taskResultText expose worktree state without leaking the worktree path", () => {

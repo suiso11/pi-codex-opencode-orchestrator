@@ -113,16 +113,22 @@ function agentDefinitionText(agentName: string | undefined): string {
 	return readFileSync(file, "utf8");
 }
 
-test("agentFrontmatterFromTools denies exactly the complement of the allowed tools", () => {
+test("agentFrontmatterFromTools is fail-closed with wildcard deny and explicit allows", () => {
 	const trimmed = agentFrontmatterFromTools(["read", "glob"]);
-	assert.match(trimmed, /\n {2}grep: deny/);
-	assert.match(trimmed, /\n {2}edit: deny/);
-	assert.match(trimmed, /\n {2}bash: deny/);
-	assert.match(trimmed, /\n {2}webfetch: deny/);
-	assert.doesNotMatch(trimmed, /\n {2}read: deny/);
-	assert.doesNotMatch(trimmed, /\n {2}glob: deny/);
+	assert.ok(trimmed.includes('permission:\n  "*": deny\n  read: allow\n  glob: allow'));
+	assert.ok(trimmed.includes('  "*": deny'));
+	assert.doesNotMatch(trimmed, /\n {2}grep: allow/);
+	assert.doesNotMatch(trimmed, /\n {2}mcp\./);
 	const full = agentFrontmatterFromTools(TOOL_PROFILES.full);
-	assert.doesNotMatch(full, /: deny/);
+	assert.ok(full.includes('  "*": deny'));
+	assert.match(full, /\n {2}skill: allow/);
+});
+
+test("agentFrontmatterFromTools allows Executor MCP only when explicitly enabled", () => {
+	const regular = agentFrontmatterFromTools(["read"]);
+	assert.doesNotMatch(regular, /mcp\.executor/);
+	const executor = agentFrontmatterFromTools(["read"], true);
+	assert.ok(executor.includes('  "mcp.executor.*": allow'));
 });
 
 test("prepare writes agent permissions from the post-maxTools tool set", () => {
@@ -140,13 +146,14 @@ test("prepare writes agent permissions from the post-maxTools tool set", () => {
 			preparation.activity.some((a) => a.startsWith("capability:")),
 			"the capability reduction must be recorded in activity",
 		);
-		// The agent definition actually denies the tools maxTools dropped.
+		// The agent definition allows only the effective tools; the wildcard denies the rest.
 		const text = agentDefinitionText(preparation.agentName);
-		assert.match(text, /\n {2}grep: deny/);
-		assert.match(text, /\n {2}edit: deny/);
-		assert.match(text, /\n {2}bash: deny/);
-		assert.doesNotMatch(text, /\n {2}read: deny/);
-		assert.doesNotMatch(text, /\n {2}glob: deny/);
+		assert.ok(text.includes('  "*": deny'));
+		assert.match(text, /\n {2}read: allow/);
+		assert.match(text, /\n {2}glob: allow/);
+		assert.doesNotMatch(text, /\n {2}grep: allow/);
+		assert.doesNotMatch(text, /\n {2}edit: allow/);
+		assert.doesNotMatch(text, /\n {2}bash: allow/);
 	} finally {
 		adapter.cleanupAgent(preparation.agentName);
 	}
@@ -163,10 +170,31 @@ test("prepare keeps the profile allowlist when no model capability applies", () 
 	try {
 		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(read,glob,grep,edit,bash\)/);
 		const text = agentDefinitionText(preparation.agentName);
-		assert.match(text, /\n {2}webfetch: deny/);
-		assert.match(text, /\n {2}skill: deny/);
-		assert.doesNotMatch(text, /\n {2}bash: deny/);
-		assert.doesNotMatch(text, /\n {2}edit: deny/);
+		assert.ok(text.includes('  "*": deny'));
+		assert.match(text, /\n {2}read: allow/);
+		assert.match(text, /\n {2}bash: allow/);
+		assert.match(text, /\n {2}edit: allow/);
+		assert.doesNotMatch(text, /\n {2}webfetch: allow/);
+		assert.doesNotMatch(text, /\n {2}skill: allow/);
+	} finally {
+		adapter.cleanupAgent(preparation.agentName);
+	}
+});
+
+test("prepare allows the Executor MCP pattern only for an explicit Executor task", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+	const preparation = adapter.prepare(spawnInput({
+		spec: { ...spawnInput().spec, role: "implementer", executor: true },
+	}));
+	try {
+		const text = agentDefinitionText(preparation.agentName);
+		assert.ok(text.includes('  "*": deny'));
+		assert.ok(text.includes('  "mcp.executor.*": allow'));
 	} finally {
 		adapter.cleanupAgent(preparation.agentName);
 	}
@@ -176,7 +204,7 @@ test("Executor MCP config overrides only mcp.executor with fixed browser approva
 	const existing = JSON.stringify({ theme: "dark", mcp: { other: { type: "remote" }, executor: { type: "remote" } } });
 	const merged = JSON.parse(buildOpenCodeConfigContent("implementer", existing, true, { PI_EXECUTOR_BIN: "custom-executor" })!);
 	assert.equal(merged.theme, "dark");
-	assert.deepEqual(merged.mcp.other, { type: "remote" });
+	assert.deepEqual(Object.keys(merged.mcp), ["executor"]);
 	assert.deepEqual(merged.mcp.executor, {
 		type: "local",
 		command: ["custom-executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"],
@@ -191,7 +219,9 @@ test("Executor gate is opt-in and fail-closed for non-implementer routes", () =>
 	assert.equal(executorGateError(input, { PI_ORCH_ENABLE_EXECUTOR: "1" }), undefined);
 });
 
-test("buildOpenCodeConfigContent keeps invalid inline JSON out of the merged config", () => {
+test("buildOpenCodeConfigContent removes ambient MCP and keeps invalid inline JSON out of forced config", () => {
+	const ambient = JSON.parse(buildOpenCodeConfigContent(undefined, JSON.stringify({ theme: "dark", mcp: { other: { type: "remote" } } }))!);
+	assert.deepEqual(ambient, { theme: "dark" });
 	const tester = JSON.parse(buildOpenCodeConfigContent("tester", "not-json")!);
 	assert.deepEqual(tester, { permission: { edit: "deny", bash: { "*": "allow" } } });
 	assert.equal(buildOpenCodeConfigContent(undefined, undefined), undefined);
