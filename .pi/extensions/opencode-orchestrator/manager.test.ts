@@ -5,7 +5,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { buildOpenCodeConfigContent, OpenCodeTaskManager } from "./manager.ts";
+import { buildOpenCodeConfigContent } from "./backends/opencode.ts";
+import { OpenCodeTaskManager } from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
 
 clearAmbientModelConfigEnv();

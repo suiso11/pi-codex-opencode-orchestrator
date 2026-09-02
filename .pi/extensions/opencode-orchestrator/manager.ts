@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,13 +12,13 @@ import type {
 	TaskSnapshot,
 	TaskSpec,
 	ThinkingLevel,
+	WorkerBackend,
 	WorkerRole,
 	WorktreeRetentionKind,
 	WorktreeSnapshotInfo,
 } from "./types.ts";
 import {
 	boundedAppend,
-	buildAgentFrontmatter,
 	buildWorkerPrompt,
 	configuredModelCapabilities,
 	configuredModelProfiles,
@@ -27,7 +27,6 @@ import {
 	decodeWorkerModel,
 	DEFAULT_MODEL,
 	DEFAULT_TOOL_PROFILE,
-	enforceToolLimit,
 	extractUsageFromEvent,
 	findScopeConflict,
 	MAX_ACTIVITY_ITEMS,
@@ -41,35 +40,12 @@ import {
 	pathForScopeComparison,
 	resolveModel,
 	resolveThinkingLevel,
-	resolveToolProfile,
-	toolsForProfile,
 	type ModelCapability,
 	type ToolProfile,
 } from "./types.ts";
-
-function opencodeAgentDir(): string {
-	// OpenCode resolves agents by name from ~/.config/opencode/agent/ on every platform.
-	return path.join(os.homedir(), ".config", "opencode", "agent");
-}
-
-function writeAgentDefinition(taskId: string, profile: ToolProfile, mode: TaskMode): string {
-	const frontmatter = buildAgentFrontmatter(profile, mode);
-	const body = "You are a bounded worker delegated by a parent Pi orchestrator. Follow the repository's AGENTS.md. Do not read secrets or git-ignored runtime configuration. Stay within the declared scope and report missing scope instead of broadening the task.";
-	const dir = opencodeAgentDir();
-	mkdirSync(dir, { recursive: true });
-	const name = `pi-orch-${taskId}-${randomBytes(4).toString("hex")}`;
-	const file = path.join(dir, `${name}.md`);
-	writeFileSync(file, `${frontmatter}
-${body}
-`, { encoding: "utf-8" });
-	return name;
-}
-
-function cleanupAgentDefinition(name: string | undefined) {
-	if (!name) return;
-	const file = path.join(opencodeAgentDir(), `${name}.md`);
-	try { unlinkSync(file); } catch { /* already removed or missing */ }
-}
+import type { BackendPreparation, WorkerBackendAdapter } from "./backends/backend.ts";
+import { OpenCodeBackendAdapter } from "./backends/opencode.ts";
+import { PiBackendAdapter } from "./backends/pi.ts";
 
 interface ManagedTask {
 	snapshot: TaskSnapshot;
@@ -295,71 +271,6 @@ function activityFromEvent(event: Record<string, unknown>) {
 	return `${type}: ${String(part.type ?? "unknown")}`;
 }
 
-// Exact Pi child tool lists. Existing unroled read/write behavior is preserved;
-// tester additionally gets bash (but no edit/write), and reviewer is strictly
-// read/grep/find/ls.
-function piToolList(spec: Pick<TaskSpec, "mode" | "role">) {
-	if (spec.role === "reviewer") return "read,grep,find,ls";
-	if (spec.role === "tester") return "read,grep,find,ls,bash";
-	return spec.mode === "read_only" ? "read,grep,find,ls" : "read,grep,find,ls,bash,edit,write";
-}
-
-interface RolePermissionOverride {
-	edit: "deny";
-	bash: "deny" | Record<string, "allow">;
-}
-
-// Official permission semantics: edit covers edit/write/patch, and the last
-// matching bash rule wins. The forced bash override is therefore appended as the
-// last rule so it wins for any matching command. Bash immutability is never claimed.
-function rolePermissionOverride(role: WorkerRole | undefined): RolePermissionOverride | undefined {
-	if (role === "tester") return { edit: "deny", bash: { "*": "allow" } };
-	if (role === "reviewer") return { edit: "deny", bash: "deny" };
-	return undefined;
-}
-
-/**
- * Merge a valid existing OPENCODE_CONFIG_CONTENT with the role-specific
- * permission override for the OpenCode child. Any existing top-level keys and
- * non-forced permission keys are preserved; an invalid existing value is
- * ignored in favor of the forced override. Returns undefined when no override
- * applies and nothing valid is present.
- */
-export function buildOpenCodeConfigContent(
-	role: WorkerRole | undefined,
-	existingContent: string | undefined,
-): string | undefined {
-	const override = rolePermissionOverride(role);
-	if (!override) return existingContent;
-	let base: Record<string, unknown> = {};
-	if (existingContent) {
-		try {
-			const parsed: unknown = JSON.parse(existingContent);
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				base = parsed as Record<string, unknown>;
-			}
-		} catch {
-			// Invalid existing inline config is ignored; the override still applies.
-		}
-	}
-	const permission = base.permission && typeof base.permission === "object" && !Array.isArray(base.permission)
-		? { ...(base.permission as Record<string, unknown>) }
-		: {};
-	permission.edit = override.edit;
-	if (override.bash === "deny") {
-		permission.bash = "deny";
-	} else {
-		const existingBash = permission.bash && typeof permission.bash === "object" && !Array.isArray(permission.bash)
-			? { ...(permission.bash as Record<string, unknown>) }
-			: {};
-		// Remove any prior "*" rule and re-insert it last so the forced override
-		// is the final matching bash rule.
-		delete existingBash["*"];
-		existingBash["*"] = override.bash["*"];
-		permission.bash = existingBash;
-	}
-	return JSON.stringify({ ...base, permission });
-}
 
 function runGit(cwd: string, args: string[]): Buffer | undefined {
 	try {
@@ -596,6 +507,7 @@ export class OpenCodeTaskManager {
 	private readonly defaultToolProfile: ToolProfile;
 	private readonly worktreeBatches = new Map<string, WorktreeBatch>();
 	private readonly retainedWorktrees = new Map<string, RetainedWorktree>();
+	private readonly backends: Record<WorkerBackend, WorkerBackendAdapter>;
 
 	constructor(options: ManagerOptions = {}) {
 		this.onChange = options.onChange;
@@ -615,6 +527,15 @@ export class OpenCodeTaskManager {
 		const piCommand = defaultPiCommand();
 		this.piBinary = options.piBinary ?? piCommand.binary;
 		this.piBinaryArgs = options.piBinaryArgs ?? piCommand.args;
+		this.backends = {
+			opencode: new OpenCodeBackendAdapter({
+				binary: this.binary,
+				binaryArgs: this.binaryArgs,
+				defaultToolProfile: this.defaultToolProfile,
+				modelCapabilities: this.modelCapabilities,
+			}),
+			pi: new PiBackendAdapter({ binary: this.piBinary, binaryArgs: this.piBinaryArgs }),
+		};
 	}
 
 	configuration() {
@@ -809,58 +730,30 @@ export class OpenCodeTaskManager {
 
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
-		const isPiWorker = entry.snapshot.backend === "pi";
 		const thinking = resolveThinkingLevel(spec, this.thinkingLevel);
-		const binary = isPiWorker ? this.piBinary : this.binary;
-		// Tool capability routing: OpenCode workers get a generated agent definition so
-		// the parent owns the tool set, instead of inheriting ambient OpenCode config.
-		// Pi workers already pass --tools explicitly.
-		let agentName: string | undefined;
-		let capabilityNotice: string | undefined;
-		if (!isPiWorker) {
-			const profile = resolveToolProfile(spec, this.defaultToolProfile);
-			const capability = this.modelCapabilities[entry.snapshot.model];
-			const tools = enforceToolLimit(toolsForProfile(profile, spec.mode), capability);
-			if (tools.reduced) capabilityNotice = tools.reason;
-			agentName = writeAgentDefinition(entry.snapshot.id, profile, spec.mode);
-			entry.snapshot.activity.push(`agent profile: ${profile} (${tools.tools.join(",")})`);
-			if (capabilityNotice) entry.snapshot.activity.push(`capability: ${capabilityNotice}`);
+		// Backend-specific command/args/env/tool-allowlist/agent construction is
+		// delegated to the backend adapter; scheduling, snapshot state, output
+		// parsing, and Git/worktree handling stay in the manager.
+		const adapter = this.backends[entry.snapshot.backend];
+		const backendName = adapter.displayName;
+		const spawnInput = {
+			taskId: entry.snapshot.id,
+			spec,
+			model: entry.snapshot.model,
+			thinking,
+			prompt,
+		};
+		const preparation: BackendPreparation = adapter.prepare(spawnInput);
+		const agentName = preparation.agentName;
+		if (preparation.activity.length > 0) {
+			entry.snapshot.activity.push(...preparation.activity);
 			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
 		}
-		const args = isPiWorker
-			? [
-				...this.piBinaryArgs,
-				"--approve",
-				"--no-session",
-				"--no-extensions",
-				"--mode",
-				"json",
-				"--model",
-				entry.snapshot.model,
-				"--thinking",
-				thinking,
-				"--tools",
-				piToolList(spec),
-				prompt,
-			]
-			: [
-				...this.binaryArgs,
-				"run",
-				"--format",
-				"json",
-				"--model",
-				entry.snapshot.model,
-				"--variant",
-				thinking,
-				...(agentName ? ["--agent", agentName] : []),
-				prompt,
-			];
-		// OpenCode children inherit the environment; role workers additionally get
+		const args = adapter.buildArgs(spawnInput, preparation);
+		// Workers inherit the environment; OpenCode role workers additionally get
 		// a forced official permission override merged over any valid inline config.
-		const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" };
-		const mergedConfig = buildOpenCodeConfigContent(spec.role, env.OPENCODE_CONFIG_CONTENT);
-		if (mergedConfig !== undefined) env.OPENCODE_CONFIG_CONTENT = mergedConfig;
-		const child = spawn(binary, args, {
+		const env = adapter.buildEnv({ ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" }, spawnInput);
+		const child = spawn(adapter.binary, args, {
 			cwd,
 			env,
 			detached: os.platform() !== "win32",
@@ -871,9 +764,9 @@ export class OpenCodeTaskManager {
 
 		const timeout = setTimeout(() => {
 			entry.snapshot.timedOut = true;
-			entry.snapshot.error = `${isPiWorker ? "Pi" : "OpenCode"} worker timed out after ${this.timeoutMs} ms.`;
+			entry.snapshot.error = `${backendName} worker timed out after ${this.timeoutMs} ms.`;
 			killProcessTree(child, "SIGTERM");
-			setTimeout(() => { killProcessTree(child, "SIGKILL"); cleanupAgentDefinition(agentName); }, 5_000).unref();
+			setTimeout(() => { killProcessTree(child, "SIGKILL"); adapter.cleanupAgent(agentName); }, 5_000).unref();
 		}, this.timeoutMs);
 		timeout.unref();
 
@@ -885,11 +778,11 @@ export class OpenCodeTaskManager {
 			this.notify();
 		});
 		child.on("error", (error) => {
-			entry.snapshot.error = `Failed to start ${isPiWorker ? "Pi" : "OpenCode"} worker: ${processError(error)}`;
+			entry.snapshot.error = `Failed to start ${backendName} worker: ${processError(error)}`;
 		});
 		child.on("close", (code) => {
 			clearTimeout(timeout);
-			cleanupAgentDefinition(agentName);
+			adapter.cleanupAgent(agentName);
 			if (entry.buffer.trim()) this.consumeLine(entry, entry.buffer);
 			entry.buffer = "";
 			entry.snapshot.exitCode = code ?? 1;
@@ -906,7 +799,7 @@ export class OpenCodeTaskManager {
 					// Cancel/timeout/worker failure: never integrate or auto-revert;
 					// the worktree is retained for a later cleanup UI. The retention
 					// code is decided here from the terminal cause, never from error text.
-					this.resolveStatus(entry, code, isPiWorker);
+					this.resolveStatus(entry, code, backendName);
 					this.redactWorktreeDiagnostics(entry);
 					const code_: RetentionCode = entry.cancelRequested
 						? "cancel"
@@ -916,13 +809,13 @@ export class OpenCodeTaskManager {
 					this.markWorktreeRetained(
 						entry,
 						code_,
-						entry.snapshot.error ?? `${isPiWorker ? "Pi" : "OpenCode"} worker did not exit cleanly.`,
+						entry.snapshot.error ?? `${backendName} worker did not exit cleanly.`,
 					);
 					this.finishSettle(entry);
 				} else {
 					void this.finalizeWorktree(entry).then(
 						() => {
-							this.resolveStatus(entry, code, isPiWorker);
+							this.resolveStatus(entry, code, backendName);
 							this.redactWorktreeDiagnostics(entry);
 							this.finishSettle(entry);
 						},
@@ -937,12 +830,12 @@ export class OpenCodeTaskManager {
 				}
 				return;
 			}
-			this.resolveStatus(entry, code, isPiWorker);
+			this.resolveStatus(entry, code, backendName);
 			this.finishSettle(entry);
 		});
 	}
 
-	private resolveStatus(entry: ManagedTask, code: number | null, isPiWorker: boolean) {
+	private resolveStatus(entry: ManagedTask, code: number | null, backendName: string) {
 		const comparison = entry.baselineFingerprint && entry.cwd
 			? compareGitFingerprint(entry.baselineFingerprint, entry.cwd)
 			: undefined;
@@ -972,7 +865,7 @@ export class OpenCodeTaskManager {
 		if (entry.snapshot.status === "running" && entry.cancelRequested) entry.snapshot.status = "cancelled";
 		else if (entry.snapshot.status === "running" && (entry.snapshot.timedOut || code !== 0 || entry.snapshot.error)) {
 			entry.snapshot.status = "error";
-			entry.snapshot.error ??= `${isPiWorker ? "Pi" : "OpenCode"} worker exited with code ${code ?? 1}.`;
+			entry.snapshot.error ??= `${backendName} worker exited with code ${code ?? 1}.`;
 		} else if (entry.snapshot.status === "running") entry.snapshot.status = "done";
 	}
 
