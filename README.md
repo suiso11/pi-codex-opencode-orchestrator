@@ -224,10 +224,10 @@ Explicit roles:
 - `reviewer`: strictly read-only review with no bash and no edit tools. It always resolves to `high` thinking for a stronger independent perspective.
 
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
-- `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship.
+- `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship. Non-worktree write workers are checked after completion by comparing Git content fingerprints from before and after the run; only paths changed during that run are scope-checked, so pre-existing dirty changes are preserved.
 - `opencode_workflow`: requires at least two sequential phases. Tasks inside one phase fan out under the same global four-worker cap.
 
-Path enforcement is a scheduler and prompt-level guard, not an operating-system sandbox. The parent Codex agent must still inspect the final diff and run relevant tests.
+Path enforcement is a scheduler, prompt-level, and (for direct writes) post-run guard, not an operating-system sandbox. The post-run guard reports out-of-scope changes as errors and never reverts files; bash can still mutate during execution or outside the repository, and ignored side effects are not prevented. The parent Codex agent must still inspect the final diff and run relevant tests.
 
 ## Opt-in worktree write isolation
 

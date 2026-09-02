@@ -83,12 +83,25 @@ interface ManagedTask {
 	cwd?: string;
 	childCwd?: string;
 	baselineFingerprint?: GitFingerprint;
+	// Direct write workers use the same post-run Git guard as tester workers,
+	// but additionally enforce the worker's declared scopes.
+	gitGuard?: "tester" | "direct-write";
 	worktree?: WorktreeRuntime;
 }
 
 interface GitFingerprint {
 	hash: string;
 	paths: string[];
+	// Per-path content/state hashes let us distinguish a worker mutation from a
+	// pre-existing dirty path with the same name.
+	pathHashes: Map<string, string>;
+}
+
+interface GitFingerprintComparison {
+	mutated: boolean;
+	changedPaths: string[];
+	currentPaths: string[];
+	error?: string;
 }
 
 // Per-task worktree runtime. The absolute worktree path lives only here and in
@@ -485,25 +498,72 @@ function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 			hash.update(Buffer.from("\0"));
 		}
 	}
-	const status = runGit(cwd, ["status", "--porcelain=v1", "-z"]);
+	const status = runGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+	const statusByPath = new Map<string, string>();
 	if (status) {
 		for (const entry of splitNul(status)) {
 			// porcelain v1 -z entries are "<XY> path"; untracked entries are "?? path".
-			if (entry.length > 3) paths.add(entry.slice(3));
-			else if (entry.length > 0) paths.add(entry);
+			if (entry.length > 3) {
+				const relative = entry.slice(3);
+				paths.add(relative);
+				statusByPath.set(relative, entry.slice(0, 2));
+			} else if (entry.length > 0) {
+				paths.add(entry);
+			}
 		}
 	}
-	return { hash: hash.digest("hex"), paths: [...paths].sort() };
+
+	// Capture state for every currently dirty/untracked path. Besides the
+	// working-tree bytes, include both index and worktree diffs so a dirty
+	// baseline remains distinguishable when the worker changes the same path.
+	const pathHashes = new Map<string, string>();
+	for (const relative of paths) {
+		const pathHash = createHash("sha256");
+		pathHash.update(statusByPath.get(relative) ?? "");
+		pathHash.update(Buffer.from("\\0worktree-content\\0"));
+		try {
+			const file = path.join(cwd, relative);
+			const stats = statSync(file);
+			pathHash.update(Buffer.from(`${stats.mode}:${stats.size}:`));
+			pathHash.update(readFileSync(file));
+		} catch {
+			pathHash.update(Buffer.from("<missing-or-unreadable>"));
+		}
+		pathHash.update(Buffer.from("\\0unstaged-diff\\0"));
+		pathHash.update(runGit(cwd, ["diff", "--no-color", "--binary", "--full-index", "--", relative]) ?? Buffer.alloc(0));
+		pathHash.update(Buffer.from("\\0staged-diff\\0"));
+		pathHash.update(runGit(cwd, ["diff", "--cached", "--no-color", "--binary", "--full-index", "--", relative]) ?? Buffer.alloc(0));
+		pathHashes.set(relative, pathHash.digest("hex"));
+	}
+	return { hash: hash.digest("hex"), paths: [...paths].sort(), pathHashes };
 }
 
-function detectMutation(baseline: GitFingerprint, cwd: string): string | undefined {
+function compareGitFingerprint(baseline: GitFingerprint, cwd: string): GitFingerprintComparison {
 	const after = captureGitFingerprint(cwd);
 	if (!after) {
-		return "the repository fingerprint could not be re-captured after the worker finished";
+		return {
+			mutated: true,
+			changedPaths: [],
+			currentPaths: [],
+			error: "the repository fingerprint could not be re-captured after the worker finished",
+		};
 	}
-	if (after.hash === baseline.hash) return undefined;
+	const candidates = new Set([...baseline.pathHashes.keys(), ...after.pathHashes.keys()]);
+	const changedPaths = [...candidates]
+		.filter((relative) => baseline.pathHashes.get(relative) !== after.pathHashes.get(relative))
+		.sort();
+	return {
+		mutated: after.hash !== baseline.hash || changedPaths.length > 0,
+		changedPaths,
+		currentPaths: after.paths,
+	};
+}
+
+function detectMutationMessage(baseline: GitFingerprint, comparison: GitFingerprintComparison): string | undefined {
+	if (comparison.error) return comparison.error;
+	if (!comparison.mutated) return undefined;
 	const before = new Set(baseline.paths);
-	const now = new Set(after.paths);
+	const now = new Set(comparison.currentPaths);
 	const added = [...now].filter((item) => !before.has(item)).sort();
 	const removed = [...before].filter((item) => !now.has(item)).sort();
 	const details: string[] = [];
@@ -511,6 +571,10 @@ function detectMutation(baseline: GitFingerprint, cwd: string): string | undefin
 	if (removed.length > 0) details.push(`${removed.length} removed path(s)`);
 	details.push("tracked worktree/staged content changed");
 	return `${details.join(", ")}; files were NOT reverted`;
+}
+
+function detectMutation(baseline: GitFingerprint, cwd: string): string | undefined {
+	return detectMutationMessage(baseline, compareGitFingerprint(baseline, cwd));
 }
 
 export class OpenCodeTaskManager {
@@ -679,16 +743,26 @@ export class OpenCodeTaskManager {
 			childCwd = this.prepareWorktree(entry, cwd, scopes);
 		}
 		entry.childCwd = childCwd;
-		// Tester role gets a repository mutation guard. The baseline must be
-		// capturable (a Git worktree) or the spawn is rejected; changes after
-		// close are marked as a task error without auto-reverting.
-		if (spec.role === "tester") {
+		// Tester and direct non-worktree write workers get a repository mutation
+		// guard. Direct writes additionally use the baseline to enforce declared
+		// scopes at close; neither guard ever reverts worker changes.
+		const guard = spec.role === "tester"
+			? "tester"
+			: spec.mode === "write" && !spec.worktree
+				? "direct-write"
+				: undefined;
+		if (guard) {
 			const baseline = captureGitFingerprint(cwd);
 			if (!baseline) {
-				throw new Error("Tester role requires a Git worktree with a capturable baseline; refusing to spawn without a repository mutation guard.");
+				throw new Error(
+					guard === "tester"
+						? "Tester role requires a Git worktree with a capturable baseline; refusing to spawn without a repository mutation guard."
+						: "Direct write workers require a Git worktree with a capturable baseline; refusing to spawn without scope enforcement.",
+				);
 			}
 			entry.baselineFingerprint = baseline;
 			entry.cwd = cwd;
+			entry.gitGuard = guard;
 		}
 		this.tasks.set(id, entry);
 		this.prune();
@@ -869,17 +943,37 @@ export class OpenCodeTaskManager {
 	}
 
 	private resolveStatus(entry: ManagedTask, code: number | null, isPiWorker: boolean) {
-		const mutation = entry.baselineFingerprint && entry.cwd
-			? detectMutation(entry.baselineFingerprint, entry.cwd)
+		const comparison = entry.baselineFingerprint && entry.cwd
+			? compareGitFingerprint(entry.baselineFingerprint, entry.cwd)
 			: undefined;
-		if (mutation) {
+		if (entry.gitGuard === "direct-write" && comparison?.error) {
 			entry.snapshot.status = "error";
-			entry.snapshot.error = `Tester worker mutated the repository: ${mutation}. Bash can mutate during execution; outside-repo and ignored side effects are not prevented.`;
-		} else if (entry.cancelRequested) entry.snapshot.status = "cancelled";
-		else if (entry.snapshot.timedOut || code !== 0 || entry.snapshot.error) {
+			entry.snapshot.error = `Direct write worker scope enforcement failed: ${comparison.error}; files were NOT reverted.`;
+		} else if (entry.gitGuard === "direct-write" && comparison?.mutated) {
+			const scopes = entry.snapshot.scopes;
+			const outOfScope = comparison.changedPaths.filter((relative) => {
+				const absolute = path.resolve(entry.cwd!, relative);
+				return !scopes.some((scope) => pathWithinScope(absolute, scope));
+			});
+			if (outOfScope.length > 0) {
+				entry.snapshot.status = "error";
+				entry.snapshot.error = `Direct write worker changed out-of-scope path(s): ${outOfScope.join(", ")}; files were NOT reverted. Post-run detection is not a sandbox; outside-repo and ignored side effects are not prevented.`;
+			} else if (comparison.changedPaths.length === 0) {
+				entry.snapshot.status = "error";
+				entry.snapshot.error = "Direct write worker changed the repository, but the changed path could not be identified; files were NOT reverted.";
+			}
+		} else if (entry.gitGuard === "tester" && comparison) {
+			const mutation = comparison.error ?? (comparison.mutated ? detectMutationMessage(entry.baselineFingerprint!, comparison) : undefined);
+			if (mutation) {
+				entry.snapshot.status = "error";
+				entry.snapshot.error = `Tester worker mutated the repository: ${mutation}. Bash can mutate during execution; outside-repo and ignored side effects are not prevented.`;
+			}
+		}
+		if (entry.snapshot.status === "running" && entry.cancelRequested) entry.snapshot.status = "cancelled";
+		else if (entry.snapshot.status === "running" && (entry.snapshot.timedOut || code !== 0 || entry.snapshot.error)) {
 			entry.snapshot.status = "error";
 			entry.snapshot.error ??= `${isPiWorker ? "Pi" : "OpenCode"} worker exited with code ${code ?? 1}.`;
-		} else entry.snapshot.status = "done";
+		} else if (entry.snapshot.status === "running") entry.snapshot.status = "done";
 	}
 
 	private finishSettle(entry: ManagedTask) {

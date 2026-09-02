@@ -976,6 +976,109 @@ test("tester role flags a worker that creates a nonignored untracked file", asyn
 	}
 });
 
+test("direct write worker allows an in-scope tracked change", async () => {
+	const fake = await fakeMutatingOpenCode('writeFileSync("src/a.txt", "changed\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	await mkdir(path.join(repo.dir, "src"), { recursive: true });
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-in-scope", "write", ["src/a.txt"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(await readFile(path.join(repo.dir, "src/a.txt"), "utf8"), "changed\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write worker rejects an out-of-scope tracked change without reverting it", async () => {
+	const fake = await fakeMutatingOpenCode('writeFileSync("base.txt", "worker\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-out-tracked", "write", ["src/a.txt"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*base\.txt/);
+		assert.match(settled.error ?? "", /files were NOT reverted/);
+		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "worker\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write worker rejects an out-of-scope untracked change without reverting it", async () => {
+	const fake = await fakeMutatingOpenCode();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-out-untracked", "write", ["src/a.txt"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*mutated\.txt/);
+		assert.match(settled.error ?? "", /not a sandbox/);
+		assert.equal(await readFile(path.join(repo.dir, "mutated.txt"), "utf8"), "changed\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write scope guard compares against a dirty baseline", async () => {
+	const fake = await fakeMutatingOpenCode('writeFileSync("base.txt", "worker\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	await writeFile(path.join(repo.dir, "base.txt"), "pre-existing\\n", "utf8");
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-dirty-change", "write", ["src/a.txt"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*base\.txt/);
+		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "worker\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write scope guard respects path boundaries and Japanese paths", async () => {
+	const boundaryFake = await fakeMutatingOpenCode('writeFileSync("src/a-b.txt", "changed\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	await mkdir(path.join(repo.dir, "src"), { recursive: true });
+	const manager = new OpenCodeTaskManager({ binary: boundaryFake.binary, binaryArgs: boundaryFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const boundary = manager.spawn(spec("direct-prefix-boundary", "write", ["src/a"]), repo.dir);
+		const [boundarySettled] = await manager.wait([boundary.id]);
+		assert.equal(boundarySettled.status, "error");
+		assert.match(boundarySettled.error ?? "", /out-of-scope path\(s\).*src\/a-b\.txt/);
+	} finally {
+		await manager.dispose();
+		await boundaryFake.cleanup();
+		await repo.cleanup();
+	}
+
+	const japaneseFake = await fakeMutatingOpenCode('writeFileSync("日本語/対象.txt", "変更\\n", "utf8");');
+	const japaneseRepo = await fakeGitRepo();
+	await mkdir(path.join(japaneseRepo.dir, "日本語"), { recursive: true });
+	const japaneseManager = new OpenCodeTaskManager({ binary: japaneseFake.binary, binaryArgs: japaneseFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const japanese = japaneseManager.spawn(spec("direct-japanese", "write", ["日本語/対象.txt"]), japaneseRepo.dir);
+		const [settled] = await japaneseManager.wait([japanese.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(await readFile(path.join(japaneseRepo.dir, "日本語", "対象.txt"), "utf8"), "変更\n");
+	} finally {
+		await japaneseManager.dispose();
+		await japaneseFake.cleanup();
+		await japaneseRepo.cleanup();
+	}
+});
+
 test("tester role spawn rejects outside a Git worktree", async () => {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-opencode-nongit-"));
 	try {
