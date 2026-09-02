@@ -2,9 +2,9 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ModelCapability, TaskMode, ToolProfile, WorkerRole } from "../types.ts";
+import type { ModelCapability, TaskMode, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
 import { buildAgentFrontmatter, enforceToolLimit, resolveToolProfile, toolsForProfile } from "../types.ts";
-import type { BackendPreparation, BackendSpawnInput, WorkerBackendAdapter } from "./backend.ts";
+import { activityFromEvent, type BackendDecodedLine, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 function opencodeAgentDir(): string {
 	// OpenCode resolves agents by name from ~/.config/opencode/agent/ on every platform.
@@ -144,5 +144,29 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 
 	cleanupAgent(agentName: string | undefined): void {
 		cleanupAgentDefinition(agentName);
+	}
+
+	// OpenCode output decoding: text streaming events (`type: "text"` with
+	// `part.text`) are the primary output path and are appended to the raw
+	// output; every structured event contributes an activity label. Raw
+	// non-JSON diagnostic lines are retained verbatim in the raw output only.
+	decodeStdoutLine(line: string, event: Record<string, unknown> | undefined): BackendDecodedLine {
+		if (!event) return { output: `${line}\n`, activity: [] };
+		const part = event.part && typeof event.part === "object"
+			? event.part as Record<string, unknown>
+			: undefined;
+		let output: string | undefined;
+		if (event.type === "text" && part && typeof part.text === "string") {
+			output = `${part.text}\n`;
+		}
+		return { output, activity: [activityFromEvent(event)] };
+	}
+
+	decodeStderrChunk(chunk: string): string {
+		return chunk;
+	}
+
+	normalizeExitReport(report: WorkerReport): WorkerReport {
+		return report;
 	}
 }

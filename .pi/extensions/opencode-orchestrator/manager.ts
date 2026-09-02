@@ -251,27 +251,6 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals) {
 	}
 }
 
-function activityFromEvent(event: Record<string, unknown>) {
-	const part = event.part && typeof event.part === "object"
-		? event.part as Record<string, unknown>
-		: undefined;
-	const type = typeof event.type === "string" ? event.type : "event";
-	if (!part) return type;
-	if (part.type === "tool") {
-		const tool = typeof part.tool === "string" ? part.tool : "tool";
-		const state = part.state && typeof part.state === "object"
-			? part.state as Record<string, unknown>
-			: undefined;
-		const status = state && typeof state.status === "string" ? state.status : "update";
-		return `${tool}: ${status}`;
-	}
-	if (part.type === "step-finish") {
-		return `step finished: ${typeof part.reason === "string" ? part.reason : "unknown"}`;
-	}
-	return `${type}: ${String(part.type ?? "unknown")}`;
-}
-
-
 function runGit(cwd: string, args: string[]): Buffer | undefined {
 	try {
 		return execFileSync("git", args, { cwd, encoding: "buffer", stdio: ["ignore", "pipe", "ignore"] });
@@ -772,7 +751,7 @@ export class OpenCodeTaskManager {
 
 		child.stdout?.on("data", (data: Buffer) => this.consumeStdout(entry, data.toString("utf8")));
 		child.stderr?.on("data", (data: Buffer) => {
-			const appended = boundedAppend(entry.snapshot.stderr, data.toString("utf8"));
+			const appended = boundedAppend(entry.snapshot.stderr, adapter.decodeStderrChunk(data.toString("utf8")));
 			entry.snapshot.stderr = appended.text;
 			entry.snapshot.truncated ||= appended.truncated;
 			this.notify();
@@ -786,7 +765,10 @@ export class OpenCodeTaskManager {
 			if (entry.buffer.trim()) this.consumeLine(entry, entry.buffer);
 			entry.buffer = "";
 			entry.snapshot.exitCode = code ?? 1;
-			entry.snapshot.report = parseWorkerReport(entry.snapshot.output);
+			// Exit-time report normalization: parse stays manager-owned; the
+			// backend adapter may normalize the backend-specific report shape
+			// before any manager-owned worktree path normalization runs.
+			entry.snapshot.report = adapter.normalizeExitReport(parseWorkerReport(entry.snapshot.output));
 			if (entry.worktree) {
 				// Map worktree-absolute paths in the structured report to
 				// repo-relative paths before the handoff consumes the report.
@@ -1293,53 +1275,28 @@ export class OpenCodeTaskManager {
 			const parsed: unknown = JSON.parse(line);
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) event = parsed as Record<string, unknown>;
 		} catch {
-			// OpenCode may emit a plain diagnostic line before JSON events.
+			// Workers may emit a plain diagnostic line before JSON events.
 		}
-		if (!event) {
-			const appended = boundedAppend(entry.snapshot.output, `${line}\n`);
-			entry.snapshot.output = appended.text;
-			entry.snapshot.truncated ||= appended.truncated;
-			if (entry.snapshot.backend === "pi") {
-				entry.snapshot.activity.push("Pi response streaming");
-				if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
-			}
-			return;
-		}
-		const part = event.part && typeof event.part === "object"
-			? event.part as Record<string, unknown>
-			: undefined;
-		// OpenCode text streaming remains the primary output path for OpenCode workers.
-		if (event.type === "text" && part && typeof part.text === "string") {
-			const appended = boundedAppend(entry.snapshot.output, `${part.text}\n`);
+		// Backend-specific stdout decoding (raw-line retention, output-text
+		// extraction, activity labels) lives in the backend adapter; the manager
+		// only applies the decoded result to bounded snapshot storage.
+		const adapter = this.backends[entry.snapshot.backend];
+		const decoded = adapter.decodeStdoutLine(line, event);
+		if (decoded.output !== undefined) {
+			const appended = boundedAppend(entry.snapshot.output, decoded.output);
 			entry.snapshot.output = appended.text;
 			entry.snapshot.truncated ||= appended.truncated;
 		}
-		// Pi JSON mode: append assistant text content at message_end (not message_update,
-		// to avoid double-counting streaming deltas). Usage is captured separately below.
-		if (event.type === "message_end") {
-			const message = event.message && typeof event.message === "object"
-				? event.message as Record<string, unknown>
-				: undefined;
-			const content = message?.content;
-			if (Array.isArray(content)) {
-				for (const item of content) {
-					if (item && typeof item === "object") {
-						const node = item as Record<string, unknown>;
-						if (node.type === "text" && typeof node.text === "string") {
-							const appended = boundedAppend(entry.snapshot.output, `${node.text}\n`);
-							entry.snapshot.output = appended.text;
-							entry.snapshot.truncated ||= appended.truncated;
-						}
-					}
-				}
+		for (const item of decoded.activity) {
+			entry.snapshot.activity.push(item);
+			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
+		}
+		if (event) {
+			const usage = extractUsageFromEvent(event);
+			if (usage) {
+				entry.snapshot.usage = mergeUsage(entry.snapshot.usage, usage);
 			}
 		}
-		const usage = extractUsageFromEvent(event);
-		if (usage) {
-			entry.snapshot.usage = mergeUsage(entry.snapshot.usage, usage);
-		}
-		entry.snapshot.activity.push(activityFromEvent(event));
-		if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
 	}
 
 	get(id: string) {

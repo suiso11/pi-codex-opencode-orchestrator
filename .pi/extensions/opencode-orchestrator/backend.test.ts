@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BackendSpawnInput } from "./backends/backend.ts";
+import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } from "./backends/backend.ts";
 import { buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
-import type { TaskSpec } from "./types.ts";
+import type { TaskSpec, WorkerReport } from "./types.ts";
 
 function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInput {
 	return {
@@ -145,4 +145,77 @@ test("piToolList preserves the exact per-role Pi tool allowlists", () => {
 	assert.equal(piToolList({ mode: "read_only", role: undefined }), "read,grep,find,ls");
 	assert.equal(piToolList({ mode: "write", role: undefined }), "read,grep,find,ls,bash,edit,write");
 	assert.equal(piToolList({ mode: "write", role: "implementer" }), "read,grep,find,ls,bash,edit,write");
+});
+
+// Output protocol contract: the manager only applies the decoded result of
+// these methods to bounded snapshot storage; each adapter must preserve its
+// backend's exact raw-output text and activity decoding.
+function openCodeAdapter() {
+	return new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+}
+
+test("activityFromEvent decodes tool, step-finish, and fallback labels", () => {
+	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "read", state: { status: "completed" } } }), "read: completed");
+	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "bash", state: {} } }), "bash: update");
+	assert.equal(activityFromEvent({ type: "e", part: { type: "step-finish", reason: "stop" } }), "step finished: stop");
+	assert.equal(activityFromEvent({ type: "message_end" }), "message_end");
+	assert.equal(activityFromEvent({ part: { type: "other" } }), "event: other");
+});
+
+test("OpenCodeBackendAdapter decodes text streaming events into output and activity", () => {
+	const adapter = openCodeAdapter();
+	const event = { type: "text", part: { type: "text", text: "hello" } };
+	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
+	assert.equal(decoded.output, "hello\n");
+	assert.deepEqual(decoded.activity, ["text: text"]);
+});
+
+test("OpenCodeBackendAdapter retains non-JSON stdout lines verbatim without activity", () => {
+	const adapter = openCodeAdapter();
+	const decoded = adapter.decodeStdoutLine("plain diagnostic line", undefined);
+	assert.equal(decoded.output, "plain diagnostic line\n");
+	assert.deepEqual(decoded.activity, []);
+});
+
+test("OpenCodeBackendAdapter emits activity only for structured non-text events", () => {
+	const adapter = openCodeAdapter();
+	const event = { type: "step_finish", part: { type: "step-finish", reason: "stop" } };
+	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
+	assert.equal(decoded.output, undefined);
+	assert.deepEqual(decoded.activity, ["step finished: stop"]);
+});
+
+test("PiBackendAdapter decodes message_end text content and labels other events", () => {
+	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
+	const event = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } };
+	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
+	assert.equal(decoded.output, "a\nb\n");
+	assert.deepEqual(decoded.activity, ["message_end"]);
+	const other = adapter.decodeStdoutLine("{}", { type: "message_update" });
+	assert.equal(other.output, undefined);
+	assert.deepEqual(other.activity, ["message_update"]);
+});
+
+test("PiBackendAdapter marks non-JSON stdout lines as Pi response streaming", () => {
+	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
+	const decoded = adapter.decodeStdoutLine("pi diagnostic line", undefined);
+	assert.equal(decoded.output, "pi diagnostic line\n");
+	assert.deepEqual(decoded.activity, ["Pi response streaming"]);
+});
+
+test("output protocol decodes stderr chunks unchanged and normalizes exit reports to identity", () => {
+	const adapters: WorkerBackendAdapter[] = [
+		openCodeAdapter(),
+		new PiBackendAdapter({ binary: "pi", binaryArgs: [] }),
+	];
+	const report: WorkerReport = { summary: "s", files: ["f"], findings: ["x"], unresolved: ["y"] };
+	for (const adapter of adapters) {
+		assert.equal(adapter.decodeStderrChunk("raw chunk\n"), "raw chunk\n");
+		assert.deepEqual(adapter.normalizeExitReport(report), report);
+	}
 });
