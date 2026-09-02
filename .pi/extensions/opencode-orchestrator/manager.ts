@@ -1,6 +1,18 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+	closeSync,
+	constants as fsConstants,
+	fstatSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	statSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,7 +105,7 @@ interface WorktreeRuntime {
 	baseHead: string;
 	scopes: string[];
 	batch: WorktreeBatch;
-	patchPath: string;
+	patchPath?: string;
 	patchBuffer?: Buffer;
 	changedPaths?: string[];
 	// Repo-relative paths that fell outside the declared scopes during
@@ -129,7 +141,7 @@ interface RetainedWorktree {
 	status: TaskSnapshot["status"];
 	error?: string;
 	createdAt: number;
-	patchPath: string;
+	patchPath?: string;
 	patchBuffer?: Buffer;
 	kind: WorktreeRetentionKind;
 	retryable: boolean;
@@ -270,9 +282,14 @@ function runGit(cwd: string, args: string[]): Buffer | undefined {
 
 // argv-based git runner that also returns captured stderr for diagnostics.
 // Always execFileSync with shell=false; no command concatenation.
-function runGitResult(cwd: string, args: string[]) {
+function runGitResult(cwd: string, args: string[], input?: Buffer) {
 	try {
-		const stdout = execFileSync("git", args, { cwd, encoding: "buffer", stdio: ["ignore", "pipe", "pipe"] });
+		const stdout = execFileSync("git", args, {
+			cwd,
+			encoding: "buffer",
+			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+			...(input === undefined ? {} : { input }),
+		});
 		return { ok: true as const, stdout, stderr: Buffer.alloc(0) };
 	} catch (error) {
 		const err = error as { stderr?: Buffer; stdout?: Buffer };
@@ -331,7 +348,7 @@ function jsonStringEscape(value: string): string {
 // JSON-escaped worker text (Windows doubled backslashes) are redacted too.
 function worktreeRedactionPaths(wt: WorktreeRuntime): string[] {
 	const candidates = new Set<string>();
-	const add = (value: string) => {
+	const add = (value: string | undefined) => {
 		if (!value) return;
 		candidates.add(value);
 		candidates.add(value.replaceAll(path.sep, path.posix.sep));
@@ -351,7 +368,7 @@ function worktreeRedactionPaths(wt: WorktreeRuntime): string[] {
 // to "\\"), so JSON-escaped absolute worktree paths inside worker output cannot
 // slip through; both spellings are replaced with the <worktree> marker without
 // corrupting any other text.
-function redactAbsolutePaths(text: string, paths: string[]): string {
+function redactAbsolutePaths(text: string, paths: (string | undefined)[]): string {
 	if (!text || paths.length === 0) return text;
 	const expanded = new Set<string>();
 	for (const value of paths) {
@@ -379,6 +396,44 @@ function requiredGit(cwd: string, args: string[]): Buffer | undefined {
 
 function isMissingFile(error: unknown): boolean {
 	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function validatePatchStats(stats: { isFile(): boolean; nlink: number }, phase: string) {
+	if (!stats.isFile() || stats.nlink !== 1) {
+		throw new Error(`Secure patch archive ${phase} validation failed; refusing to use the archive.`);
+	}
+}
+
+// Keep a diagnostic/retention archive without ever overwriting a path. The
+// archive is not trusted for integration: all git apply operations consume the
+// manager-owned buffer directly. O_EXCL plus descriptor validation prevents a
+// worker-created collision, symlink, or hardlink from becoming the archive.
+function createPatchArchive(baseDir: string, patch: Buffer): string {
+	const patchPath = path.join(baseDir, `patch-${randomBytes(24).toString("hex")}.patch`);
+	let fd: number | undefined;
+	try {
+		fd = openSync(patchPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+		validatePatchStats(fstatSync(fd), "creation");
+		let offset = 0;
+		while (offset < patch.length) {
+			const written = writeSync(fd, patch, offset, patch.length - offset);
+			if (written <= 0) throw new Error("Secure patch archive write made no progress; refusing to continue.");
+			offset += written;
+		}
+		validatePatchStats(fstatSync(fd), "post-write");
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		// Validate the name after closing too. This archive is only retained for
+		// cleanup/UI, but a substituted path must still fail closed.
+		validatePatchStats(lstatSync(patchPath), "path");
+		return patchPath;
+	} catch (error) {
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* preserve the original failure */ }
+		}
+		throw error;
+	}
 }
 
 export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
@@ -1023,7 +1078,6 @@ export class OpenCodeTaskManager {
 				baseHead: batch.baseHead,
 				scopes,
 				batch,
-				patchPath: path.join(baseDir, `${entry.snapshot.id}.patch`),
 			};
 			entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
 			batch.tasks.push(entry);
@@ -1086,6 +1140,13 @@ export class OpenCodeTaskManager {
 		if (!patch.ok) throw new Error("Failed to generate the isolated change patch.");
 		wt.patchBuffer = patch.stdout;
 		wt.changedPaths = changedPaths;
+		if (patch.stdout.length > 0) {
+			try {
+				wt.patchPath = createPatchArchive(worktreeRootDir(wt.repoRoot), patch.stdout);
+			} catch (error) {
+				throw new RetentionError("integration-conflict", `Failed to securely create the isolated patch archive: ${processError(error)}`);
+			}
+		}
 		this.throwIfCancelled(entry, "before entering the integration queue");
 		await this.enqueueIntegration(wt.batch, entry);
 	}
@@ -1144,14 +1205,20 @@ export class OpenCodeTaskManager {
 		}
 		const patch = wt.patchBuffer ?? Buffer.alloc(0);
 		if (patch.length > 0) {
-			writeFileSync(wt.patchPath, patch);
 			this.throwIfCancelled(entry, "before git apply --check");
-			const check = runGitResult(wt.repoRoot, ["apply", "--check", wt.patchPath]);
+			const check = runGitResult(wt.repoRoot, ["apply", "--check", "-"], patch);
 			if (!check.ok) {
 				throw new RetentionError("integration-conflict", `git apply --check rejected the isolated patch: ${check.stderr.toString("utf8").trim() || "patch does not apply cleanly"}`);
 			}
+			// --check executes a separate Git process, so re-capture immediately
+			// afterward and again require the batch baseline before applying.
+			const checkedFingerprint = captureGitFingerprint(wt.repoRoot);
+			if (!checkedFingerprint || checkedFingerprint.hash !== batch.expectedFingerprint.hash) {
+				batch.poisoned = true;
+				throw new RetentionError("integration-conflict", "External mutation detected between git apply --check and root integration; batch integration aborted.");
+			}
 			this.throwIfCancelled(entry, "before root git apply");
-			const apply = runGitResult(wt.repoRoot, ["apply", wt.patchPath]);
+			const apply = runGitResult(wt.repoRoot, ["apply", "-"], patch);
 			if (!apply.ok) {
 				throw new RetentionError("integration-conflict", `git apply failed: ${apply.stderr.toString("utf8").trim() || "apply error"}`);
 			}
@@ -1216,8 +1283,12 @@ export class OpenCodeTaskManager {
 	// A missing patch file (never written, e.g. an empty patch) is not an error.
 	// Returns an error message on unlink failure, or undefined on success; the
 	// already-applied root change is never undone regardless of the outcome.
-	private removePatchFile(patchPath: string): string | undefined {
+	private removePatchFile(patchPath?: string): string | undefined {
+		if (!patchPath) return undefined;
 		try {
+			// Never unlink a substituted archive path. lstat deliberately rejects
+			// symlinks, while nlink=1 rejects hardlink substitutions.
+			validatePatchStats(lstatSync(patchPath), "cleanup");
 			unlinkSync(patchPath);
 			return undefined;
 		} catch (error) {
@@ -1231,7 +1302,7 @@ export class OpenCodeTaskManager {
 	// short synchronous wait to ride out transient file locks left by git
 	// subprocesses before giving up. Returns an error message on persistent
 	// failure, or undefined on success.
-	private removePatchFileWithRetry(patchPath: string): string | undefined {
+	private removePatchFileWithRetry(patchPath?: string): string | undefined {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 6; attempt++) {
 			const error = this.removePatchFile(patchPath);
@@ -1242,40 +1313,6 @@ export class OpenCodeTaskManager {
 			}
 		}
 		return String(lastError);
-	}
-
-	// Validate and (re)create the parent directory of a temporary patch file
-	// before it is written by retry. The parent must be contained within a known
-	// WorktreeRuntime temp root (the repo-hash OS-temp directory that this
-	// manager created), decided with path.relative containment -- a caller
-	// supplied path is never accepted. On any failure a redacted, clear error is
-	// thrown so the retry cannot write to an unexpected or unavailable location.
-	private ensureRetryPatchParent(patchPath: string, repoRoot: string): void {
-		const parent = path.dirname(patchPath);
-		const root = worktreeRootDir(repoRoot);
-		const rel = path.relative(root, parent);
-		const inside = rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-		if (!inside) {
-			throw new Error(
-				"Retry aborted: the temporary patch location is not within the managed worktree temp root; refusing to write outside the internally-derived directory.",
-			);
-		}
-		try {
-			mkdirSync(parent, { recursive: true });
-		} catch (error) {
-			throw new Error(`Retry aborted: unable to create the temporary patch directory: ${processError(error)}`);
-		}
-		if (!this.isDirectoryAvailable(parent)) {
-			throw new Error("Retry aborted: the temporary patch directory is not writable; refusing to write the retry patch.");
-		}
-	}
-
-	private isDirectoryAvailable(dir: string): boolean {
-		try {
-			return statSync(dir).isDirectory();
-		} catch {
-			return false;
-		}
 	}
 
 	// Map absolute file paths under the task's worktree to repo-relative paths
@@ -1577,9 +1614,10 @@ export class OpenCodeTaskManager {
 
 	// User-driven retry of a retained integration failure. Only current-session
 	// retained entries whose patch was previously validated and whose root was
-	// not integrated are eligible. The fingerprint guard + `git apply --check` +
-	// apply are performed synchronously with no await between the final
-	// fingerprint capture and the apply, so the root cannot change under us.
+	// not integrated are eligible. The fingerprint guard + stdin-fed
+	// `git apply --check` + apply are performed synchronously with no await
+	// between the final fingerprint capture and the apply, so the root cannot
+	// change under us.
 	retryRetainedWorktree(taskId: string): RetainedWorktreeView {
 		if (this.disposed) throw new Error("OpenCode task manager is shut down.");
 		const retained = this.retainedWorktrees.get(taskId);
@@ -1605,9 +1643,10 @@ export class OpenCodeTaskManager {
 		if (!before) {
 			throw new Error("Unable to capture the repository root fingerprint before retry.");
 		}
-		this.ensureRetryPatchParent(retained.patchPath, retained.repoRoot);
-		writeFileSync(retained.patchPath, retained.patchBuffer);
-		const check = runGitResult(retained.repoRoot, ["apply", "--check", retained.patchPath]);
+		// The retained archive is intentionally never read or rewritten. It may
+		// have been changed by an external actor; the immutable manager buffer is
+		// the only input accepted by Git.
+		const check = runGitResult(retained.repoRoot, ["apply", "--check", "-"], retained.patchBuffer);
 		if (!check.ok) {
 			throw new Error(
 				`Retry rejected: the patch no longer applies; git apply --check reported: ${redactAbsolutePaths(check.stderr.toString("utf8").trim(), [retained.path, retained.patchPath]) || "patch does not apply cleanly"}`,
@@ -1617,7 +1656,7 @@ export class OpenCodeTaskManager {
 		if (!after || after.hash !== before.hash) {
 			throw new Error("Repository fingerprint changed between pre-check and apply; retry aborted without applying.");
 		}
-		const apply = runGitResult(retained.repoRoot, ["apply", retained.patchPath]);
+		const apply = runGitResult(retained.repoRoot, ["apply", "-"], retained.patchBuffer);
 		if (!apply.ok) {
 			throw new Error(
 				`Retry git apply failed: ${redactAbsolutePaths(apply.stderr.toString("utf8").trim(), [retained.path, retained.patchPath]) || "apply error"}`,

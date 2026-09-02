@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -943,6 +943,69 @@ test("retry of a retained integration failure applies synchronously and updates 
 		const { baseDir } = worktreeBaseDir(repo.dir);
 		assert.ok(!existsSync(path.join(baseDir, id)), "worktree removed after successful retry");
 		assert.ok(!existsSync(path.join(baseDir, `${id}.patch`)), "patch removed after successful retry");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("patch archives use randomized exclusive files and retry consumes the retained buffer", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	let id = "";
+	try {
+		id = await retainedIntegrationFailure(manager, repo.dir, "wt-buffer-retry");
+		const { baseDir } = worktreeBaseDir(repo.dir);
+		const archives = (await readdir(baseDir)).filter((name) => /^patch-[0-9a-f]{48}\.patch$/.test(name));
+		assert.equal(archives.length, 1, "a non-empty patch must have one randomized archive");
+		assert.notEqual(archives[0], `${id}.patch`, "the task id must not determine the archive name");
+		const archivePath = path.join(baseDir, archives[0]);
+		const archiveStats = await lstat(archivePath);
+		assert.equal(archiveStats.isFile(), true, "archive must be a regular file");
+		assert.equal(archiveStats.nlink, 1, "archive must not be hardlinked");
+		// An attacker changing the retained archive must not change the bytes
+		// used by retry; retry is required to consume the manager-held buffer.
+		await writeFile(archivePath, Buffer.from("not the validated patch\n"));
+		const result = manager.retryRetainedWorktree(id);
+		assert.equal(result.rootIntegrated, true);
+		assert.equal(await readFile(path.join(repo.dir, "src", "a.txt"), "utf8"), "A-from-worker\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("predictable patch collision and symlink substitution are never used or overwritten", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	let id = "";
+	try {
+		const started = manager.spawn(
+			{ ...spec("wt-patch-collision", "write", ["src/a.txt"], "WRITE_SRC_A SLOW"), worktree: true },
+			repo.dir,
+		);
+		id = started.id;
+		const { baseDir } = worktreeBaseDir(repo.dir);
+		const sentinel = path.join(baseDir, "archive-sentinel");
+		const predictable = path.join(baseDir, `${id}.patch`);
+		await writeFile(sentinel, "sentinel\n", "utf8");
+		let usedSymlink = true;
+		try {
+			await symlink(path.basename(sentinel), predictable, "file");
+		} catch {
+			// Some Windows configurations deny symlink creation; a hardlink still
+			// exercises the fail-closed existing-path collision.
+			usedSymlink = false;
+			await link(sentinel, predictable);
+		}
+		const [settled] = await manager.wait([id]);
+		assert.equal(settled.status, "done");
+		assert.equal(await readFile(sentinel, "utf8"), "sentinel\n", "existing collision target must remain unchanged");
+		assert.equal((await lstat(predictable)).isSymbolicLink(), usedSymlink);
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();
