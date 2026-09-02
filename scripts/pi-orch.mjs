@@ -26,15 +26,20 @@ const MODEL_SETTINGS = {
 		label: "Default OpenCode worker",
 		defaultValue: "opencode-go/glm-5.2",
 	},
-	glm: {
-		env: "PI_OPENCODE_PROFILE_GLM",
-		label: "GLM profile",
+	implementer: {
+		env: "PI_OPENCODE_PROFILE_IMPLEMENTER",
+		label: "Implementer profile",
 		defaultValue: "opencode-go/glm-5.2",
 	},
-	kimi: {
-		env: "PI_OPENCODE_PROFILE_KIMI_K3",
-		label: "Kimi review profile",
+	reviewer: {
+		env: "PI_OPENCODE_PROFILE_REVIEWER",
+		label: "Reviewer profile",
 		defaultValue: "opencode-go/kimi-k3",
+	},
+	tester: {
+		env: "PI_OPENCODE_PROFILE_TESTER",
+		label: "Tester profile",
+		defaultValue: "opencode-go/glm-5.2",
 	},
 };
 
@@ -76,8 +81,8 @@ function printModels(config) {
 	console.log(`\nThinking  parent ${parentThinking}  worker ${workerThinking}  (per-task: low|medium|high)`);
 	console.log(`  PI_CODEX_THINKING / PI_OPENCODE_THINKING override; use high for final risky approval.`);
 	console.log(`\nConfig: ${configPath}`);
-	console.log("Change: pi-orch model <parent|worker|glm|kimi> [pi|opencode] <provider/model>");
-	console.log("Reset:  pi-orch model reset [parent|worker|glm|kimi]");
+	console.log("Change: pi-orch model <parent|worker|implementer|reviewer|tester> [pi|opencode] <provider/model>");
+	console.log("Reset:  pi-orch model reset [parent|worker|implementer|reviewer|tester]");
 }
 
 function handleModelCommand(args) {
@@ -113,13 +118,14 @@ function handleModelCommand(args) {
 		if (backend === "pi") model = `pi::${model}`;
 	}
 	if (!MODEL_SETTINGS[target] || !model || /[\r\n\0]/.test(model)) {
-		console.error("Usage: pi-orch model <parent|worker|glm|kimi> [pi|opencode] <provider/model>");
+		console.error("Usage: pi-orch model <parent|worker|implementer|reviewer|tester> [pi|opencode] <provider/model>");
 		process.exitCode = 2;
 		return;
 	}
 	config[target] = model;
 	saveConfig(config);
 	console.log(`Saved ${target}: ${model}`);
+	console.log(`Running Pi sessions apply this change without restart.`);
 }
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
