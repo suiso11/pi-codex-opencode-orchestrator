@@ -105,6 +105,7 @@ CLIが未導入・失敗してもオーケストレーターは継続するfail-
 - OpenCode実装: `implementer` プロファイル（`opencode-go/glm-5.2`）
 - OpenCode別視点レビュー: `reviewer` プロファイル（`opencode-go/kimi-k3`、読み取り専用）
 - 検証: `tester` プロファイル（既定はworkerと同じ `opencode-go/glm-5.2`、読み取り専用・bashあり）
+- Executor MCP: `PI_ORCH_ENABLE_EXECUTOR=1` と明示的な `implementer` の `executor: true` が必要（OpenCodeのみ）
 - 最終レビュー: `codex exec -m gpt-5.6-sol --sandbox read-only`
 
 モデルは環境変数で上書きできる。
@@ -131,6 +132,8 @@ Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対
 ```
 
 `pi` backendはOpenCodeを完全に迂回し、Piで認証済みのClaude、Codexなどを直接workerとして起動する。`opencode` backendを選んだ経路だけがOpenCode CLIを使用する。
+
+Executor MCP gatewayは、`PI_ORCH_ENABLE_EXECUTOR=1` を設定し、タスクに `executor: true` と明示的な `role: "implementer"` を指定したOpenCode workerでのみ有効になる。`PI_EXECUTOR_BIN`（未指定時は `executor`）を使い、生成される `mcp.executor` のlocal commandは `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]` に固定される。既存設定のうち上書きするのは `mcp.executor` だけで、Pi/Collie・tester/reviewer・roleなし・無効時はspawn前にfail closedする。Executor停止時に別backendへfallbackせず、認証情報などのsecretをprompt/reportへ入れないこと。
 
 実験的なCollie backendは、タスクの `model` を `collie::provider/model` とし、`PI_ORCH_ENABLE_COLLIE=1` を明示した場合だけ利用できる。安全上、`mode: write`・`role: implementer`・`worktree: true` の組み合わせ以外は、workerやworktreeを開始する前に拒否される。実行ファイルは `PI_COLLIE_BIN`（未指定時は `collie`）。構造化promptを渡して `collie run ... --provider ... --model ... --cwd <管理対象worktree> --mode auto --json --stream-json` を起動する。stdoutの最終JSON（`answer`/`error`/`usage`）は共通report/usageへ正規化し、stderrのNDJSONはraw診断として保持しつつactivityへ要約する。Collieにtool allowlistがあるとは主張せず、既存のworktreeスコープ・統合ゲートを使う（worktreeはOSサンドボックスではない）。Collieのインストールはこのプロジェクトでは行わない。
 

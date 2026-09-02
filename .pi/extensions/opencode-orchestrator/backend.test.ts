@@ -4,6 +4,7 @@ import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } 
 import { buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
 import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
+import { executorGateError } from "./backends/opencode.ts";
 import type { TaskSpec, WorkerReport } from "./types.ts";
 
 function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInput {
@@ -100,6 +101,25 @@ test("OpenCodeBackendAdapter cleanupAgent tolerates missing and undefined agent 
 	});
 	assert.doesNotThrow(() => adapter.cleanupAgent(undefined));
 	assert.doesNotThrow(() => adapter.cleanupAgent("pi-orch-does-not-exist"));
+});
+
+test("Executor MCP config overrides only mcp.executor with fixed browser approval", () => {
+	const existing = JSON.stringify({ theme: "dark", mcp: { other: { type: "remote" }, executor: { type: "remote" } } });
+	const merged = JSON.parse(buildOpenCodeConfigContent("implementer", existing, true, { PI_EXECUTOR_BIN: "custom-executor" })!);
+	assert.equal(merged.theme, "dark");
+	assert.deepEqual(merged.mcp.other, { type: "remote" });
+	assert.deepEqual(merged.mcp.executor, {
+		type: "local",
+		command: ["custom-executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"],
+	});
+});
+
+test("Executor gate is opt-in and fail-closed for non-implementer routes", () => {
+	const input = { spec: { ...spawnInput().spec, executor: true, role: "implementer" as const }, model: "opencode-go/model" };
+	assert.match(executorGateError(input, {}) ?? "", /PI_ORCH_ENABLE_EXECUTOR/);
+	assert.match(executorGateError({ ...input, spec: { ...input.spec, role: undefined } }, { PI_ORCH_ENABLE_EXECUTOR: "1" }) ?? "", /explicit implementer/);
+	assert.match(executorGateError({ ...input, model: "pi::provider/model" }, { PI_ORCH_ENABLE_EXECUTOR: "1" }) ?? "", /OpenCode backend/);
+	assert.equal(executorGateError(input, { PI_ORCH_ENABLE_EXECUTOR: "1" }), undefined);
 });
 
 test("buildOpenCodeConfigContent keeps invalid inline JSON out of the merged config", () => {

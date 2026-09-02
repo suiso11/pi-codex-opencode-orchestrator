@@ -44,7 +44,7 @@ import {
 	type ToolProfile,
 } from "./types.ts";
 import type { BackendPreparation, WorkerBackendAdapter } from "./backends/backend.ts";
-import { OpenCodeBackendAdapter } from "./backends/opencode.ts";
+import { executorGateError, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter } from "./backends/pi.ts";
 import { CollieBackendAdapter, collieGateError, collieModelParts } from "./backends/collie.ts";
 
@@ -593,6 +593,13 @@ export class OpenCodeTaskManager {
 		return undefined;
 	}
 
+	private executorBlockReason(spec: InternalTaskSpec) {
+		if (spec.executor !== true) return undefined;
+		const selection = decodeWorkerModel(resolveModel(spec, this.defaultModel, this.modelProfiles, this.testerModel));
+		if (selection.backend !== "opencode") return "Executor MCP requires the OpenCode backend.";
+		return executorGateError({ spec, model: selection.model });
+	}
+
 	private spawnBlockReason(spec: InternalTaskSpec, cwd: string) {
 		if (this.disposed) return "OpenCode task manager is shut down.";
 		if (this.runningCount() >= MAX_RUNNING) return `OpenCode concurrency limit reached (${MAX_RUNNING}).`;
@@ -608,6 +615,8 @@ export class OpenCodeTaskManager {
 	}
 
 	spawn(spec: InternalTaskSpec, cwd: string) {
+		const executorReason = this.executorBlockReason(spec);
+		if (executorReason) throw new Error(executorReason);
 		const blockReason = this.spawnBlockReason(spec, cwd);
 		if (blockReason) throw new Error(blockReason);
 		if ((spec.role === "tester" || spec.role === "reviewer") && spec.mode !== "read_only") {
@@ -690,6 +699,8 @@ export class OpenCodeTaskManager {
 	}
 
 	async spawnWhenAvailable(spec: InternalTaskSpec, cwd: string, signal?: AbortSignal) {
+		const executorReason = this.executorBlockReason(spec);
+		if (executorReason) throw new Error(executorReason);
 		while (true) {
 			if (signal?.aborted) throw new Error("Operation was aborted.");
 			const reason = this.spawnBlockReason(spec, cwd);

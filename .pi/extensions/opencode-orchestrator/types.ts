@@ -147,6 +147,8 @@ export interface TaskSpec {
 	// detached git worktree and its changes are integrated via a per-repo
 	// ID-ordered queue. No absolute worktree path is ever exposed to prompts.
 	worktree?: boolean;
+	// Opt-in Executor MCP gateway. Valid only for the OpenCode implementer route.
+	executor?: boolean;
 }
 
 export interface InternalTaskSpec extends TaskSpec {

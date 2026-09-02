@@ -863,6 +863,46 @@ test("buildOpenCodeConfigContent is deterministic for invalid existing JSON", ()
 	assert.equal(buildOpenCodeConfigContent("implementer", invalid), invalid);
 });
 
+test("manager injects the Executor MCP gateway only for an opted-in OpenCode implementer", async () => {
+	const fake = await fakeEchoEnv();
+	const repo = await fakeGitRepo();
+	const originalEnabled = process.env.PI_ORCH_ENABLE_EXECUTOR;
+	const originalBin = process.env.PI_EXECUTOR_BIN;
+	process.env.PI_ORCH_ENABLE_EXECUTOR = "1";
+	process.env.PI_EXECUTOR_BIN = "executor-test";
+	try {
+		const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+		try {
+			const started = manager.spawn({ ...spec("executor", "write", ["src"]), role: "implementer", executor: true }, repo.dir);
+			const [settled] = await manager.wait([started.id]);
+			const config = JSON.parse(settled.output.trim());
+			assert.deepEqual(config.mcp.executor, { type: "local", command: ["executor-test", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"] });
+		} finally { await manager.dispose(); }
+	} finally {
+		if (originalEnabled === undefined) delete process.env.PI_ORCH_ENABLE_EXECUTOR; else process.env.PI_ORCH_ENABLE_EXECUTOR = originalEnabled;
+		if (originalBin === undefined) delete process.env.PI_EXECUTOR_BIN; else process.env.PI_EXECUTOR_BIN = originalBin;
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("manager rejects Executor routes before task or worktree creation", async () => {
+	const manager = new OpenCodeTaskManager({ binary: "must-not-launch" });
+	const original = process.env.PI_ORCH_ENABLE_EXECUTOR;
+	delete process.env.PI_ORCH_ENABLE_EXECUTOR;
+	try {
+		assert.throws(() => manager.spawn({ ...spec("executor-disabled", "write", ["src"]), executor: true, role: "implementer" }, process.cwd()), /Executor MCP is disabled/);
+		assert.equal(manager.list().length, 0);
+		process.env.PI_ORCH_ENABLE_EXECUTOR = "1";
+		assert.throws(() => manager.spawn({ ...spec("executor-no-role", "write", ["src"]), executor: true }, process.cwd()), /explicit implementer/);
+		assert.throws(() => manager.spawn({ ...spec("executor-pi", "write", ["src"]), executor: true, role: "implementer", model: "pi::provider/model" }, process.cwd()), /OpenCode backend/);
+		assert.equal(manager.list().length, 0);
+	} finally {
+		if (original === undefined) delete process.env.PI_ORCH_ENABLE_EXECUTOR; else process.env.PI_ORCH_ENABLE_EXECUTOR = original;
+		await manager.dispose();
+	}
+});
+
 test("manager injects forced role permission config into child OPENCODE_CONFIG_CONTENT", async () => {
 	const fake = await fakeEchoEnv();
 	const repo = await fakeGitRepo();

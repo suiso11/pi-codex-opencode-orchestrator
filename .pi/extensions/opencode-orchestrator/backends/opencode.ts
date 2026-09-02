@@ -35,6 +35,30 @@ interface RolePermissionOverride {
 	bash: "deny" | Record<string, "allow">;
 }
 
+const EXECUTOR_ENABLE_ENV = "PI_ORCH_ENABLE_EXECUTOR";
+const EXECUTOR_CONFIG_KEY = "executor";
+
+export function executorGateError(
+	input: Pick<BackendSpawnInput, "spec" | "model">,
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	if (input.spec.executor !== true) return undefined;
+	if (env[EXECUTOR_ENABLE_ENV] !== "1") {
+		return "Executor MCP is disabled; set PI_ORCH_ENABLE_EXECUTOR=1 to opt in.";
+	}
+	if (input.spec.role !== "implementer") {
+		return "Executor MCP requires the explicit implementer role.";
+	}
+	if (input.model.startsWith("pi::") || input.model.startsWith("collie::")) {
+		return "Executor MCP requires the OpenCode backend.";
+	}
+	return undefined;
+}
+
+function executorCommand(env: NodeJS.ProcessEnv): string[] {
+	return [env.PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"];
+}
+
 // Official permission semantics: edit covers edit/write/patch, and the last
 // matching bash rule wins. The forced bash override is therefore appended as the
 // last rule so it wins for any matching command. Bash immutability is never claimed.
@@ -54,9 +78,11 @@ function rolePermissionOverride(role: WorkerRole | undefined): RolePermissionOve
 export function buildOpenCodeConfigContent(
 	role: WorkerRole | undefined,
 	existingContent: string | undefined,
+	executor = false,
+	env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
 	const override = rolePermissionOverride(role);
-	if (!override) return existingContent;
+	if (!override && !executor) return existingContent;
 	let base: Record<string, unknown> = {};
 	if (existingContent) {
 		try {
@@ -68,23 +94,33 @@ export function buildOpenCodeConfigContent(
 			// Invalid existing inline config is ignored; the override still applies.
 		}
 	}
-	const permission = base.permission && typeof base.permission === "object" && !Array.isArray(base.permission)
-		? { ...(base.permission as Record<string, unknown>) }
-		: {};
-	permission.edit = override.edit;
-	if (override.bash === "deny") {
-		permission.bash = "deny";
-	} else {
-		const existingBash = permission.bash && typeof permission.bash === "object" && !Array.isArray(permission.bash)
-			? { ...(permission.bash as Record<string, unknown>) }
+	let permission: Record<string, unknown> | undefined;
+	if (override) {
+		permission = base.permission && typeof base.permission === "object" && !Array.isArray(base.permission)
+			? { ...(base.permission as Record<string, unknown>) }
 			: {};
-		// Remove any prior "*" rule and re-insert it last so the forced override
-		// is the final matching bash rule.
-		delete existingBash["*"];
-		existingBash["*"] = override.bash["*"];
-		permission.bash = existingBash;
+		permission.edit = override.edit;
+		if (override.bash === "deny") {
+			permission.bash = "deny";
+		} else {
+			const existingBash = permission.bash && typeof permission.bash === "object" && !Array.isArray(permission.bash)
+				? { ...(permission.bash as Record<string, unknown>) }
+				: {};
+			// Remove any prior "*" rule and re-insert it last so the forced override
+			// is the final matching bash rule.
+			delete existingBash["*"];
+			existingBash["*"] = override.bash["*"];
+			permission.bash = existingBash;
+		}
 	}
-	return JSON.stringify({ ...base, permission });
+	if (executor) {
+		const mcp = base.mcp && typeof base.mcp === "object" && !Array.isArray(base.mcp)
+			? { ...(base.mcp as Record<string, unknown>) }
+			: {};
+		mcp[EXECUTOR_CONFIG_KEY] = { type: "local", command: executorCommand(env) };
+		base.mcp = mcp;
+	}
+	return JSON.stringify({ ...base, ...(override ? { permission } : {}) });
 }
 
 // OpenCode worker child construction. The tool allowlist is owned by a
@@ -137,7 +173,12 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 	}
 
 	buildEnv(env: NodeJS.ProcessEnv, input: BackendSpawnInput): NodeJS.ProcessEnv {
-		const mergedConfig = buildOpenCodeConfigContent(input.spec.role, env.OPENCODE_CONFIG_CONTENT);
+		const mergedConfig = buildOpenCodeConfigContent(
+			input.spec.role,
+			env.OPENCODE_CONFIG_CONTENT,
+			input.spec.executor === true,
+			env,
+		);
 		if (mergedConfig === undefined || mergedConfig === env.OPENCODE_CONFIG_CONTENT) return env;
 		return { ...env, OPENCODE_CONFIG_CONTENT: mergedConfig };
 	}

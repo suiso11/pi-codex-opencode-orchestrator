@@ -22,6 +22,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - `/opencode-usage` reports actual parent and worker token usage plus workflow handoff duplication and latest pruning statistics, with no savings claim absent a baseline
 - Default worker model: `opencode-go/glm-5.2`
 - Explicit worker roles: `implementer`, `tester`, and `reviewer` with role-specific tool sets, model profiles, and safety behavior
+- Opt-in Executor MCP gateway for explicit OpenCode `implementer` tasks (`executor: true`) when `PI_ORCH_ENABLE_EXECUTOR=1`
 - Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides; the `reviewer` role always resolves to `high`
 - Interactive `/orch-model` command for persistent parent and worker model changes applied to running sessions without restarting the orchestrator
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
@@ -76,6 +77,7 @@ Other settings:
 
 - `PI_OPENCODE_BIN`: OpenCode executable, default `opencode`
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
+- `PI_ORCH_ENABLE_EXECUTOR=1`: opt in to the Executor MCP gateway; `PI_EXECUTOR_BIN` optionally selects its executable (default `executor`)
 - `PI_CODEX_THINKING`: parent thinking level, default `medium`; set `high` for final risky approval or complex planning
 - `PI_OPENCODE_THINKING`: default worker thinking level, default `medium`; each task accepts a per-task `thinking` of `low|medium|high`
 - `/opencode-status`: show the current worker configuration inside Pi
@@ -156,6 +158,10 @@ The skill uses progressive disclosure and adds no scripts, dependencies, or netw
 ## Worker backends and models
 
 Each worker route can use either the OpenCode backend or the Pi backend. The Pi backend launches a bounded, non-interactive Pi worker with the selected Pi provider/model and never starts OpenCode. Read-only Pi workers receive only read/search tools; write workers receive the editing toolset.
+
+### Opt-in Executor MCP gateway
+
+Set `PI_ORCH_ENABLE_EXECUTOR=1` and set `executor: true` on a task to add a local `mcp.executor` server to the generated OpenCode config. It is accepted only for the OpenCode backend with an explicit `role: "implementer"`; disabled, Pi/Collie, reviewer/tester, and no-role requests fail before spawning. The command is fixed to `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]`, and the generated entry overrides only `mcp.executor` while preserving unrelated config. Executor failures are terminal; there is no fallback backend. Keep authentication and other secrets out of task prompts and reports.
 
 ### Experimental Collie backend
 
