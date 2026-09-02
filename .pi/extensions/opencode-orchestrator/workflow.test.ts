@@ -373,8 +373,74 @@ if (prompt.includes("Objective: slow first task")) {
 	};
 }
 
+test("workflow start rejects an invalid read-only scope before spawning any child", async () => {
+	const fake = await fakeSpawnFailureOpenCode();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	try {
+		// The read_only task with a glob path is now rejected synchronously by
+		// validateWorkflowPhases, so no workflow is registered and the first
+		// (valid) task of the phase is never spawned.
+		assert.throws(
+			() =>
+				workflows.start("bad read-only scope", [
+					{
+						name: "mixed",
+						tasks: [
+							{
+								name: "slow-first",
+								mode: "read_only",
+								objective: "slow first task",
+								relevantPaths: ["src"],
+								constraints: [],
+								expectedOutput: "result",
+							},
+							{
+								name: "bad-second",
+								mode: "read_only",
+								objective: "bad second task",
+								relevantPaths: ["src/*.ts"],
+								constraints: [],
+								expectedOutput: "result",
+							},
+						],
+					},
+					{
+						name: "unreachable",
+						tasks: [{
+							name: "dummy",
+							mode: "read_only",
+							objective: "never runs",
+							relevantPaths: ["src"],
+							constraints: [],
+							expectedOutput: "result",
+						}],
+					},
+				], process.cwd()),
+			/not globs/,
+		);
+		assert.equal(workflows.list().length, 0, "no workflow snapshot may be registered on validation failure");
+		assert.equal(tasks.list().length, 0, "no child worker may be spawned on validation failure");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(tasks.list().length, 0, "no child worker may appear after the synchronous rejection");
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+	}
+});
+
 test("a mid-phase spawn failure cancels earlier phase tasks best-effort and never injects an orphan handoff", async () => {
 	const fake = await fakeSpawnFailureOpenCode();
+	// The failing task uses the tester role, which spawn() rejects outside a Git
+	// repository; validation passes because its concrete scope is valid. This
+	// keeps a genuine mid-phase spawn failure reachable after prevalidation.
+	const nonRepo = await mkdtemp(path.join(os.tmpdir(), "workflow-nongit-"));
+	await mkdir(path.join(nonRepo, "src"), { recursive: true });
 	const tasks = new OpenCodeTaskManager({
 		binary: fake.binary,
 		binaryArgs: fake.binaryArgs,
@@ -395,16 +461,13 @@ test("a mid-phase spawn failure cancels earlier phase tasks best-effort and neve
 						expectedOutput: "result",
 					},
 					{
-						// This spec passes phase validation (validation only calls
-						// normalizeScopes for write tasks) but fails synchronously in
-						// spawn() because a read_only task with a glob path cannot be
-						// normalized into concrete scopes.
 						name: "bad-second",
 						mode: "read_only",
 						objective: "bad second task",
-						relevantPaths: ["src/*.ts"],
+						relevantPaths: ["src"],
 						constraints: [],
 						expectedOutput: "result",
+						role: "tester",
 					},
 				],
 			},
@@ -420,11 +483,11 @@ test("a mid-phase spawn failure cancels earlier phase tasks best-effort and neve
 					expectedOutput: "result",
 				}],
 			},
-		], process.cwd());
+		], nonRepo);
 
 		const settled = await workflows.wait(started.id);
 		assert.equal(settled.status, "error", `expected error, got ${settled.status}: ${settled.error ?? ""}`);
-		assert.match(settled.error ?? "", /not globs/);
+		assert.match(settled.error ?? "", /Tester role requires a Git worktree/);
 		assert.ok(settled.settledAt !== undefined, "workflow must settle deterministically");
 
 		// The first task was spawned and its id remains inspectable on the workflow.
@@ -446,6 +509,7 @@ test("a mid-phase spawn failure cancels earlier phase tasks best-effort and neve
 		await workflows.dispose();
 		await tasks.dispose();
 		await fake.cleanup();
+		await rm(nonRepo, { recursive: true, force: true });
 	}
 });
 

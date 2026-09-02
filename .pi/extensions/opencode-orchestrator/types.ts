@@ -457,9 +457,15 @@ export function validateWorkflowPhases(cwd: string, phases: WorkflowPhaseSpec[])
 				throw new Error(`Worktree isolation (worktree=true) requires mode write; task "${task.name}" in phase "${phase.name}" is not a write task.`);
 			}
 		}
-		const writes = phase.tasks
-			.filter((task) => task.mode === "write")
-			.map((task) => ({ task, scopes: normalizeScopes(cwd, task.relevantPaths) }));
+		// Validate (side-effect free) the scopes of every task up front, including
+		// read_only tasks: spawn() normalizes relevantPaths for all modes, so an
+		// invalid read_only scope must fail validation here rather than after
+		// earlier workers of the phase have already been spawned.
+		const taskScopes = phase.tasks.map((task) => ({
+			task,
+			scopes: normalizeScopes(cwd, task.relevantPaths),
+		}));
+		const writes = taskScopes.filter(({ task }) => task.mode === "write");
 		for (let i = 0; i < writes.length; i++) {
 			for (let j = i + 1; j < writes.length; j++) {
 				const conflict = findScopeConflict(writes[i].scopes, writes[j].scopes);

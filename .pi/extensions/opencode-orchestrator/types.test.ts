@@ -194,6 +194,42 @@ test("workflow rejects overlapping write scopes in the same phase", () => {
 	]));
 });
 
+test("workflow validates scopes of read-only tasks too, before any phase starts", () => {
+	const readOnly = (name: string, relevantPaths: string[]) => ({
+		name,
+		mode: "read_only" as const,
+		objective: name,
+		relevantPaths,
+		constraints: [],
+		expectedOutput: "result",
+	});
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "research", tasks: [readOnly("good", ["src"])] },
+			{ name: "verify", tasks: [readOnly("bad-glob", ["src/*.ts"])] },
+		]),
+		/not globs/,
+	);
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "research", tasks: [readOnly("good", ["src"])] },
+			{ name: "verify", tasks: [readOnly("bad-escape", ["../secret"])] },
+		]),
+		/escapes/,
+	);
+	assert.throws(
+		() => validateWorkflowPhases(cwd, [
+			{ name: "research", tasks: [readOnly("bad-empty", ["  "])] },
+			{ name: "verify", tasks: [readOnly("good", ["src"])] },
+		]),
+		/empty paths/,
+	);
+	assert.doesNotThrow(() => validateWorkflowPhases(cwd, [
+		{ name: "research", tasks: [readOnly("a", ["src"]), readOnly("b", ["src/a.ts"])] },
+		{ name: "verify", tasks: [readOnly("c", ["tests"])] },
+	]));
+});
+
 test("buildWorkerPrompt requires a compact JSON report with structured fields", () => {
 	const base = {
 		name: "inspect",
