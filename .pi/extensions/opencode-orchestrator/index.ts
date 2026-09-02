@@ -228,18 +228,18 @@ function unionToolNames(...lists: (readonly string[])[]): string[] {
 }
 
 /**
- * Strict coordinator-only-parent allowlist: safe planning reads (read/grep/find/ls),
- * every core orchestration tool, and any already-active tool from the exact set of
- * orchestration tools this extension registers (optional opencode groups are never
- * auto-activated; they are preserved only when already active/activated). Unknown
- * `opencode_*` names from other extensions are never preserved. No unrelated tools
- * (bash, edit, write, subagent, apply_patch, patch, ...) survive.
+ * Strict coordinator-only-parent allowlist: safe planning reads (read/grep/find/ls)
+ * and every core orchestration tool are always active. Optional orchestration tools
+ * stay lazy (dynamic tool groups keep working): they are preserved only when
+ * already active in `current`, and only under their exact registered name.
+ * Unknown `opencode_*` names from other extensions are never preserved. No
+ * unrelated tools (bash, edit, write, subagent, apply_patch, patch, ...) survive.
  */
 export function coordinatorAllowlist(current: readonly string[]): string[] {
 	const set = new Set<string>(SAFE_READ_TOOLS);
-	for (const name of KNOWN_ORCHESTRATOR_TOOLS) set.add(name);
-	for (const name of current) {
-		if (name.startsWith("opencode_") && KNOWN_ORCHESTRATOR_TOOLS.includes(name)) set.add(name);
+	for (const name of CORE_ORCHESTRATOR_TOOLS) set.add(name);
+	for (const name of OPTIONAL_ORCHESTRATOR_TOOLS) {
+		if (current.includes(name)) set.add(name);
 	}
 	return [...set];
 }

@@ -419,7 +419,7 @@ test("boundParentText caps arbitrary normal tool content at 8000", () => {
 	assert.match(text, /Parent-facing output truncated/);
 });
 
-test("coordinator allowlist keeps safe reads and active opencode tools, drops unrelated tools", () => {
+test("coordinator allowlist keeps core tools always active and optional tools only when already active", () => {
 	const active = coordinatorAllowlist(["read", "subagent", "bash", "edit", "apply_patch", "patch", "opencode_output", "opencode_workflow"]);
 	for (const safe of ["read", "grep", "find", "ls"]) {
 		assert.ok(active.includes(safe), `missing safe read ${safe}`);
@@ -427,10 +427,16 @@ test("coordinator allowlist keeps safe reads and active opencode tools, drops un
 	for (const core of ["opencode_task", "opencode_spawn", "opencode_wait", "opencode_tools"]) {
 		assert.ok(active.includes(core), `missing core tool ${core}`);
 	}
+	// Optional tools already active in the current set are preserved.
 	assert.ok(active.includes("opencode_output"));
 	assert.ok(active.includes("opencode_workflow"));
 	for (const banned of ["subagent", "bash", "edit", "write", "apply_patch", "patch"]) {
 		assert.ok(!active.includes(banned), `${banned} must be dropped`);
+	}
+	// Optional tools not currently active are NOT auto-activated (lazy loading).
+	const lazy = coordinatorAllowlist(["read", "bash"]);
+	for (const optional of ["opencode_check", "opencode_output", "opencode_workflow", "opencode_verified_task"]) {
+		assert.ok(!lazy.includes(optional), `${optional} must not be auto-activated`);
 	}
 	assert.equal(isCoordinatorAllowedTool("read"), true);
 	assert.equal(isCoordinatorAllowedTool("opencode_spawn"), true);
