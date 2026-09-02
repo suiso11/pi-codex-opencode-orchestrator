@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ModelCapability, TaskMode, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
-import { buildAgentFrontmatter, enforceToolLimit, resolveToolProfile, toolsForProfile } from "../types.ts";
+import type { ModelCapability, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
+import { enforceToolLimit, resolveToolProfile, TOOL_PROFILES, toolsForProfile } from "../types.ts";
 import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 function opencodeAgentDir(): string {
@@ -11,8 +11,27 @@ function opencodeAgentDir(): string {
 	return path.join(os.homedir(), ".config", "opencode", "agent");
 }
 
-function writeAgentDefinition(taskId: string, profile: ToolProfile, mode: TaskMode): string {
-	const frontmatter = buildAgentFrontmatter(profile, mode);
+// The OpenCode tool universe is the "full" profile: every OpenCode tool. The
+// generated agent definition denies exactly the complement of the effective
+// (post-maxTools) allowlist, so activity display and enforced permissions match.
+export function agentFrontmatterFromTools(allowed: readonly string[]): string {
+	const allowedSet = new Set(allowed);
+	const denied = TOOL_PROFILES.full.filter((tool) => !allowedSet.has(tool));
+	const permBlock = denied.length > 0
+		? denied.map((tool) => `  ${tool}: deny`).join("\n")
+		: "  # all tools allowed";
+	return [
+		"---",
+		"description: Pi orchestrator bounded worker",
+		"mode: primary",
+		"permission:",
+		permBlock,
+		"---",
+	].join("\n");
+}
+
+function writeAgentDefinition(taskId: string, allowedTools: readonly string[]): string {
+	const frontmatter = agentFrontmatterFromTools(allowedTools);
 	const body = "You are a bounded worker delegated by a parent Pi orchestrator. Follow the repository's AGENTS.md. Do not read secrets or git-ignored runtime configuration. Stay within the declared scope and report missing scope instead of broadening the task.";
 	const dir = opencodeAgentDir();
 	mkdirSync(dir, { recursive: true });
@@ -125,8 +144,10 @@ export function buildOpenCodeConfigContent(
 
 // OpenCode worker child construction. The tool allowlist is owned by a
 // generated agent definition (so the parent controls the tool set instead of
-// inheriting ambient OpenCode config), and role workers get a forced official
-// permission override merged over any valid inline config.
+// inheriting ambient OpenCode config); the definition is built from the
+// effective tool set, i.e. the profile after maxTools reduction, so tools
+// trimmed by a model capability are actually denied. Role workers get a forced
+// official permission override merged over any valid inline config.
 export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 	readonly id = "opencode" as const;
 	readonly displayName = "OpenCode";
@@ -151,7 +172,7 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		const profile = resolveToolProfile(input.spec, this.defaultToolProfile);
 		const capability = this.modelCapabilities[input.model];
 		const tools = enforceToolLimit(toolsForProfile(profile, input.spec.mode), capability);
-		const agentName = writeAgentDefinition(input.taskId, profile, input.spec.mode);
+		const agentName = writeAgentDefinition(input.taskId, tools.tools);
 		const activity = [`agent profile: ${profile} (${tools.tools.join(",")})`];
 		if (tools.reduced && tools.reason) activity.push(`capability: ${tools.reason}`);
 		return { agentName, activity };

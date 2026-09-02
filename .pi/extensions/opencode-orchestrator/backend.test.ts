@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } from "./backends/backend.ts";
-import { buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
+import { agentFrontmatterFromTools, buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
 import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
 import { executorGateError } from "./backends/opencode.ts";
+import { TOOL_PROFILES } from "./types.ts";
 import type { TaskSpec, WorkerReport } from "./types.ts";
 
 function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInput {
@@ -101,6 +105,71 @@ test("OpenCodeBackendAdapter cleanupAgent tolerates missing and undefined agent 
 	});
 	assert.doesNotThrow(() => adapter.cleanupAgent(undefined));
 	assert.doesNotThrow(() => adapter.cleanupAgent("pi-orch-does-not-exist"));
+});
+
+function agentDefinitionText(agentName: string | undefined): string {
+	assert.ok(agentName, "prepare must return an agent name");
+	const file = path.join(os.homedir(), ".config", "opencode", "agent", `${agentName}.md`);
+	return readFileSync(file, "utf8");
+}
+
+test("agentFrontmatterFromTools denies exactly the complement of the allowed tools", () => {
+	const trimmed = agentFrontmatterFromTools(["read", "glob"]);
+	assert.match(trimmed, /\n {2}grep: deny/);
+	assert.match(trimmed, /\n {2}edit: deny/);
+	assert.match(trimmed, /\n {2}bash: deny/);
+	assert.match(trimmed, /\n {2}webfetch: deny/);
+	assert.doesNotMatch(trimmed, /\n {2}read: deny/);
+	assert.doesNotMatch(trimmed, /\n {2}glob: deny/);
+	const full = agentFrontmatterFromTools(TOOL_PROFILES.full);
+	assert.doesNotMatch(full, /: deny/);
+});
+
+test("prepare writes agent permissions from the post-maxTools tool set", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: { "opencode-go/limited": { maxTools: 2 } },
+	});
+	const preparation = adapter.prepare(spawnInput({ model: "opencode-go/limited" }));
+	try {
+		// Activity lists the effective (reduced) tool set, not the full profile.
+		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(read,glob\)/);
+		assert.ok(
+			preparation.activity.some((a) => a.startsWith("capability:")),
+			"the capability reduction must be recorded in activity",
+		);
+		// The agent definition actually denies the tools maxTools dropped.
+		const text = agentDefinitionText(preparation.agentName);
+		assert.match(text, /\n {2}grep: deny/);
+		assert.match(text, /\n {2}edit: deny/);
+		assert.match(text, /\n {2}bash: deny/);
+		assert.doesNotMatch(text, /\n {2}read: deny/);
+		assert.doesNotMatch(text, /\n {2}glob: deny/);
+	} finally {
+		adapter.cleanupAgent(preparation.agentName);
+	}
+});
+
+test("prepare keeps the profile allowlist when no model capability applies", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+	const preparation = adapter.prepare(spawnInput());
+	try {
+		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(read,glob,grep,edit,bash\)/);
+		const text = agentDefinitionText(preparation.agentName);
+		assert.match(text, /\n {2}webfetch: deny/);
+		assert.match(text, /\n {2}skill: deny/);
+		assert.doesNotMatch(text, /\n {2}bash: deny/);
+		assert.doesNotMatch(text, /\n {2}edit: deny/);
+	} finally {
+		adapter.cleanupAgent(preparation.agentName);
+	}
 });
 
 test("Executor MCP config overrides only mcp.executor with fixed browser approval", () => {
