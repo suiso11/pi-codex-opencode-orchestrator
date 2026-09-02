@@ -651,3 +651,157 @@ test("a later read-only phase starts only after the worktree-write phase settled
 		else await repo.cleanup();
 	}
 });
+
+// Fake worker for the requireResolved quality-gate tests. The implementer and
+// reviewer phases always succeed; the tester phase either reports done with a
+// non-empty unresolved array (gate blocked), done with an empty array (gate
+// passed), or exits nonzero (test failure -> worker status error).
+async function fakeGateOpenCode() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-gate-"));
+	const script = path.join(dir, "opencode.mjs");
+	await writeFile(
+		script,
+		`
+const prompt = process.argv.at(-1) || "";
+const emit = (text) => process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text } }) + "\\n");
+if (prompt.includes("GATE_IMPLEMENT")) {
+  emit(JSON.stringify({ summary: "implemented", files: [], findings: [], unresolved: [] }));
+  process.exit(0);
+}
+if (prompt.includes("GATE_UNRESOLVED_TEST")) {
+  emit(JSON.stringify({ summary: "tests ran", files: [], findings: ["SOME_FAILURE"], unresolved: ["GATE_BLOCKER"] }));
+  process.exit(0);
+}
+if (prompt.includes("GATE_CLEAN_TEST")) {
+  emit(JSON.stringify({ summary: "tests passed", files: [], findings: [], unresolved: [] }));
+  process.exit(0);
+}
+if (prompt.includes("GATE_FAILING_TEST")) {
+  process.exit(2);
+}
+if (prompt.includes("GATE_REVIEW")) {
+  emit(JSON.stringify({ summary: "review ok", files: [], findings: [], unresolved: [] }));
+  process.exit(0);
+}
+emit(JSON.stringify({ summary: "unexpected", files: [], findings: [], unresolved: [] }));
+process.exit(1);
+`,
+		"utf8",
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+function gatePhases(testObjective: string): WorkflowPhaseSpec[] {
+	return [
+		{
+			name: "implement",
+			tasks: [{
+				name: "implementer",
+				mode: "write",
+				objective: "GATE_IMPLEMENT",
+				relevantPaths: ["src"],
+				constraints: [],
+				expectedOutput: "result",
+			}],
+		},
+		{
+			name: "test",
+			requireResolved: true,
+			tasks: [{
+				name: "tester",
+				mode: "read_only",
+				role: "tester",
+				objective: testObjective,
+				relevantPaths: ["src"],
+				constraints: [],
+				expectedOutput: "result",
+			}],
+		},
+		{
+			name: "review",
+			requireResolved: true,
+			tasks: [{
+				name: "reviewer",
+				mode: "read_only",
+				role: "reviewer",
+				objective: "GATE_REVIEW",
+				relevantPaths: ["src"],
+				constraints: [],
+				expectedOutput: "result",
+			}],
+		},
+	];
+}
+
+test("requireResolved gate: done worker with non-empty unresolved fails the workflow and never reaches the next phase", async () => {
+	const fake = await fakeGateOpenCode();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	try {
+		const started = workflows.start("gate blocked", gatePhases("GATE_UNRESOLVED_TEST"), process.cwd());
+		const settled = await workflows.wait(started.id);
+		assert.equal(settled.status, "error", `expected error, got ${settled.status}: ${settled.error ?? ""}`);
+		assert.match(settled.error ?? "", /requireResolved/);
+		assert.match(settled.error ?? "", /GATE_BLOCKER/);
+		assert.equal(settled.taskIds.length, 2, "reviewer phase must never start after a gate failure");
+		const tester = tasks.get(settled.taskIds[1]);
+		assert.equal(tester?.status, "done", "gate worker settled as done yet still failed the phase");
+		assert.ok((tester?.report?.unresolved ?? []).includes("GATE_BLOCKER"));
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("requireResolved gate: a passing tester and reviewer let the workflow complete with all three phases", async () => {
+	const fake = await fakeGateOpenCode();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	try {
+		const started = workflows.start("gate passed", gatePhases("GATE_CLEAN_TEST"), process.cwd());
+		const settled = await workflows.wait(started.id);
+		assert.equal(settled.status, "done", `expected done, got ${settled.status}: ${settled.error ?? ""}`);
+		assert.equal(settled.taskIds.length, 3);
+		for (const id of settled.taskIds) assert.equal(tasks.get(id)?.status, "done");
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+	}
+});
+
+test("requireResolved gate: a test-failure worker error stops the workflow through the existing failure path", async () => {
+	const fake = await fakeGateOpenCode();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	try {
+		const started = workflows.start("test failed", gatePhases("GATE_FAILING_TEST"), process.cwd());
+		const settled = await workflows.wait(started.id);
+		assert.equal(settled.status, "error", `expected error, got ${settled.status}: ${settled.error ?? ""}`);
+		assert.match(settled.error ?? "", /Phase "test" failed/);
+		assert.match(settled.error ?? "", /=error/);
+		assert.equal(settled.taskIds.length, 2, "reviewer phase must never start after a failed tester");
+		assert.equal(tasks.get(settled.taskIds[1])?.status, "error");
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+	}
+});

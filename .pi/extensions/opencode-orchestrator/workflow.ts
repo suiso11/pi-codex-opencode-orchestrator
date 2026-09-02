@@ -5,6 +5,7 @@ import type {
 	WorkflowPhaseSpec,
 	WorkflowSnapshot,
 } from "./types.ts";
+import { collectUnresolvedIssues } from "./verified-workflow.ts";
 import { taskResultsText, validateWorkflowPhases } from "./types.ts";
 
 interface ManagedWorkflow {
@@ -123,6 +124,20 @@ export class OpenCodeWorkflowManager {
 					throw new Error(
 						`Phase "${phase.name}" failed: ${failed.map((task) => `${task.id}=${task.status}`).join(", ")}`,
 					);
+				}
+				// Internal quality gate: a worker can settle with status=done while its
+				// report still lists unresolved issues. Such a phase must not advance:
+				// the workflow errors and the next phase (and any downstream approval)
+				// never starts. No automatic retry is performed.
+				if (phase.requireResolved) {
+					const gated = collectUnresolvedIssues(results);
+					if (gated.length > 0) {
+						throw new Error(
+							`Quality gate "requireResolved" failed in phase "${phase.name}": ${gated
+								.map((task) => `${task.taskId} "${task.taskName}" unresolved: ${task.unresolved.slice(0, 3).join("; ")}`)
+								.join(" | ")}. The next phase did not start and no approval was granted.`,
+						);
+					}
 				}
 				priorPhaseContext = buildPhaseHandoff(results);
 				const downstreamPhase = entry.snapshot.phases[phaseIndex + 1];

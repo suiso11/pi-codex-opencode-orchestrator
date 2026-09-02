@@ -184,6 +184,10 @@ export interface TaskSnapshot {
 export interface WorkflowPhaseSpec {
 	name: string;
 	tasks: TaskSpec[];
+	// Internal quality gate: when true, a phase whose tasks all finish with
+	// status=done still fails the workflow if any task report carries a
+	// non-empty unresolved array. Nothing is retried and no approval is granted.
+	requireResolved?: boolean;
 }
 
 export interface WorkflowSnapshot {

@@ -21,6 +21,7 @@ import type {
 } from "./types.ts";
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
+import { buildVerifiedPhases, REQUIRE_RESOLVED_GATE } from "./verified-workflow.ts";
 import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard, sumWorkerUsage, type DashboardUsage } from "./dashboard.ts";
 import { HerdrStatusReporter, resolveHerdrEnv } from "./herdr.ts";
 import { ModelConfigSync, registerModelCommand } from "./model-command.ts";
@@ -94,6 +95,30 @@ const WorkflowSchema = Type.Object({
 	})),
 });
 
+const VerifiedTaskSchema = Type.Object({
+	name: Type.String({ description: "Short unique task label.", minLength: 1, maxLength: 160 }),
+	objective: Type.String({ description: "One concrete, independently verifiable objective for the implementer phase.", minLength: 1 }),
+	relevant_paths: Type.Array(Type.String(), {
+		description: "Concrete repository-relative files/directories shared by all three phases. Globs and paths outside cwd are rejected.",
+		minItems: 1,
+		maxItems: 32,
+	}),
+	constraints: Type.Optional(Type.Array(Type.String(), {
+		description: "Task-specific constraints applied to every phase.",
+		maxItems: 32,
+	})),
+	expected_output: Type.String({ description: "Evidence/result the implementer must produce and the tester/reviewer verify.", minLength: 1 }),
+	worktree: Type.Optional(Type.Boolean({
+		description: "Opt-in write isolation for the implementer phase only: the write worker runs in a detached git worktree and changes integrate before the gated read-only phases start.",
+	})),
+	implementer_model: Type.Optional(Type.String({ description: "Optional model override for the implementer (write) phase." })),
+	tester_model: Type.Optional(Type.String({ description: "Optional model override for the tester (read_only, gated) phase." })),
+	reviewer_model: Type.Optional(Type.String({ description: "Optional model override for the reviewer (read_only, gated) phase." })),
+	background: Type.Optional(Type.Boolean({
+		description: "Return immediately and deliver a follow-up when complete. Defaults to true.",
+	})),
+});
+
 export interface RawTask {
 	name: string;
 	mode: TaskMode;
@@ -150,6 +175,7 @@ const OPTIONAL_ORCHESTRATOR_TOOLS = [
 	"opencode_workflow_check",
 	"opencode_workflow_cancel",
 	"opencode_workflow_list",
+	"opencode_verified_task",
 	"opencode_worktree_list",
 	"opencode_worktree_status",
 ] as const;
@@ -174,6 +200,7 @@ const TOOL_GROUPS: Record<ToolGroupName, readonly string[]> = {
 		"opencode_workflow_check",
 		"opencode_workflow_cancel",
 		"opencode_workflow_list",
+		"opencode_verified_task",
 	],
 	all: [...CORE_ORCHESTRATOR_TOOLS, ...OPTIONAL_ORCHESTRATOR_TOOLS],
 };
@@ -897,6 +924,55 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "opencode_verified_task",
+		label: "Run Verified Task Workflow",
+		description:
+			"Run one objective through a standard three-phase verification loop: implementer (write) -> tester (read_only) -> reviewer (read_only). The tester and reviewer phases carry the internal requireResolved quality gate: even when a gate worker finishes with status=done, a non-empty report.unresolved fails the workflow (status=error) and the next phase never starts. A tester/reviewer worker error stops the workflow through the existing failure path. There is no automatic retry and no infinite loop. Final approval always stays with the parent: a done workflow is verification evidence only, never an approval.",
+		promptSnippet: "Run one objective through the gated implement-test-review verification workflow",
+		promptGuidelines: [
+			"Use opencode_verified_task when one objective should be implemented, tested, and reviewed before you inspect the result yourself.",
+			"The requireResolved gate blocks progression when the tester or reviewer reports unresolved issues; address them by calling the tool again with a refined objective — nothing is retried automatically.",
+			"Final approval is never delegated: a completed workflow is evidence, and you as the parent must still inspect the diff and decide.",
+		],
+		parameters: VerifiedTaskSchema,
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const phases = buildVerifiedPhases({
+				name: params.name,
+				objective: params.objective,
+				relevantPaths: params.relevant_paths,
+				constraints: params.constraints,
+				expectedOutput: params.expected_output,
+				worktree: params.worktree,
+				implementerModel: params.implementer_model,
+				testerModel: params.tester_model,
+				reviewerModel: params.reviewer_model,
+			});
+			const workflow = workflows.start(`verified: ${params.name}`, phases, ctx.cwd);
+			if (params.background ?? true) {
+				return {
+					content: [{
+						type: "text",
+						text: `Started verified workflow ${workflow.id} "${workflow.name}" (implement -> test -> review, requireResolved gate on test/review). Final approval stays with the parent.`,
+					}],
+					details: { id: workflow.id, status: workflow.status, gate: REQUIRE_RESOLVED_GATE, background: true },
+				};
+			}
+			onUpdate?.({
+				content: [{ type: "text", text: `Running verified workflow ${workflow.id}...` }],
+				details: { id: workflow.id, status: workflow.status, gate: REQUIRE_RESOLVED_GATE, background: false },
+			});
+			const result = await workflows.wait(workflow.id, signal, true);
+			return {
+				content: [{
+					type: "text",
+					text: `${workflows.resultText(result)}\nFinal approval stays with the parent; a done workflow is verification evidence only.`,
+				}],
+				details: { id: result.id, status: result.status, gate: REQUIRE_RESOLVED_GATE, background: false },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "opencode_worktree_list",
 		label: "List Retained Worktrees",
 		description: "List retained (never auto-deleted) worktree isolation entries that failed integration or cleanup and await a decision. Read-only: no mutation or absolute path is exposed.",
@@ -928,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
 		name: "opencode_tools",
 		label: "OpenCode Tool Groups",
 		description:
-			"Activate a group of optional OpenCode orchestration tools additively for this session. Core tools (opencode_task, opencode_spawn, opencode_wait, opencode_tools) are always active. Groups: inspection (opencode_check, opencode_output, opencode_list, opencode_workflow_check, opencode_workflow_list, opencode_worktree_list, opencode_worktree_status), control (opencode_cancel, opencode_workflow_cancel), workflows (opencode_workflow, opencode_workflow_wait, opencode_workflow_check, opencode_workflow_cancel, opencode_workflow_list), all (every OpenCode tool). Activation is additive and persists for the session; call opencode_output on demand after enabling inspection/all to fetch a retained raw output slice.",
+			"Activate a group of optional OpenCode orchestration tools additively for this session. Core tools (opencode_task, opencode_spawn, opencode_wait, opencode_tools) are always active. Groups: inspection (opencode_check, opencode_output, opencode_list, opencode_workflow_check, opencode_workflow_list, opencode_worktree_list, opencode_worktree_status), control (opencode_cancel, opencode_workflow_cancel), workflows (opencode_workflow, opencode_workflow_wait, opencode_workflow_check, opencode_workflow_cancel, opencode_workflow_list, opencode_verified_task), all (every OpenCode tool). Activation is additive and persists for the session; call opencode_output on demand after enabling inspection/all to fetch a retained raw output slice.",
 		promptSnippet: "Activate a group of optional OpenCode orchestration tools for this session",
 		parameters: Type.Object({ group: ToolGroupSchema }),
 		async execute(_toolCallId, params) {

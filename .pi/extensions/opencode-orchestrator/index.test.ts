@@ -557,6 +557,60 @@ test("tool groups activate additively without dropping unrelated tools", () => {
 	assert.equal(new Set(activation.active).size, activation.active.length);
 });
 
+// --- Verified workflow (opencode_verified_task) ---
+
+function verifiedPayload(overrides: Record<string, unknown> = {}) {
+	return {
+		name: "verified-change",
+		objective: "Implement the change",
+		relevant_paths: ["src"],
+		expected_output: "Report the changed file and summary",
+		...overrides,
+	};
+}
+
+test("opencode_verified_task is registered in the workflows dynamic tool group", () => {
+	const { tools } = activateExtension();
+	const schema = tools.get("opencode_verified_task")?.parameters;
+	assert.ok(schema, "opencode_verified_task not registered");
+	const workflowsActivation = activateToolGroup(["opencode_tools"], "workflows");
+	assert.ok(workflowsActivation.loaded.includes("opencode_verified_task"));
+	const allActivation = activateToolGroup([], "all");
+	assert.ok(allActivation.active.includes("opencode_verified_task"));
+});
+
+test("opencode_verified_task schema accepts the full verified workflow payload and rejects invalid input", () => {
+	const { tools } = activateExtension();
+	const schema = tools.get("opencode_verified_task")?.parameters;
+	assert.ok(schema, "opencode_verified_task not registered");
+	assert.equal(Value.Check(schema, verifiedPayload()), true, "rejected minimal payload");
+	assert.equal(
+		Value.Check(schema, verifiedPayload({
+			constraints: ["Do not touch README"],
+			worktree: true,
+			implementer_model: "provider/impl",
+			tester_model: "provider/test",
+			reviewer_model: "provider/review",
+			background: false,
+		})),
+		true,
+		"rejected full payload",
+	);
+	assert.equal(Value.Check(schema, verifiedPayload({ worktree: "yes" })), false, "accepted string worktree");
+	assert.equal(Value.Check(schema, verifiedPayload({ relevant_paths: [] })), false, "accepted empty relevant_paths");
+	assert.equal(Value.Check(schema, verifiedPayload({ name: "" })), false, "accepted empty name");
+});
+
+test("opencode_verified_task documents the requireResolved gate and parent-only final approval", () => {
+	const { tools } = activateExtension();
+	const tool = tools.get("opencode_verified_task");
+	assert.ok(tool, "opencode_verified_task not registered");
+	const description = String((tool as { description?: string }).description ?? "");
+	assert.match(description, /requireResolved/);
+	assert.match(description, /Final approval always stays with the parent/);
+	assert.match(description, /no automatic retry/i);
+});
+
 // --- Worktree cleanup command & inspection tools ---
 
 function retainedView(overrides: Partial<RetainedWorktreeView> = {}): RetainedWorktreeView {

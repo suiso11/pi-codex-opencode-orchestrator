@@ -250,6 +250,7 @@ Explicit roles:
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
 - `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship. Non-worktree write workers are checked after completion by comparing Git content fingerprints from before and after the run; only paths changed during that run are scope-checked, so pre-existing dirty changes are preserved.
 - `opencode_workflow`: requires at least two sequential phases. Tasks inside one phase fan out under the same global four-worker cap.
+- `opencode_verified_task`: one-objective standard verification loop (see below) inside the `workflows` tool group.
 
 Path enforcement is a scheduler, prompt-level, and (for direct writes) post-run guard, not an operating-system sandbox. The post-run guard reports out-of-scope changes as errors and never reverts files; bash can still mutate during execution or outside the repository, and ignored side effects are not prevented. The parent Codex agent must still inspect the final diff and run relevant tests.
 
@@ -349,6 +350,28 @@ Worktree writes integrate through the root, so workflows constrain them tightly:
 - Only read-only phases may precede the worktree-write phase.
 - Read/test/review and direct-write phases may follow it; the worktree phase must fully settle and integrate before a later phase starts.
 
+### Standard verification loop (opencode_verified_task)
+
+`opencode_verified_task` runs one objective through a fixed three-phase workflow generated from a single input (`name`, `objective`, `relevant_paths`, optional `constraints`, `expected_output`, optional `worktree`, and optional `implementer_model`/`tester_model`/`reviewer_model` overrides):
+
+1. `implement` — one write task with the `implementer` role (the only phase allowed to edit; `worktree: true` applies here and satisfies the worktree-write phase restrictions because the later phases are read-only).
+2. `test` — one read-only task with the `tester` role that runs the relevant tests/verification commands.
+3. `review` — one read-only task with the `reviewer` role that independently reviews the change.
+
+The `test` and `review` phases carry the internal `requireResolved` quality gate: even when a gate worker settles with `status=done`, a non-empty `report.unresolved` array fails the workflow (`status=error`), and the next phase never starts. A tester/reviewer worker that ends in `status=error` (for example a failing test run) stops the workflow through the existing phase-failure path. There is no automatic retry and no loop: re-run the tool with a refined objective if the gate blocked progression.
+
+Final approval always stays with the parent. A completed verified workflow is verification evidence only — the parent must still inspect the diff and decide. No delegated worker ever grants final approval.
+
+```json
+opencode_verified_task({
+  "name": "verified-edit",
+  "objective": "Implement the requested change only inside src/a.ts.",
+  "relevant_paths": ["src/a.ts", "tests/a.test.ts"],
+  "expected_output": "Report the changed file and a short summary.",
+  "worktree": true
+})
+```
+
 ### Failure and retention
 
 - A worktree task that fails, is cancelled, times out, moves its own HEAD (commits inside the worktree), changes out-of-scope paths, contains submodule/gitlink changes, or whose patch is rejected is never integrated and never auto-reverted. Its worktree and patch are retained, with the error, in a current-session-only registry for manual cleanup.
@@ -409,7 +432,7 @@ Pruning is non-destructive: the session JSONL and the manager's retained raw out
 
 ### Dynamic tool groups
 
-The core orchestration tools `opencode_task`, `opencode_spawn`, `opencode_wait`, and `opencode_tools` (plus unrelated tools owned by Pi and other extensions) are always active. Optional tools — `opencode_check`, `opencode_cancel`, `opencode_list`, `opencode_output`, and the `opencode_workflow*` family — start inactive to keep the system prompt lean and prompt caching stable, and are loaded on demand:
+The core orchestration tools `opencode_task`, `opencode_spawn`, `opencode_wait`, and `opencode_tools` (plus unrelated tools owned by Pi and other extensions) are always active. Optional tools — `opencode_check`, `opencode_cancel`, `opencode_list`, `opencode_output`, the `opencode_workflow*` family, and `opencode_verified_task` — start inactive to keep the system prompt lean and prompt caching stable, and are loaded on demand:
 
 ```text
 opencode_tools group=inspection
