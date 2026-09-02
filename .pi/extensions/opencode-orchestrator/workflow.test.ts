@@ -8,6 +8,9 @@ import test from "node:test";
 import { OpenCodeTaskManager } from "./manager.ts";
 import { configuredModelProfiles, type TaskSnapshot, type WorkflowPhaseSpec, type WorkflowSnapshot } from "./types.ts";
 import { buildPhaseHandoff, formatWorkflowResultText, OpenCodeWorkflowManager } from "./workflow.ts";
+import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
+
+clearAmbientModelConfigEnv();
 
 async function fakeOpenCode() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-workflow-"));

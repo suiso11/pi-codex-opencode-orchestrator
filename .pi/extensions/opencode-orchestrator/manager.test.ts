@@ -6,6 +6,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { buildOpenCodeConfigContent, OpenCodeTaskManager } from "./manager.ts";
+import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
+
+clearAmbientModelConfigEnv();
 
 async function fakeOpenCode() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-"));
