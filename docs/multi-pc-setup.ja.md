@@ -118,6 +118,8 @@ PI_OPENCODE_PROFILE_REVIEWER=opencode-go/kimi-k3
 PI_OPENCODE_PROFILE_TESTER=opencode-go/glm-5.2
 PI_CODEX_THINKING=medium
 PI_OPENCODE_THINKING=medium
+# worker子プロセスへ追加で渡す環境変数名（任意、カンマ/空白区切り）
+PI_ORCH_WORKER_ENV_ALLOWLIST=
 ```
 
 親・workerともに思考レベルの既定は `medium`。タスクごとに `low|medium|high` を指定できる。`reviewer` ロールは常に `high` に解決される。最終承認などリスクの高い判断では `high` を選ぶこと。`medium` は常に十分という意味ではない。
@@ -133,7 +135,7 @@ Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対
 
 `pi` backendはOpenCodeを完全に迂回し、Piで認証済みのClaude、Codexなどを直接workerとして起動する。`opencode` backendを選んだ経路だけがOpenCode CLIを使用する。
 
-Executor MCP gatewayは、`PI_ORCH_ENABLE_EXECUTOR=1` を設定し、タスクに `executor: true` と明示的な `role: "implementer"` を指定したOpenCode workerでのみ有効になる。`PI_EXECUTOR_BIN`（未指定時は `executor`）を使い、生成される `mcp.executor` のlocal commandは `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]` に固定される。既存設定のうち上書きするのは `mcp.executor` だけで、Pi/Collie・tester/reviewer・roleなし・無効時はspawn前にfail closedする。Executor停止時に別backendへfallbackせず、認証情報などのsecretをprompt/reportへ入れないこと。
+Executor MCP gatewayは、`PI_ORCH_ENABLE_EXECUTOR=1` を設定し、タスクに `executor: true` と明示的な `role: "implementer"` を指定したOpenCode workerでのみ有効になる。`PI_EXECUTOR_BIN`（未指定時は `executor`）を使い、生成される `mcp.executor` のlocal commandは `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]` に固定される。既存設定のうち上書きするのは `mcp.executor` だけで、Pi/Collie・tester/reviewer・roleなし・無効時はspawn前にfail closedする。Executor停止時に別backendへfallbackせず、認証情報などのsecretをprompt/reportへ入れないこと。worker子プロセスは親の環境変数を全継承せず、PATH・ホーム/一時ディレクトリ・locale・CI・OPENCODE_CONFIG_CONTENTなどのruntime変数だけを受け取る。providerの環境変数は保存済みCLI authを基本とし、必要なキーだけ`PI_ORCH_WORKER_ENV_ALLOWLIST`へ明示する。環境変数の値や名前をworker reportへ出力しないこと。
 
 実験的なCollie backendは、タスクの `model` を `collie::provider/model` とし、`PI_ORCH_ENABLE_COLLIE=1` を明示した場合だけ利用できる。安全上、`mode: write`・`role: implementer`・`worktree: true` の組み合わせ以外は、workerやworktreeを開始する前に拒否される。実行ファイルは `PI_COLLIE_BIN`（未指定時は `collie`）。構造化promptを渡して `collie run ... --provider ... --model ... --cwd <管理対象worktree> --mode auto --json --stream-json` を起動する。stdoutの最終JSON（`answer`/`error`/`usage`）は共通report/usageへ正規化し、stderrのNDJSONはraw診断として保持しつつactivityへ要約する。Collieにtool allowlistがあるとは主張せず、既存のworktreeスコープ・統合ゲートを使う（worktreeはOSサンドボックスではない）。Collieのインストールはこのプロジェクトでは行わない。
 

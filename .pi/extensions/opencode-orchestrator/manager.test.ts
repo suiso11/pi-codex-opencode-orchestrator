@@ -8,6 +8,7 @@ import test from "node:test";
 import { buildOpenCodeConfigContent } from "./backends/opencode.ts";
 import { OpenCodeTaskManager } from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
+import { buildWorkerEnv } from "./worker-env.ts";
 
 clearAmbientModelConfigEnv();
 
@@ -127,6 +128,23 @@ process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: 
 	};
 }
 
+test("worker environment defaults to runtime variables and requires explicit additions", () => {
+	const env = buildWorkerEnv({
+		PATH: "path-value",
+		HOME: "home-value",
+		OPENCODE_CONFIG_CONTENT: "config-value",
+		PROVIDER_API_KEY: "secret-value",
+		PI_ORCH_WORKER_ENV_ALLOWLIST: "EXTRA_RUNTIME, PROVIDER_API_KEY",
+		EXTRA_RUNTIME: "extra-value",
+	});
+	assert.equal(env.PATH, "path-value");
+	assert.equal(env.HOME, "home-value");
+	assert.equal(env.OPENCODE_CONFIG_CONTENT, "config-value");
+	assert.equal(env.EXTRA_RUNTIME, "extra-value");
+	assert.equal(env.PROVIDER_API_KEY, "secret-value");
+	assert.equal(env.UNSET, undefined);
+});
+
 function spec(name: string, mode: "read_only" | "write", relevantPaths: string[], objective = name) {
 	return {
 		name,
@@ -228,6 +246,63 @@ test("manager runs read-only tasks concurrently but rejects concurrent direct wr
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();
+	}
+});
+
+test("cancellation after worker exit prevents queued worktree integration", async () => {
+	const fake = await fakeOpenCode();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const first = manager.spawn({ ...spec("queue-first", "write", ["src/a"], "slow"), worktree: true }, repo.dir);
+		const queued = manager.spawn({ ...spec("queue-cancel", "write", ["src/b"], "quick"), worktree: true }, repo.dir);
+		for (let attempt = 0; attempt < 40 && !manager.get(queued.id)?.output.includes("FAKE_OK"); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.equal(manager.get(queued.id)?.status, "running", "worker must be exited while finalization waits in the queue");
+		const [cancelled] = await manager.cancel([queued.id]);
+		assert.equal(cancelled.status, "cancelled");
+		assert.equal(cancelled.worktree?.status, "retained");
+		const [settledFirst] = await manager.wait([first.id]);
+		assert.equal(settledFirst.status, "done");
+		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "base\n");
+		manager.discardRetainedWorktree(queued.id);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("adapter launch exceptions clean up prepared worktrees and poison the batch", async () => {
+	const repo = await fakeGitRepo();
+	let cleanupCalls = 0;
+	const manager = new OpenCodeTaskManager({ timeoutMs: 2_000 });
+	const adapters = (manager as any).backends;
+	adapters.opencode = {
+		id: "opencode",
+		displayName: "fake",
+		binary: "unused",
+		binaryArgs: [],
+		prepare: () => ({ agentName: "fake-agent", activity: [] }),
+		buildArgs: () => { throw new Error("adapter build failed"); },
+		buildEnv: (env: NodeJS.ProcessEnv) => env,
+		cleanupAgent: () => { cleanupCalls++; },
+		decodeStdoutLine: () => ({ activity: [] }),
+		decodeStderrChunk: (text: string) => ({ text, activity: [] }),
+		normalizeExitReport: (report: unknown) => report,
+	};
+	try {
+		assert.throws(
+			() => manager.spawn({ ...spec("adapter-failure", "write", ["src/a"]), worktree: true }, repo.dir),
+			/adapter build failed/,
+		);
+		assert.equal(cleanupCalls, 1);
+		assert.equal(manager.list().length, 0, "successfully cleaned launch failures do not remain as task history");
+		assert.equal(repo.git(["worktree", "list", "--porcelain"]).toString("utf8").trim().split("\n\n").length, 1);
+	} finally {
+		await manager.dispose();
+		await repo.cleanup();
 	}
 });
 

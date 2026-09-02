@@ -47,10 +47,12 @@ import type { BackendPreparation, WorkerBackendAdapter } from "./backends/backen
 import { executorGateError, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter } from "./backends/pi.ts";
 import { CollieBackendAdapter, collieGateError, collieModelParts } from "./backends/collie.ts";
+import { buildWorkerEnv } from "./worker-env.ts";
 
 interface ManagedTask {
 	snapshot: TaskSnapshot;
 	child?: ChildProcess;
+	agentName?: string;
 	buffer: string;
 	stderrBuffer: string;
 	settleListeners: Set<() => void>;
@@ -203,6 +205,7 @@ type RetentionCode =
 	| "commit"
 	| "gitlink"
 	| "integration-conflict"
+	| "post-integration-fingerprint"
 	| "cleanup-failed";
 
 // Internal error carrying the retention code that applies when a worktree task
@@ -229,6 +232,8 @@ function retentionKindOf(code: RetentionCode): WorktreeRetentionKind {
 			return "worker-failure";
 		case "integration-conflict":
 			return "integration-failure";
+		case "post-integration-fingerprint":
+			return "cleanup-failed";
 		default:
 			return code;
 	}
@@ -367,43 +372,55 @@ function redactAbsolutePaths(text: string, paths: string[]): string {
  * contents are hashed internally and never exposed. Only path names are kept
  * for the change diagnostic.
  */
-function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
-	const worktreeCheck = runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+function requiredGit(cwd: string, args: string[]): Buffer | undefined {
+	const result = runGitResult(cwd, args);
+	return result.ok ? result.stdout : undefined;
+}
+
+function isMissingFile(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
+	const worktreeCheck = requiredGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
 	if (!worktreeCheck || worktreeCheck.toString("utf8").trim() !== "true") return undefined;
 	const hash = createHash("sha256");
 	const paths = new Set<string>();
 
 	hash.update(Buffer.from("worktree-diff\0"));
-	hash.update(runGit(cwd, ["diff", "--no-color", "--binary"]) ?? Buffer.alloc(0));
+	const worktreeDiff = requiredGit(cwd, ["diff", "--no-color", "--binary"]);
+	if (!worktreeDiff) return undefined;
+	hash.update(worktreeDiff);
 	hash.update(Buffer.from("\0staged-diff\0"));
-	hash.update(runGit(cwd, ["diff", "--cached", "--no-color", "--binary"]) ?? Buffer.alloc(0));
+	const stagedDiff = requiredGit(cwd, ["diff", "--cached", "--no-color", "--binary"]);
+	if (!stagedDiff) return undefined;
+	hash.update(stagedDiff);
 	hash.update(Buffer.from("\0untracked\0"));
-	const untracked = runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
-	if (untracked) {
-		for (const relative of splitNul(untracked)) {
-			paths.add(relative);
-			hash.update(Buffer.from(relative, "utf8"));
-			hash.update(Buffer.from("\0"));
-			try {
-				hash.update(readFileSync(path.join(cwd, relative)));
-			} catch {
-				hash.update(Buffer.from("<unreadable>"));
-			}
-			hash.update(Buffer.from("\0"));
+	const untracked = requiredGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+	if (!untracked) return undefined;
+	for (const relative of splitNul(untracked)) {
+		paths.add(relative);
+		hash.update(Buffer.from(relative, "utf8"));
+		hash.update(Buffer.from("\0"));
+		try {
+			hash.update(readFileSync(path.join(cwd, relative)));
+		} catch (error) {
+			if (!isMissingFile(error)) return undefined;
+			hash.update(Buffer.from("<missing>"));
 		}
+		hash.update(Buffer.from("\0"));
 	}
-	const status = runGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+	const status = requiredGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+	if (!status) return undefined;
 	const statusByPath = new Map<string, string>();
-	if (status) {
-		for (const entry of splitNul(status)) {
-			// porcelain v1 -z entries are "<XY> path"; untracked entries are "?? path".
-			if (entry.length > 3) {
-				const relative = entry.slice(3);
-				paths.add(relative);
-				statusByPath.set(relative, entry.slice(0, 2));
-			} else if (entry.length > 0) {
-				paths.add(entry);
-			}
+	for (const entry of splitNul(status)) {
+		// porcelain v1 -z entries are "<XY> path"; untracked entries are "?? path".
+		if (entry.length > 3) {
+			const relative = entry.slice(3);
+			paths.add(relative);
+			statusByPath.set(relative, entry.slice(0, 2));
+		} else if (entry.length > 0) {
+			paths.add(entry);
 		}
 	}
 
@@ -420,13 +437,18 @@ function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 			const stats = statSync(file);
 			pathHash.update(Buffer.from(`${stats.mode}:${stats.size}:`));
 			pathHash.update(readFileSync(file));
-		} catch {
-			pathHash.update(Buffer.from("<missing-or-unreadable>"));
+		} catch (error) {
+			if (!isMissingFile(error)) return undefined;
+			pathHash.update(Buffer.from("<missing>"));
 		}
 		pathHash.update(Buffer.from("\\0unstaged-diff\\0"));
-		pathHash.update(runGit(cwd, ["diff", "--no-color", "--binary", "--full-index", "--", relative]) ?? Buffer.alloc(0));
+		const unstaged = requiredGit(cwd, ["diff", "--no-color", "--binary", "--full-index", "--", relative]);
+		if (!unstaged) return undefined;
+		pathHash.update(unstaged);
 		pathHash.update(Buffer.from("\\0staged-diff\\0"));
-		pathHash.update(runGit(cwd, ["diff", "--cached", "--no-color", "--binary", "--full-index", "--", relative]) ?? Buffer.alloc(0));
+		const staged = requiredGit(cwd, ["diff", "--cached", "--no-color", "--binary", "--full-index", "--", relative]);
+		if (!staged) return undefined;
+		pathHash.update(staged);
 		pathHashes.set(relative, pathHash.digest("hex"));
 	}
 	return { hash: hash.digest("hex"), paths: [...paths].sort(), pathHashes };
@@ -665,37 +687,40 @@ export class OpenCodeTaskManager {
 			delivered: false,
 			cancelRequested: false,
 		};
-		let childCwd = cwd;
-		if (spec.worktree) {
-			childCwd = this.prepareWorktree(entry, cwd, scopes);
-		}
-		entry.childCwd = childCwd;
-		// Tester and direct non-worktree write workers get a repository mutation
-		// guard. Direct writes additionally use the baseline to enforce declared
-		// scopes at close; neither guard ever reverts worker changes.
-		const guard = spec.role === "tester"
-			? "tester"
-			: spec.mode === "write" && !spec.worktree
-				? "direct-write"
-				: undefined;
-		if (guard) {
-			const baseline = captureGitFingerprint(cwd);
-			if (!baseline) {
-				throw new Error(
-					guard === "tester"
-						? "Tester role requires a Git worktree with a capturable baseline; refusing to spawn without a repository mutation guard."
-						: "Direct write workers require a Git worktree with a capturable baseline; refusing to spawn without scope enforcement.",
-				);
+		try {
+			let childCwd = cwd;
+			if (spec.worktree) childCwd = this.prepareWorktree(entry, cwd, scopes);
+			entry.childCwd = childCwd;
+			// Tester and direct non-worktree write workers get a repository mutation
+			// guard. Direct writes additionally use the baseline to enforce declared
+			// scopes at close; neither guard ever reverts worker changes.
+			const guard = spec.role === "tester"
+				? "tester"
+				: spec.mode === "write" && !spec.worktree
+					? "direct-write"
+					: undefined;
+			if (guard) {
+				const baseline = captureGitFingerprint(cwd);
+				if (!baseline) {
+					throw new Error(
+						guard === "tester"
+							? "Tester role requires a Git worktree with a capturable baseline; refusing to spawn without a repository mutation guard."
+							: "Direct write workers require a Git worktree with a capturable baseline; refusing to spawn without scope enforcement.",
+					);
+				}
+				entry.baselineFingerprint = baseline;
+				entry.cwd = cwd;
+				entry.gitGuard = guard;
 			}
-			entry.baselineFingerprint = baseline;
-			entry.cwd = cwd;
-			entry.gitGuard = guard;
+			this.tasks.set(id, entry);
+			this.prune();
+			this.start(entry, spec, childCwd);
+			this.notify();
+			return snapshot;
+		} catch (error) {
+			this.failSpawn(entry, error);
+			throw error;
 		}
-		this.tasks.set(id, entry);
-		this.prune();
-		this.start(entry, spec, childCwd);
-		this.notify();
-		return snapshot;
 	}
 
 	async spawnWhenAvailable(spec: InternalTaskSpec, cwd: string, signal?: AbortSignal) {
@@ -736,6 +761,47 @@ export class OpenCodeTaskManager {
 		});
 	}
 
+	// A synchronous adapter/spawn failure happens after worktree preparation
+	// often enough to require the same cleanup guarantees as a worker failure.
+	// Poison the batch before removing the failed task so no later task can join
+	// a partially prepared batch. A cleanup failure is retained for the cleanup UI.
+	private failSpawn(entry: ManagedTask, error: unknown) {
+		const adapter = this.backends[entry.snapshot.backend];
+		let agentCleanupError: string | undefined;
+		try { adapter.cleanupAgent(entry.agentName); } catch (cleanupError) { agentCleanupError = processError(cleanupError); }
+		const wt = entry.worktree;
+		if (!wt) {
+			this.tasks.delete(entry.snapshot.id);
+			this.notify();
+			return;
+		}
+		wt.batch.poisoned = true;
+		const failures: string[] = agentCleanupError ? [`worker agent cleanup failed: ${agentCleanupError}`] : [];
+		const remove = runGitResult(wt.repoRoot, ["worktree", "remove", "--force", wt.path]);
+		if (!remove.ok) {
+			failures.push(`git worktree remove failed: ${redactAbsolutePaths(remove.stderr.toString("utf8").trim(), worktreeRedactionPaths(wt)) || "unknown error"}`);
+		}
+		const prune = runGitResult(wt.repoRoot, ["worktree", "prune"]);
+		if (!prune.ok) failures.push("git worktree prune failed");
+		const patchCleanupError = this.removePatchFileWithRetry(wt.patchPath);
+		if (patchCleanupError) failures.push(patchCleanupError);
+		entry.snapshot.status = "error";
+		entry.snapshot.error = redactAbsolutePaths(`Worker launch failed: ${processError(error)}`, worktreeRedactionPaths(wt));
+		if (failures.length === 0) {
+			const index = wt.batch.tasks.indexOf(entry);
+			if (index >= 0) wt.batch.tasks.splice(index, 1);
+			if (wt.batch.tasks.length === 0) {
+				wt.batch.open = false;
+				this.worktreeBatches.delete(wt.batch.key);
+			}
+			this.tasks.delete(entry.snapshot.id);
+			this.notify();
+			return;
+		}
+		this.markWorktreeRetained(entry, "cleanup-failed", `${entry.snapshot.error}; cleanup failed: ${failures.join("; ")}`);
+		this.finishSettle(entry);
+	}
+
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
 		const thinking = resolveThinkingLevel(spec, this.thinkingLevel);
@@ -754,6 +820,7 @@ export class OpenCodeTaskManager {
 		};
 		const preparation: BackendPreparation = adapter.prepare(spawnInput);
 		const agentName = preparation.agentName;
+		entry.agentName = agentName;
 		if (preparation.activity.length > 0) {
 			entry.snapshot.activity.push(...preparation.activity);
 			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
@@ -761,7 +828,7 @@ export class OpenCodeTaskManager {
 		const args = adapter.buildArgs(spawnInput, preparation);
 		// Workers inherit the environment; OpenCode role workers additionally get
 		// a forced official permission override merged over any valid inline config.
-		const env = adapter.buildEnv({ ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" }, spawnInput);
+		const env = adapter.buildEnv({ ...buildWorkerEnv(), NO_COLOR: "1", FORCE_COLOR: "0" }, spawnInput);
 		const child = spawn(adapter.binary, args, {
 			cwd,
 			env,
@@ -830,10 +897,17 @@ export class OpenCodeTaskManager {
 							this.finishSettle(entry);
 						},
 						(error: unknown) => {
-							entry.snapshot.error = processError(error);
-							entry.snapshot.status = "error";
-							this.redactWorktreeDiagnostics(entry);
-							this.markWorktreeRetained(entry, retentionCodeOf(error), entry.snapshot.error);
+							if (entry.cancelRequested) {
+								entry.snapshot.error = undefined;
+								this.resolveStatus(entry, code, backendName);
+								this.redactWorktreeDiagnostics(entry);
+								this.markWorktreeRetained(entry, "cancel", "Worker cancellation requested before integration; isolated patch was not integrated.");
+							} else {
+								entry.snapshot.error = processError(error);
+								entry.snapshot.status = "error";
+								this.redactWorktreeDiagnostics(entry);
+								this.markWorktreeRetained(entry, retentionCodeOf(error), entry.snapshot.error);
+							}
 							this.finishSettle(entry);
 						},
 					);
@@ -928,36 +1002,47 @@ export class OpenCodeTaskManager {
 			};
 			this.worktreeBatches.set(key, batch);
 		}
-		mkdirSync(baseDir, { recursive: true });
+		if (batch.poisoned) throw new Error("Worktree batch is poisoned; refusing to start another isolated worker in it.");
 		const wtPath = path.join(baseDir, entry.snapshot.id);
-		const added = runGitResult(repoRoot, ["worktree", "add", "--detach", wtPath, batch.baseHead]);
-		if (!added.ok) {
-			const stderr = redactAbsolutePaths(
-				added.stderr.toString("utf8").trim(),
-				[baseDir, wtPath],
-			);
-			throw new Error(`Failed to create isolated worktree: ${stderr || "git worktree add failed"}`);
+		try {
+			mkdirSync(baseDir, { recursive: true });
+			const added = runGitResult(repoRoot, ["worktree", "add", "--detach", wtPath, batch.baseHead]);
+			if (!added.ok) {
+				const stderr = redactAbsolutePaths(
+					added.stderr.toString("utf8").trim(),
+					[baseDir, wtPath],
+				);
+				throw new Error(`Failed to create isolated worktree: ${stderr || "git worktree add failed"}`);
+			}
+			const relCwd = path.relative(repoRoot, cwd);
+			const childCwd = relCwd ? path.join(wtPath, relCwd) : wtPath;
+			entry.worktree = {
+				path: wtPath,
+				repoRoot,
+				childCwd,
+				baseHead: batch.baseHead,
+				scopes,
+				batch,
+				patchPath: path.join(baseDir, `${entry.snapshot.id}.patch`),
+			};
+			entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
+			batch.tasks.push(entry);
+			mkdirSync(childCwd, { recursive: true });
+			return childCwd;
+		} catch (error) {
+			batch.poisoned = true;
+			if (batch.tasks.length === 0) {
+				batch.open = false;
+				this.worktreeBatches.delete(batch.key);
+			}
+			throw error;
 		}
-		const relCwd = path.relative(repoRoot, cwd);
-		const childCwd = relCwd ? path.join(wtPath, relCwd) : wtPath;
-		mkdirSync(childCwd, { recursive: true });
-		entry.worktree = {
-			path: wtPath,
-			repoRoot,
-			childCwd,
-			baseHead: batch.baseHead,
-			scopes,
-			batch,
-			patchPath: path.join(baseDir, `${entry.snapshot.id}.patch`),
-		};
-		entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
-		batch.tasks.push(entry);
-		return childCwd;
 	}
 
 	// Validate the isolated changes and enqueue integration through the
 	// per-repo ID-ordered batch queue. Any rejection retains the worktree.
 	private async finalizeWorktree(entry: ManagedTask): Promise<void> {
+		this.throwIfCancelled(entry, "before worktree finalization");
 		const wt = entry.worktree!;
 		const headResult = runGitResult(wt.path, ["rev-parse", "HEAD"]);
 		if (!headResult.ok) {
@@ -1001,6 +1086,7 @@ export class OpenCodeTaskManager {
 		if (!patch.ok) throw new Error("Failed to generate the isolated change patch.");
 		wt.patchBuffer = patch.stdout;
 		wt.changedPaths = changedPaths;
+		this.throwIfCancelled(entry, "before entering the integration queue");
 		await this.enqueueIntegration(wt.batch, entry);
 	}
 
@@ -1015,6 +1101,7 @@ export class OpenCodeTaskManager {
 		const rank = batch.tasks.indexOf(entry);
 		const deadline = Date.now() + this.timeoutMs + INTEGRATION_ORDER_GRACE_MS;
 		while (true) {
+			this.throwIfCancelled(entry, "while waiting for integration order");
 			if (Date.now() > deadline) {
 				throw new RetentionError(
 					"integration-conflict",
@@ -1029,13 +1116,21 @@ export class OpenCodeTaskManager {
 
 	private async enqueueIntegration(batch: WorktreeBatch, entry: ManagedTask): Promise<void> {
 		await this.waitForBatchOrder(batch, entry);
+		this.throwIfCancelled(entry, "before the integration check");
 		this.applyPatch(entry);
+	}
+
+	private throwIfCancelled(entry: ManagedTask, phase: string): void {
+		if (entry.cancelRequested) {
+			throw new RetentionError("cancel", `Worker cancellation requested ${phase}; isolated patch was not integrated.`);
+		}
 	}
 
 	// Apply at the repository root without staging/root reset/stash: fingerprint
 	// guard, `git apply --check`, then `git apply`. Update the batch's expected
 	// fingerprint and remove/prune the successfully integrated worktree.
 	private applyPatch(entry: ManagedTask): void {
+		this.throwIfCancelled(entry, "immediately before root integration");
 		const wt = entry.worktree!;
 		const batch = wt.batch;
 		if (batch.poisoned) {
@@ -1050,16 +1145,22 @@ export class OpenCodeTaskManager {
 		const patch = wt.patchBuffer ?? Buffer.alloc(0);
 		if (patch.length > 0) {
 			writeFileSync(wt.patchPath, patch);
+			this.throwIfCancelled(entry, "before git apply --check");
 			const check = runGitResult(wt.repoRoot, ["apply", "--check", wt.patchPath]);
 			if (!check.ok) {
 				throw new RetentionError("integration-conflict", `git apply --check rejected the isolated patch: ${check.stderr.toString("utf8").trim() || "patch does not apply cleanly"}`);
 			}
+			this.throwIfCancelled(entry, "before root git apply");
 			const apply = runGitResult(wt.repoRoot, ["apply", wt.patchPath]);
 			if (!apply.ok) {
 				throw new RetentionError("integration-conflict", `git apply failed: ${apply.stderr.toString("utf8").trim() || "apply error"}`);
 			}
 			const after = captureGitFingerprint(wt.repoRoot);
-			if (after) batch.expectedFingerprint = after;
+			if (!after) {
+				batch.poisoned = true;
+				throw new RetentionError("post-integration-fingerprint", "Repository fingerprint failed after integration; batch integration is halted and the result is retained without retry.");
+			}
+			batch.expectedFingerprint = after;
 		}
 		this.completeIntegration(entry);
 	}
@@ -1253,10 +1354,10 @@ export class OpenCodeTaskManager {
 			error: reason,
 			createdAt: entry.snapshot.createdAt,
 			patchPath: wt.patchPath,
-			patchBuffer: wt.patchBuffer,
+			patchBuffer: code === "post-integration-fingerprint" ? undefined : wt.patchBuffer,
 			kind,
 			retryable: kind === "integration-failure",
-			rootIntegrated: false,
+			rootIntegrated: code === "post-integration-fingerprint",
 		});
 	}
 
@@ -1400,10 +1501,12 @@ export class OpenCodeTaskManager {
 			const entry = this.tasks.get(id);
 			if (!entry) throw new Error(`Unknown OpenCode task id: ${id}`);
 			entry.consumed = true;
-			if (entry.snapshot.status !== "running" || !entry.child) continue;
+			if (entry.snapshot.status !== "running") continue;
 			entry.cancelRequested = true;
-			killProcessTree(entry.child, "SIGTERM");
-			setTimeout(() => entry.child && killProcessTree(entry.child, "SIGKILL"), 5_000).unref();
+			if (entry.child) {
+				killProcessTree(entry.child, "SIGTERM");
+				setTimeout(() => entry.child && killProcessTree(entry.child, "SIGKILL"), 5_000).unref();
+			}
 		}
 		return this.wait(unique, undefined, true);
 	}
@@ -1429,6 +1532,7 @@ export class OpenCodeTaskManager {
 		if (this.tasks.size < MAX_TRACKED) return;
 		const settled = [...this.tasks.values()]
 			.filter((entry) => entry.snapshot.status !== "running")
+			.filter((entry) => !this.retainedWorktrees.has(entry.snapshot.id))
 			.sort((a, b) => (a.snapshot.settledAt ?? 0) - (b.snapshot.settledAt ?? 0));
 		while (this.tasks.size >= MAX_TRACKED && settled.length > 0) {
 			const entry = settled.shift();
@@ -1518,6 +1622,29 @@ export class OpenCodeTaskManager {
 			throw new Error(
 				`Retry git apply failed: ${redactAbsolutePaths(apply.stderr.toString("utf8").trim(), [retained.path, retained.patchPath]) || "apply error"}`,
 			);
+		}
+		const postApply = captureGitFingerprint(retained.repoRoot);
+		if (!postApply) {
+			const error = "Repository fingerprint failed after retry integration; the result is retained without retry.";
+			const entry = this.tasks.get(taskId);
+			if (entry) {
+				entry.snapshot.status = "error";
+				entry.snapshot.error = error;
+				if (entry.snapshot.worktree) {
+					entry.snapshot.worktree.status = "cleanup-failed";
+					entry.snapshot.worktree.error = error;
+				}
+			}
+			this.retainedWorktrees.set(taskId, {
+				...retained,
+				status: "error",
+				error,
+				kind: "cleanup-failed",
+				retryable: false,
+				rootIntegrated: true,
+				patchBuffer: undefined,
+			});
+			throw new Error(error);
 		}
 
 		// Success: update the original snapshot to done/integrated and clear the
