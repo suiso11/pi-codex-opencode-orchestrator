@@ -180,6 +180,14 @@ const OPTIONAL_ORCHESTRATOR_TOOLS = [
 	"opencode_worktree_status",
 ] as const;
 
+// Exact set of orchestration tool names this extension registers. The
+// coordinator gate allowlists only these names (plus safe planning reads);
+// unknown `opencode_*` tools from other extensions never match.
+const KNOWN_ORCHESTRATOR_TOOLS: readonly string[] = [
+	...CORE_ORCHESTRATOR_TOOLS,
+	...OPTIONAL_ORCHESTRATOR_TOOLS,
+];
+
 const TOOL_GROUP_NAMES = ["inspection", "control", "workflows", "all"] as const;
 export type ToolGroupName = (typeof TOOL_GROUP_NAMES)[number];
 
@@ -220,24 +228,31 @@ function unionToolNames(...lists: (readonly string[])[]): string[] {
 }
 
 /**
- * Strict coordinator-only-parent allowlist: safe planning reads (read/grep/find/ls)
- * plus every active `opencode_*` orchestration tool. Optional opencode groups are
- * never auto-activated; they are preserved only when already active/activated.
- * No unrelated tools (bash, edit, write, subagent, apply_patch, patch, ...) survive.
+ * Strict coordinator-only-parent allowlist: safe planning reads (read/grep/find/ls),
+ * every core orchestration tool, and any already-active tool from the exact set of
+ * orchestration tools this extension registers (optional opencode groups are never
+ * auto-activated; they are preserved only when already active/activated). Unknown
+ * `opencode_*` names from other extensions are never preserved. No unrelated tools
+ * (bash, edit, write, subagent, apply_patch, patch, ...) survive.
  */
 export function coordinatorAllowlist(current: readonly string[]): string[] {
 	const set = new Set<string>(SAFE_READ_TOOLS);
-	for (const name of CORE_ORCHESTRATOR_TOOLS) set.add(name);
+	for (const name of KNOWN_ORCHESTRATOR_TOOLS) set.add(name);
 	for (const name of current) {
-		if (name.startsWith("opencode_")) set.add(name);
+		if (name.startsWith("opencode_") && KNOWN_ORCHESTRATOR_TOOLS.includes(name)) set.add(name);
 	}
 	return [...set];
 }
 
-/** Defense-in-depth gate shared by session_start, before_agent_start, and tool_call. */
+/**
+ * Defense-in-depth gate shared by session_start, before_agent_start, and tool_call.
+ * Exact-name allowlist: safe planning reads plus every orchestration tool this
+ * extension registers (core and optional, including tools not yet dynamically
+ * activated — active tool determination stays with Pi). Unknown `opencode_*`
+ * tools from other extensions are blocked.
+ */
 export function isCoordinatorAllowedTool(name: string): boolean {
-	if ((SAFE_READ_TOOLS as readonly string[]).includes(name)) return true;
-	return name.startsWith("opencode_");
+	return KNOWN_ORCHESTRATOR_TOOLS.includes(name) || (SAFE_READ_TOOLS as readonly string[]).includes(name);
 }
 
 /** Block reason for any non-orchestration tool a coordinator-only parent must not call. */
@@ -612,8 +627,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Defense-in-depth: block every tool call that is not a safe planning read or an
-	// opencode_* orchestration tool. This prevents other extensions/presets from
-	// bypassing the coordinator-only-parent enforcement via setActiveTools.
+	// orchestration tool this extension registers (exact-name allowlist). This
+	// prevents other extensions/presets from bypassing the coordinator-only-parent
+	// enforcement via setActiveTools or unknown `opencode_*` tools.
 	pi.on("tool_call", (event) => {
 		if (isCoordinatorAllowedTool(event.toolName)) return undefined;
 		return { block: true, reason: coordinatorBlockReason(event.toolName) };

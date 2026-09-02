@@ -438,6 +438,40 @@ test("coordinator allowlist keeps safe reads and active opencode tools, drops un
 	assert.equal(isCoordinatorAllowedTool("apply_patch"), false);
 });
 
+test("coordinator allowlist uses an exact tool-name set and drops unknown opencode_* tools", () => {
+	// Unknown opencode_* names (e.g. from another extension) never survive the
+	// allowlist even when currently active.
+	const active = coordinatorAllowlist(["read", "opencode_evil", "opencode_bypass", "opencode_verified_task"]);
+	assert.ok(active.includes("opencode_verified_task"), "known optional tool must be preserved when active");
+	for (const unknown of ["opencode_evil", "opencode_bypass"]) {
+		assert.ok(!active.includes(unknown), `${unknown} must be dropped from the allowlist`);
+	}
+	// Core tools are always present; unknown names are never auto-added.
+	assert.ok(active.includes("opencode_tools"));
+	assert.ok(!coordinatorAllowlist(["read", "bash", "opencode_malicious"]).includes("opencode_malicious"));
+});
+
+test("coordinator gate blocks unknown opencode_* tools and allows every registered orchestration tool", async () => {
+	// Gate: every registered core/optional orchestration tool is allowed by name,
+	// including tools not yet dynamically activated (active tool determination
+	// stays with Pi).
+	const { tools, listeners } = activateExtension();
+	for (const name of Object.keys(tools)) {
+		assert.equal(isCoordinatorAllowedTool(name), true, `${name} must pass the coordinator gate`);
+		const result = await emitToolCall(listeners, { toolCallId: "id", toolName: name, input: {} });
+		assert.equal(result, undefined, `${name} should be allowed (no block)`);
+	}
+	assert.equal(isCoordinatorAllowedTool("opencode_verified_task"), true);
+	// Unknown opencode_* names from other extensions are blocked by the gate.
+	for (const name of ["opencode_evil", "opencode_unrelated", "opencode_shell"]) {
+		assert.equal(isCoordinatorAllowedTool(name), false, `${name} must not pass the gate`);
+		const block = await emitToolCall(listeners, { toolCallId: "id", toolName: name, input: {} });
+		assert.ok(block, `${name} should be blocked`);
+		assert.equal(block.block, true);
+		assert.match(block.reason, /Coordinator-only parent/);
+	}
+});
+
 test("session_start replaces active tools with safe reads plus active opencode tools", async () => {
 	const original = process.env.LOCALAPPDATA;
 	const tempDir = join(tmpdir(), "pi-orch-test-session");
