@@ -77,6 +77,7 @@ export class OpenCodeWorkflowManager {
 				const phase = entry.snapshot.phases[phaseIndex];
 				const phaseTasks: TaskSnapshot[] = [];
 				for (const originalSpec of phase.tasks) {
+					if (signal.aborted) throw new Error("Workflow was cancelled.");
 					const spec = priorPhaseContext
 						? {
 							...originalSpec,
@@ -86,13 +87,27 @@ export class OpenCodeWorkflowManager {
 							],
 						}
 						: originalSpec;
-					const task = await this.tasks.spawnWhenAvailable(
-						{ ...spec, workflowId: entry.snapshot.id },
-						cwd,
-						signal,
-					);
-					phaseTasks.push(task);
-					entry.snapshot.taskIds.push(task.id);
+					let spawned: TaskSnapshot;
+					try {
+						spawned = await this.tasks.spawnWhenAvailable(
+							{ ...spec, workflowId: entry.snapshot.id },
+							cwd,
+							signal,
+						);
+					} catch (error) {
+						// A mid-phase spawn failure leaves earlier tasks of this
+						// phase running as orphans. Cancel them so the workflow
+						// reaches an error state without live orphan workers;
+						// their snapshots remain registered on taskIds for later
+						// review and are never auto-delivered as a handoff.
+						const spawnedIds = phaseTasks.map((task) => task.id);
+						if (spawnedIds.length > 0) {
+							void this.tasks.cancel(spawnedIds).catch(() => undefined);
+						}
+						throw error;
+					}
+					phaseTasks.push(spawned);
+					entry.snapshot.taskIds.push(spawned.id);
 					if (priorPhaseContext) {
 						entry.snapshot.handoffCharsInjected = (entry.snapshot.handoffCharsInjected ?? 0) + priorPhaseContext.length;
 					}

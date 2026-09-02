@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -87,7 +89,7 @@ test("workflow runs phases sequentially and passes compact structured prior resu
 				relevantPaths: ["src"],
 				constraints: [],
 				expectedOutput: "integrated result",
-				profile: "kimi_k3",
+				profile: "reviewer",
 			}],
 		},
 	];
@@ -99,7 +101,7 @@ test("workflow runs phases sequentially and passes compact structured prior resu
 		assert.equal(settled.taskIds.length, 2);
 		assert.match(tasks.get(settled.taskIds[0])?.output ?? "", /PHASE_ONE_SUMMARY/);
 		const second = tasks.get(settled.taskIds[1]);
-		assert.equal(second?.model, configuredModelProfiles().kimi_k3);
+		assert.equal(second?.model, configuredModelProfiles().reviewer);
 		const findings = second?.report?.findings ?? [];
 		assert.ok(findings.includes("HAS_STRUCTURED_SUMMARY"), "second phase missing structured prior summary");
 		assert.ok(findings.includes("NO_RAW_FILLER"), "second phase leaked raw filler");
@@ -338,4 +340,247 @@ test("formatWorkflowResultText never exceeds 8000 chars including headers and tr
 	const text = formatWorkflowResultText(workflow, results);
 	assert.ok(text.length > 0, "resultText empty");
 	assert.ok(text.length <= 8000, `resultText length ${text.length} > 8000`);
+});
+
+// Fake worker for a workflow with a long-running first task whose sibling later
+// fails at spawn time. The worker keeps running until it emits DONE or is killed.
+async function fakeSpawnFailureOpenCode() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-spawnfail-"));
+	const script = path.join(dir, "opencode.mjs");
+	await writeFile(
+		script,
+		`
+const prompt = process.argv.at(-1) || "";
+const emit = (text) => process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text } }) + "\\n");
+if (prompt.includes("Objective: slow first task")) {
+  setTimeout(() => {
+    emit(JSON.stringify({ summary: "first done", files: [], findings: [], unresolved: [] }));
+  }, 5000);
+} else {
+  emit(JSON.stringify({ summary: "unexpected", files: [], findings: [], unresolved: [] }));
+  process.exit(0);
+}
+`,
+		"utf8",
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+test("a mid-phase spawn failure cancels earlier phase tasks best-effort and never injects an orphan handoff", async () => {
+	const fake = await fakeSpawnFailureOpenCode();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	try {
+		const started = workflows.start("spawn failure", [
+			{
+				name: "mixed",
+				tasks: [
+					{
+						name: "slow-first",
+						mode: "read_only",
+						objective: "slow first task",
+						relevantPaths: ["src"],
+						constraints: [],
+						expectedOutput: "result",
+					},
+					{
+						// This spec passes phase validation (validation only calls
+						// normalizeScopes for write tasks) but fails synchronously in
+						// spawn() because a read_only task with a glob path cannot be
+						// normalized into concrete scopes.
+						name: "bad-second",
+						mode: "read_only",
+						objective: "bad second task",
+						relevantPaths: ["src/*.ts"],
+						constraints: [],
+						expectedOutput: "result",
+					},
+				],
+			},
+			{
+				// Never reached: the failing spawn in phase 1 aborts the workflow first.
+				name: "unreachable",
+				tasks: [{
+					name: "dummy",
+					mode: "read_only",
+					objective: "never runs",
+					relevantPaths: ["src"],
+					constraints: [],
+					expectedOutput: "result",
+				}],
+			},
+		], process.cwd());
+
+		const settled = await workflows.wait(started.id);
+		assert.equal(settled.status, "error", `expected error, got ${settled.status}: ${settled.error ?? ""}`);
+		assert.match(settled.error ?? "", /not globs/);
+		assert.ok(settled.settledAt !== undefined, "workflow must settle deterministically");
+
+		// The first task was spawned and its id remains inspectable on the workflow.
+		assert.equal(settled.taskIds.length, 1, "only the first task should be spawned");
+		const firstId = settled.taskIds[0];
+		const firstTask = tasks.get(firstId);
+		assert.ok(firstTask, "first task snapshot must remain inspectable");
+
+		// The earlier phase task is cancelled best-effort (fire-and-forget), so
+		// wait for it to reach a terminal state before asserting cancellation.
+		await waitUntil(() => tasks.get(firstId)?.status !== "running", 3_000);
+		assert.equal(tasks.get(firstId)?.status, "cancelled", "earlier phase task should be cancelled best-effort");
+
+		// No orphan handoff is injected: the failed second task is never spawned
+		// and no handoff payload was created or injected into any downstream task.
+		assert.equal(settled.handoffCharsCreated, 0, "no handoff should be created on a mid-phase spawn failure");
+		assert.equal(settled.handoffCharsInjected, 0, "no handoff should be injected on a mid-phase spawn failure");
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+	}
+});
+
+// Fake worker for a worktree write phase plus a downstream read-only verification
+// task. The write worker mutates its own cwd (the isolated worktree); the
+// downstream read-only worker inspects the repository root to prove integration
+// already happened before the read-only phase started.
+async function fakeWorktreeWorkflowOpenCode() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-opencode-wtworkflow-"));
+	const script = path.join(dir, "opencode.mjs");
+	await writeFile(
+		script,
+		`
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+const prompt = process.argv.at(-1) || "";
+const emit = (text) => process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text } }) + "\\n");
+if (prompt.includes("WRITE_SRC_A")) {
+  mkdirSync("src", { recursive: true });
+  writeFileSync("src/a.txt", "A-from-worktree\\n", "utf8");
+  emit(JSON.stringify({ summary: "isolated write done", files: ["src/a.txt"], findings: [], unresolved: [] }));
+  process.exit(0);
+}
+if (prompt.includes("CHECK_INTEGRATION")) {
+  let integrated = false;
+  try {
+    integrated = readFileSync("src/a.txt", "utf8").includes("A-from-worktree");
+  } catch {}
+  emit(JSON.stringify({ summary: "verify done", files: [], findings: [integrated ? "INTEGRATED_BEFORE_READONLY" : "NOT_INTEGRATED_YET"], unresolved: [] }));
+  process.exit(0);
+}
+emit(JSON.stringify({ summary: "unexpected", files: [], findings: [], unresolved: [] }));
+process.exit(0);
+`,
+		"utf8",
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+// Disposable Git repo whose root is clean so the worktree batch can open.
+async function workflowGitRepo() {
+	const base = await mkdtemp(path.join(os.tmpdir(), "wt-workflow-"));
+	const dir = path.join(base, "repo");
+	await mkdir(path.join(dir, "src"), { recursive: true });
+	const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+	git(["init", "-q"]);
+	git(["config", "core.autocrlf", "false"]);
+	await writeFile(path.join(dir, "src", "a.txt"), "a\n", "utf8");
+	git(["add", "-A"]);
+	git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "base"]);
+	return {
+		dir,
+		git,
+		baseHead: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
+		cleanup: () => rm(base, { recursive: true, force: true }),
+	};
+}
+
+// Remove any retained worktree for a repo before deleting the disposable repo.
+async function cleanupWorkflowRepo(repo: { dir: string; cleanup: () => Promise<void> }, snapshotId: string) {
+	const toplevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: repo.dir, encoding: "utf8" }).trim();
+	const repoRoot = path.resolve(toplevel);
+	const digest = createHash("sha256").update(repoRoot).digest("hex").slice(0, 16);
+	try {
+		execFileSync("git", ["worktree", "remove", "--force", path.join(os.tmpdir(), "oc-worktrees", digest, snapshotId)], { cwd: repoRoot, stdio: "ignore" });
+	} catch {
+		// The worktree may already have been removed by a successful integration.
+	}
+	try {
+		execFileSync("git", ["worktree", "prune"], { cwd: repoRoot, stdio: "ignore" });
+	} catch {
+		// Nothing to prune.
+	}
+	await repo.cleanup();
+}
+
+test("a later read-only phase starts only after the worktree-write phase settled and integrated", async () => {
+	const fake = await fakeWorktreeWorkflowOpenCode();
+	const repo = await workflowGitRepo();
+	const tasks = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	const workflows = new OpenCodeWorkflowManager(tasks);
+	let wtId = "";
+	try {
+		const started = workflows.start("worktree then read-only", [
+			{
+				name: "isolated",
+				tasks: [{
+					name: "write-a",
+					mode: "write",
+					objective: "WRITE_SRC_A",
+					relevantPaths: ["src/a.txt"],
+					constraints: [],
+					expectedOutput: "result",
+					worktree: true,
+				}],
+			},
+			{
+				name: "verify",
+				tasks: [{
+					name: "verify-integrated",
+					mode: "read_only",
+					objective: "CHECK_INTEGRATION",
+					relevantPaths: ["src"],
+					constraints: [],
+					expectedOutput: "result",
+				}],
+			},
+		], repo.dir);
+
+		const settled = await workflows.wait(started.id);
+		assert.equal(settled.status, "done", `expected done, got ${settled.status}: ${settled.error ?? ""}`);
+		assert.equal(settled.taskIds.length, 2, "one worktree write and one read-only verify task");
+
+		wtId = settled.taskIds[0];
+		const writeTask = tasks.get(wtId);
+		assert.ok(writeTask, "worktree write task must remain inspectable");
+		assert.equal(writeTask?.status, "done");
+		assert.equal(writeTask?.worktree?.status, "integrated", "worktree write must integrate before the read-only phase runs");
+
+		const verifyTask = tasks.get(settled.taskIds[1]);
+		assert.ok(verifyTask, "read-only verify task must remain inspectable");
+		assert.equal(verifyTask?.status, "done");
+		assert.ok(
+			(verifyTask?.report?.findings ?? []).includes("INTEGRATED_BEFORE_READONLY"),
+			"read-only phase must start only after the worktree write was integrated",
+		);
+	} finally {
+		await workflows.dispose();
+		await tasks.dispose();
+		await fake.cleanup();
+		if (wtId) await cleanupWorkflowRepo(repo, wtId);
+		else await repo.cleanup();
+	}
 });
