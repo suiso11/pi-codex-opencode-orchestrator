@@ -137,7 +137,7 @@ test("reporter sends report-agent only on status change and release-agent at shu
 		reporter.report([task({ status: "running" })], []);
 		assert.equal(reporter.reportsCount, 2);
 
-		await new Promise<void>((resolve) => setTimeout(resolve, 300));
+		await reporter.flush();
 		const lines = (await readFile(fake.log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 		assert.equal(lines.length, 3, `expected 3 CLI calls, got ${lines.length}`);
 		assert.equal(lines[0][1], "report-agent");
@@ -167,7 +167,7 @@ test("reporter confines CLI failures to diagnostics without throwing", async () 
 		});
 		assert.doesNotThrow(() => reporter.report([task({ status: "running" })], []));
 		assert.doesNotThrow(() => reporter.release());
-		await new Promise<void>((resolve) => setTimeout(resolve, 300));
+		await reporter.flush();
 		assert.ok(reporter.diagnostics.length >= 2, `diagnostics=${JSON.stringify(reporter.diagnostics)}`);
 		assert.match(reporter.diagnostics[0], /^herdr report failed \(seq 1\): /);
 		// Diagnostics stay path-free.
@@ -189,7 +189,7 @@ test("reporter survives a missing CLI binary and keeps diagnostics bounded", asy
 		reporter.report(index % 2 === 0 ? [task({ status: "running" })] : [], []);
 	}
 	reporter.release();
-	await new Promise<void>((resolve) => setTimeout(resolve, 300));
+	await reporter.flush();
 	assert.ok(reporter.diagnostics.length <= 3, `bounded diagnostics: ${reporter.diagnostics.length}`);
 	assert.ok(reporter.diagnostics.every((line) => line.startsWith("herdr ")));
 });

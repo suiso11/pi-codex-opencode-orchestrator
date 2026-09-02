@@ -645,6 +645,9 @@ export default function (pi: ExtensionAPI) {
 		modelSync.close();
 		try {
 			herdr?.release();
+			// Wait for the release (and any in-flight report) subprocess to settle
+			// so the final status is reliably delivered before the process exits.
+			await herdr?.flush();
 		} catch {
 			// Release is best-effort; never fail shutdown for it.
 		}

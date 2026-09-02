@@ -99,6 +99,8 @@ const CLI_TIMEOUT_MS = 5_000;
  * Fire-and-forget Herdr status reporter. Reports are sent only when the derived
  * status changes, with a monotonically increasing seq shared with the final
  * release. Every failure lands in bounded `diagnostics` and nowhere else.
+ * Dispatched CLI subprocesses are tracked in-flight so `flush()` can await
+ * their completion (used by tests and session shutdown).
  */
 export class HerdrStatusReporter {
 	readonly diagnostics: string[] = [];
@@ -107,6 +109,8 @@ export class HerdrStatusReporter {
 	private lastReported?: HerdrStatus;
 	private released = false;
 	private reportsSent = 0;
+	private readonly inflight = new Set<Promise<void>>();
+	private tail: Promise<void> = Promise.resolve();
 
 	constructor(options: HerdrReporterOptions) {
 		this.options = { maxDiagnostics: DEFAULT_MAX_DIAGNOSTICS, ...options };
@@ -142,18 +146,42 @@ export class HerdrStatusReporter {
 		this.dispatch("release", buildReleaseArgs(this.options.env.paneId, this.seq), this.seq);
 	}
 
+	/** Resolves once every dispatched CLI subprocess has settled (success or failure). */
+	async flush(): Promise<void> {
+		while (this.inflight.size > 0) {
+			await Promise.allSettled([...this.inflight]);
+		}
+	}
+
 	private dispatch(kind: "report" | "release", args: string[], seq: number): void {
 		const record = (error: unknown) => this.recordDiagnostic(kind, seq, error);
-		try {
-			execFile(
-				this.options.env.binPath,
-				[...(this.options.binArgs ?? []), ...args],
-				{ windowsHide: true, timeout: CLI_TIMEOUT_MS },
-				(error) => record(error),
-			);
-		} catch (error) {
-			record(error);
-		}
+		let settle!: () => void;
+		const done = new Promise<void>((resolve) => {
+			settle = () => {
+				this.inflight.delete(done);
+				resolve();
+			};
+		});
+		this.inflight.add(done);
+		// Dispatches are serialized: Herdr applies statuses by seq, so concurrent
+		// CLI calls could land out of order and let a stale state win. Spawning
+		// the next call only after the previous one settled keeps seq order.
+		this.tail = this.tail.then(() => {
+			try {
+				execFile(
+					this.options.env.binPath,
+					[...(this.options.binArgs ?? []), ...args],
+					{ windowsHide: true, timeout: CLI_TIMEOUT_MS },
+					(error) => {
+						record(error);
+						settle();
+					},
+				);
+			} catch (error) {
+				record(error);
+				settle();
+			}
+		});
 	}
 
 	/** Bounded, path-free diagnostic: error code only, never a message with paths. */
