@@ -22,6 +22,7 @@ import type {
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
 import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard, sumWorkerUsage, type DashboardUsage } from "./dashboard.ts";
+import { HerdrStatusReporter, resolveHerdrEnv } from "./herdr.ts";
 import { ModelConfigSync, registerModelCommand } from "./model-command.ts";
 
 const ModeSchema = StringEnum(["read_only", "write"] as const, {
@@ -462,6 +463,12 @@ export default function (pi: ExtensionAPI) {
 	let deliveryScheduled = false;
 	let dashboardTimer: ReturnType<typeof setInterval> | undefined;
 
+	// Optional Herdr status integration: a complete no-op unless the orchestrator
+	// runs inside a Herdr pane (HERDR_ENV=1, HERDR_PANE_ID, HERDR_BIN_PATH all set).
+	// Failures never propagate; they stay in the reporter's bounded diagnostics.
+	const herdrEnv = resolveHerdrEnv();
+	const herdr = herdrEnv ? new HerdrStatusReporter({ env: herdrEnv }) : undefined;
+
 	const parentUsage = {
 		inputTokens: 0,
 		outputTokens: 0,
@@ -508,6 +515,11 @@ export default function (pi: ExtensionAPI) {
 	const updateStatus = () => {
 		const taskRunning = tasks?.runningCount() ?? 0;
 		const workflowRunning = workflows?.list().filter((item) => item.status === "running").length ?? 0;
+		try {
+			herdr?.report(tasks.list(), workflows.list());
+		} catch {
+			// Herdr reporting is best-effort only; never fail orchestration for it.
+		}
 		if (ui) {
 			const hasRunningWork = taskRunning > 0 || workflowRunning > 0;
 			if (!hasRunningWork) ui.setStatus("opencode-orchestrator", undefined);
@@ -626,6 +638,11 @@ export default function (pi: ExtensionAPI) {
 		ui?.setWidget(DASHBOARD_KEY, undefined);
 		ui = undefined;
 		modelSync.close();
+		try {
+			herdr?.release();
+		} catch {
+			// Release is best-effort; never fail shutdown for it.
+		}
 		await workflows.dispose();
 		await tasks.dispose();
 	});
@@ -935,6 +952,9 @@ export default function (pi: ExtensionAPI) {
 					`Timeout: ${config.timeoutMs} ms`,
 					`Running: ${tasks.runningCount()}/${config.maxRunning}`,
 					`Workflows: ${workflows.list().filter((item) => item.status === "running").length} running`,
+					`Herdr: ${herdr
+						? `enabled (state ${herdr.lastStatus?.state ?? "-"}, reports ${herdr.reportsCount}${herdr.diagnostics.length > 0 ? `, diagnostics: ${herdr.diagnostics.join("; ")}` : ""})`
+						: "disabled (not inside a Herdr pane)"}`,
 				].join("\n"),
 				"info",
 			);

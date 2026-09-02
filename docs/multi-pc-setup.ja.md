@@ -76,6 +76,20 @@ opencode auth list
 - アクセストークンとセッショントークン
 - `.env` など秘密情報を含む実設定
 
+## Herdrステータス連携（任意）
+
+Herdrのpane内で起動する場合だけ、次の3つを起動プロセスへ渡すと、公式CLIでオーケストレーターの状態を表示できる。3つが揃わない場合は連携しない。
+
+```bash
+HERDR_ENV=1
+HERDR_PANE_ID=<pane-id>
+HERDR_BIN_PATH=<herdr実行ファイルのパス>
+```
+
+状態報告は `pane report-agent`（`--source custom:pi-orch`、`--agent pi-orch`）、終了時の解放は `pane release-agent` を使う。worker/workflow実行中は `working`、判断待ちのretainedまたはcleanup-failed worktreeがあれば `blocked`、それ以外は `idle`。同じ状態の再送は行わず、seqは単調増加する。メッセージは件数だけで、プロンプト・秘密情報・リポジトリやworktreeのパスは送信しない。
+
+CLIが未導入・失敗してもオーケストレーターは継続するfail-open設計で、診断は件数制限・パス非表示。Herdr外ではインストールや設定は不要である。
+
 ## ドキュメントコーディネータースキル
 
 ドキュメント作業用に、プロジェクトが信頼するPiスキルが利用できる。Piは `.pi/skills/orchestrator-role-coordinator/SKILL.md` からプロジェクト単位で自動発見するため、プロジェクト発見に `package.json` への登録は不要。複数workerのロール計画、worktreeのバッチ/復旧、モデルルーティングを検討するときは `/skill:orchestrator-role-coordinator` で明示的に呼び出す。

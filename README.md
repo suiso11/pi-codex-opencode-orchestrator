@@ -113,6 +113,20 @@ How changes apply to a running session:
 - `reset` (for example `/orch-model reset worker` or `pi-orch model reset worker`) or deleting the saved setting returns that target to its startup baseline: the launcher's environment-variable override (`PI_CODEX_MODEL`, `PI_OPENCODE_MODEL`, `PI_OPENCODE_PROFILE_IMPLEMENTER`, `PI_OPENCODE_PROFILE_REVIEWER`, `PI_OPENCODE_PROFILE_TESTER`) if set, otherwise the built-in default.
 - Environment-variable overrides continue to take effect from the next orchestrator launch on; a change made in the running session takes precedence until then.
 
+## Herdr status integration (optional)
+
+When launched inside a Herdr pane, the extension reports orchestrator status through Herdr's official CLI. It is disabled unless all three values are present in the process environment:
+
+```bash
+HERDR_ENV=1
+HERDR_PANE_ID=<pane-id>
+HERDR_BIN_PATH=<path-to-herdr>
+```
+
+Reports use `pane report-agent` with `--source custom:pi-orch` and `--agent pi-orch`; shutdown uses `pane release-agent`. The mapping is `working` when workers/workflows are running, `blocked` when retained or cleanup-failed worktrees await a decision, and `idle` otherwise. Only coarse state transitions are sent, with a monotonically increasing sequence number. Messages contain counts only; prompts, secrets, repository paths, and worktree paths are not sent.
+
+Herdr reporting is fail-open: a missing or failing CLI never affects orchestration, and bounded path-free diagnostics are available in `/opencode-status`. No Herdr installation or configuration is required outside a Herdr-managed pane.
+
 ## Live activity dashboard
 
 While worker tasks are running, Pi shows a widget above the editor. It refreshes about once per second and includes:
