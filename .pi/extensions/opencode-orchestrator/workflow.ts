@@ -5,6 +5,7 @@ import type {
 	WorkflowPhaseSpec,
 	WorkflowSnapshot,
 } from "./types.ts";
+import { collectUnresolvedIssues } from "./verified-workflow.ts";
 import { taskResultsText, validateWorkflowPhases } from "./types.ts";
 
 interface ManagedWorkflow {
@@ -77,6 +78,7 @@ export class OpenCodeWorkflowManager {
 				const phase = entry.snapshot.phases[phaseIndex];
 				const phaseTasks: TaskSnapshot[] = [];
 				for (const originalSpec of phase.tasks) {
+					if (signal.aborted) throw new Error("Workflow was cancelled.");
 					const spec = priorPhaseContext
 						? {
 							...originalSpec,
@@ -86,13 +88,27 @@ export class OpenCodeWorkflowManager {
 							],
 						}
 						: originalSpec;
-					const task = await this.tasks.spawnWhenAvailable(
-						{ ...spec, workflowId: entry.snapshot.id },
-						cwd,
-						signal,
-					);
-					phaseTasks.push(task);
-					entry.snapshot.taskIds.push(task.id);
+					let spawned: TaskSnapshot;
+					try {
+						spawned = await this.tasks.spawnWhenAvailable(
+							{ ...spec, workflowId: entry.snapshot.id },
+							cwd,
+							signal,
+						);
+					} catch (error) {
+						// A mid-phase spawn failure leaves earlier tasks of this
+						// phase running as orphans. Cancel them so the workflow
+						// reaches an error state without live orphan workers;
+						// their snapshots remain registered on taskIds for later
+						// review and are never auto-delivered as a handoff.
+						const spawnedIds = phaseTasks.map((task) => task.id);
+						if (spawnedIds.length > 0) {
+							void this.tasks.cancel(spawnedIds).catch(() => undefined);
+						}
+						throw error;
+					}
+					phaseTasks.push(spawned);
+					entry.snapshot.taskIds.push(spawned.id);
 					if (priorPhaseContext) {
 						entry.snapshot.handoffCharsInjected = (entry.snapshot.handoffCharsInjected ?? 0) + priorPhaseContext.length;
 					}
@@ -108,6 +124,20 @@ export class OpenCodeWorkflowManager {
 					throw new Error(
 						`Phase "${phase.name}" failed: ${failed.map((task) => `${task.id}=${task.status}`).join(", ")}`,
 					);
+				}
+				// Internal quality gate: a worker can settle with status=done while its
+				// report still lists unresolved issues. Such a phase must not advance:
+				// the workflow errors and the next phase (and any downstream approval)
+				// never starts. No automatic retry is performed.
+				if (phase.requireResolved) {
+					const gated = collectUnresolvedIssues(results);
+					if (gated.length > 0) {
+						throw new Error(
+							`Quality gate "requireResolved" failed in phase "${phase.name}": ${gated
+								.map((task) => `${task.taskId} "${task.taskName}" unresolved: ${task.unresolved.slice(0, 3).join("; ")}`)
+								.join(" | ")}. The next phase did not start and no approval was granted.`,
+						);
+					}
 				}
 				priorPhaseContext = buildPhaseHandoff(results);
 				const downstreamPhase = entry.snapshot.phases[phaseIndex + 1];
