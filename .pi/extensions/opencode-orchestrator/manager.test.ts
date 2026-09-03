@@ -1,11 +1,27 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	symlinkSync,
+	truncateSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { captureGitFingerprint, parsePorcelainStatusRecords, OpenCodeTaskManager } from "./manager.ts";
+import {
+	captureGitFingerprint,
+	FINGERPRINT_MAX_FILE_BYTES,
+	hashPathWithoutFollowing,
+	parsePorcelainStatusRecords,
+	OpenCodeTaskManager,
+} from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
 import { buildWorkerEnv } from "./worker-env.ts";
 
@@ -187,6 +203,228 @@ test("GitFingerprint requires HEAD identity and observes a same-commit branch sw
 		assert.ok(after);
 		assert.equal(after.headOid, before.headOid, "the test branch intentionally points at the same commit");
 		assert.notEqual(after.headRef, before.headRef, "the symbolic HEAD identity must still change");
+	} finally {
+		await repo.cleanup();
+	}
+});
+
+// A helper-level digest over one path, used by the no-follow tests below.
+function digestPathWithoutFollowing(file: string): { outcome: ReturnType<typeof hashPathWithoutFollowing>; digest: string } {
+	const hash = createHash("sha256");
+	const outcome = hashPathWithoutFollowing(hash, file);
+	return { outcome, digest: hash.digest("hex") };
+}
+
+test("hashPathWithoutFollowing reads exact regular bytes and fails closed on oversize paths", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "fp-path-"));
+	try {
+		const file = path.join(dir, "regular.txt");
+		writeFileSync(file, "fingerprint content\n");
+		const first = digestPathWithoutFollowing(file);
+		assert.ok(first.outcome.ok);
+		assert.equal(first.outcome.kind, "file");
+		assert.equal(digestPathWithoutFollowing(file).digest, first.digest);
+		writeFileSync(file, "fingerprint content 2\n");
+		assert.notEqual(digestPathWithoutFollowing(file).digest, first.digest);
+		// A file larger than one bounded-read chunk (reads are capped at 1 MiB)
+		// crosses the chunk boundary with a full chunk plus a partial tail and
+		// must still settle to the exact same digest as its own bytes.
+		const chunked = path.join(dir, "chunked.bin");
+		const chunkedBytes = Buffer.concat([Buffer.alloc(1024 * 1024, 0x61), Buffer.from("tail-bytes")]);
+		writeFileSync(chunked, chunkedBytes);
+		const chunkedFirst = digestPathWithoutFollowing(chunked);
+		assert.ok(chunkedFirst.outcome.ok);
+		assert.equal(chunkedFirst.outcome.kind, "file");
+		assert.equal(digestPathWithoutFollowing(chunked).digest, chunkedFirst.digest);
+		writeFileSync(chunked, Buffer.concat([chunkedBytes, Buffer.from("!")]));
+		assert.notEqual(digestPathWithoutFollowing(chunked).digest, chunkedFirst.digest);
+		// An over-cap file fails closed before any of its content is read.
+		const big = path.join(dir, "big.bin");
+		writeFileSync(big, "x");
+		truncateSync(big, FINGERPRINT_MAX_FILE_BYTES + 1);
+		assert.equal(hashPathWithoutFollowing(createHash("sha256"), big).ok, false);
+		// A path that is absent from the start is a stable Git-visible state
+		// (deleted dirty paths and rename sources), not an instability.
+		const missing = digestPathWithoutFollowing(path.join(dir, "absent.txt"));
+		assert.ok(missing.outcome.ok);
+		assert.equal(missing.outcome.kind, "missing");
+		assert.equal(digestPathWithoutFollowing(path.join(dir, "elsewhere.txt")).digest, missing.digest);
+		// A directory is hashed from lstat metadata only and never opened.
+		const directory = digestPathWithoutFollowing(dir);
+		assert.ok(directory.outcome.ok);
+		assert.equal(directory.outcome.kind, "special");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("hashPathWithoutFollowing hashes the link itself and never its target", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "fp-link-"));
+	const targetDir = path.join(dir, "target-dir");
+	const otherDir = path.join(dir, "other-dir");
+	try {
+		mkdirSync(targetDir, { recursive: true });
+		mkdirSync(otherDir, { recursive: true });
+		writeFileSync(path.join(targetDir, "inside.bin"), "target content");
+		// The link target holds an over-cap file: following it would blow the
+		// fingerprint size cap, so a settled link hash proves it is never read.
+		const big = path.join(targetDir, "large.bin");
+		writeFileSync(big, "x");
+		truncateSync(big, FINGERPRINT_MAX_FILE_BYTES + 1);
+		const link = path.join(dir, "link");
+		const linkType = process.platform === "win32" ? "junction" : "dir";
+		symlinkSync(targetDir, link, linkType);
+		const digestLink = () => {
+			const result = digestPathWithoutFollowing(link);
+			assert.ok(result.outcome.ok);
+			assert.equal(result.outcome.kind, "symlink");
+			return result.digest;
+		};
+		const before = digestLink();
+		// Mutating bytes behind the link never changes the link's own hash.
+		writeFileSync(path.join(targetDir, "inside.bin"), "target content changed");
+		assert.equal(digestLink(), before);
+		// Pointing the link at a different target does.
+		unlinkSync(link);
+		symlinkSync(otherDir, link, linkType);
+		assert.notEqual(digestLink(), before);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// FIFOs cannot exist on Windows, so this regression only registers on platforms
+// where mkfifo can run; it never skips at runtime.
+if (process.platform !== "win32") {
+	test("hashPathWithoutFollowing settles FIFOs from lstat metadata instead of opening them", () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "fp-fifo-"));
+		try {
+			const fifo = path.join(dir, "pipe");
+			execFileSync("mkfifo", [fifo]);
+			const digestFifo = () => {
+				const result = digestPathWithoutFollowing(fifo);
+				assert.ok(result.outcome.ok);
+				assert.equal(result.outcome.kind, "special");
+				return result.digest;
+			};
+			const before = digestFifo();
+			assert.equal(digestFifo(), before);
+			// Recreating the FIFO yields a new inode, which the metadata hash sees.
+			unlinkSync(fifo);
+			execFileSync("mkfifo", [fifo]);
+			assert.notEqual(digestFifo(), before);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+}
+
+// Windows without Developer Mode/administrator rights forbids creating
+// symlinks (EPERM), so probe once whether this process can create a real file
+// symlink at all; the fingerprint-level link regression only registers where
+// the platform can produce one and never skips at runtime.
+function canCreateFileSymlinks(): boolean {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "fp-symlink-probe-"));
+	try {
+		const target = path.join(dir, "target.txt");
+		writeFileSync(target, "probe");
+		symlinkSync(target, path.join(dir, "link"), "file");
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+if (canCreateFileSymlinks()) {
+	test("captureGitFingerprint fingerprints an untracked symlink without following its target", async () => {
+		const repo = await fakeGitRepo();
+		const external = await mkdtemp(path.join(os.tmpdir(), "fp-external-"));
+		try {
+			// The target is an oversized external file: following it would exceed
+			// the fingerprint cap, so a settled fingerprint proves it stays unread.
+			const bigTarget = path.join(external, "large.bin");
+			await writeFile(bigTarget, "x");
+			await truncate(bigTarget, FINGERPRINT_MAX_FILE_BYTES + 1);
+			const link = path.join(repo.dir, "link.bin");
+			symlinkSync(bigTarget, link);
+			const before = captureGitFingerprint(repo.dir);
+			assert.ok(before);
+			const linkHash = before.pathHashes.get("link.bin");
+			assert.ok(linkHash, "the untracked link must join the fingerprint");
+			// Two captures settle to the same state even though the target is huge.
+			const again = captureGitFingerprint(repo.dir);
+			assert.ok(again);
+			assert.equal(again.hash, before.hash);
+			// Changing only the external target bytes never changes the fingerprint.
+			writeFileSync(bigTarget, "y", { flag: "r+" });
+			const afterTargetChange = captureGitFingerprint(repo.dir);
+			assert.ok(afterTargetChange);
+			assert.equal(afterTargetChange.hash, before.hash);
+			// Retargeting the link itself does change the fingerprint.
+			const smallTarget = path.join(external, "small.bin");
+			await writeFile(smallTarget, "small\n");
+			unlinkSync(link);
+			symlinkSync(smallTarget, link);
+			const afterRetarget = captureGitFingerprint(repo.dir);
+			assert.ok(afterRetarget);
+			assert.notEqual(afterRetarget.hash, before.hash);
+			assert.notEqual(afterRetarget.pathHashes.get("link.bin"), linkHash);
+		} finally {
+			await repo.cleanup();
+			await rm(external, { recursive: true, force: true });
+		}
+	});
+}
+
+test("captureGitFingerprint fails closed for an oversized untracked path", async () => {
+	const repo = await fakeGitRepo();
+	try {
+		const big = path.join(repo.dir, "big.bin");
+		await writeFile(big, "x");
+		await truncate(big, FINGERPRINT_MAX_FILE_BYTES + 1);
+		assert.equal(captureGitFingerprint(repo.dir), undefined);
+	} finally {
+		await repo.cleanup();
+	}
+});
+
+test("captureGitFingerprint fails closed for an oversized tracked dirty path", async () => {
+	const repo = await fakeGitRepo();
+	try {
+		// base.txt is tracked and clean, so it only reaches the hasher through
+		// the status-driven per-path hashes; the cap must fail the capture there.
+		await truncate(path.join(repo.dir, "base.txt"), FINGERPRINT_MAX_FILE_BYTES + 1);
+		assert.equal(captureGitFingerprint(repo.dir), undefined);
+	} finally {
+		await repo.cleanup();
+	}
+});
+
+test("captureGitFingerprint distinguishes dirty regular content and settled deletions", async () => {
+	const repo = await fakeGitRepo();
+	try {
+		const dirty = path.join(repo.dir, "dirty.txt");
+		await writeFile(dirty, "one\n");
+		const before = captureGitFingerprint(repo.dir);
+		assert.ok(before);
+		const dirtyHash = before.pathHashes.get("dirty.txt");
+		assert.ok(dirtyHash);
+		await writeFile(dirty, "two\n");
+		const after = captureGitFingerprint(repo.dir);
+		assert.ok(after);
+		assert.notEqual(after.pathHashes.get("dirty.txt"), dirtyHash);
+		assert.notEqual(after.hash, before.hash);
+		// A Git-reported worktree deletion is a stable fingerprint state (the
+		// in-scope git mv rename flow depends on it), not an instability.
+		await rm(path.join(repo.dir, "base.txt"));
+		const deleted = captureGitFingerprint(repo.dir);
+		assert.ok(deleted);
+		assert.ok(deleted.pathHashes.get("base.txt"), "a Git-reported deletion must still join the path hashes");
+		const repeat = captureGitFingerprint(repo.dir);
+		assert.ok(repeat);
+		assert.equal(repeat.hash, deleted.hash);
 	} finally {
 		await repo.cleanup();
 	}

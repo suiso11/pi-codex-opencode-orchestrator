@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, type Hash } from "node:crypto";
 import {
 	closeSync,
 	constants as fsConstants,
@@ -8,8 +8,9 @@ import {
 	lstatSync,
 	mkdirSync,
 	openSync,
-	readFileSync,
-	statSync,
+	readSync,
+	readlinkSync,
+	type Stats,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
@@ -448,13 +449,168 @@ function redactAbsolutePaths(text: string, paths: (string | undefined)[]): strin
 	return text.replace(pattern, "<worktree>");
 }
 
+// Fingerprinted regular files are read from a descriptor in bounded chunks and
+// never buffered whole in memory; a file whose initial size exceeds this cap
+// fails the whole fingerprint closed instead of degrading to a partial hash.
+export const FINGERPRINT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+// Upper bound on one fingerprint read chunk.
+const FINGERPRINT_READ_CHUNK_BYTES = 1024 * 1024;
+
+// O_NOFOLLOW is not available on every platform (Windows libuv lacks it), so it
+// is OR-ed in only where present. Where it is missing, the post-open fstat
+// identity check still catches a swapped-in symlink: the opened descriptor
+// would describe the link target's device/inode instead of the lstat'ed path.
+const O_NOFOLLOW_IF_AVAILABLE = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+
+// Outcome of hashing one working-tree path without following symlinks.
+// ok:false marks an unstable, swapped, oversized, or unsupported path; the
+// caller must fail the whole fingerprint instead of continuing.
+export type PathHashOutcome =
+	| { ok: true; kind: "file" | "symlink" | "special" | "missing" }
+	| { ok: false; reason: string };
+
+// Stable identity of a path: the device/inode pair the kernel reports.
+function samePathIdentity(left: Stats, right: Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+// Stable kind key so a mid-hash type change (e.g. a file replaced by a FIFO)
+// is detectable as an identity change.
+function pathKindKey(stats: Stats): string {
+	if (stats.isFile()) return "file";
+	if (stats.isSymbolicLink()) return "symlink";
+	if (stats.isDirectory()) return "directory";
+	if (stats.isFIFO()) return "fifo";
+	if (stats.isSocket()) return "socket";
+	if (stats.isBlockDevice()) return "block";
+	if (stats.isCharacterDevice()) return "char";
+	return "other";
+}
+
 /**
- * Capture a content-based Git fingerprint of the working tree: tracked worktree
- * diff, staged diff, and nonignored untracked paths with their contents. Paths
- * are NUL-safe (git -z), gitignore-aware (--exclude-standard), and file
- * contents are hashed internally and never exposed. Only path names are kept
- * for the change diagnostic.
+ * Hash one working-tree path for the Git fingerprint without ever following a
+ * symlink and without opening anything other than a verified regular file.
+ *
+ * - lstat decides the kind. A symlink contributes only its own mode and target
+ *   bytes (readlinkSync, never open/read of the target), so an external or
+ *   oversized target can never influence or block the hash.
+ * - A regular file is opened O_RDONLY (plus O_NOFOLLOW where available); the
+ *   opened descriptor's fstat must match the pre-open lstat identity
+ *   (dev/ino/type), the initial size must stay under the hard cap, exactly
+ *   that many bytes are hashed via bounded readSync chunks, and a post-read
+ *   fstat plus a post-close lstat must show size/dev/ino/type unchanged.
+ * - FIFOs, sockets, devices, and directories are never opened (opening a FIFO
+ *   could block forever); only their lstat metadata is hashed, with a second
+ *   lstat confirming the identity did not change.
+ * - A path that is already absent is a stable Git-visible state (deleted dirty
+ *   paths and rename sources) and records the same "<missing>" marker as
+ *   before. Any ENOENT, error, or identity mismatch detected *during* the
+ *   operation (open, read, readlink, re-stat) returns ok:false so the caller
+ *   fails the whole fingerprint closed.
  */
+export function hashPathWithoutFollowing(hash: Hash, file: string): PathHashOutcome {
+	let before: Stats;
+	try {
+		before = lstatSync(file);
+	} catch (error) {
+		if (!isMissingFile(error)) return { ok: false, reason: "path could not be inspected" };
+		hash.update(Buffer.from("<missing>"));
+		return { ok: true, kind: "missing" };
+	}
+	if (before.isSymbolicLink()) {
+		let target: Buffer;
+		try {
+			target = readlinkSync(file, "buffer");
+		} catch {
+			return { ok: false, reason: "symlink target could not be read" };
+		}
+		let after: Stats;
+		let targetAfter: Buffer;
+		try {
+			after = lstatSync(file);
+			targetAfter = readlinkSync(file, "buffer");
+		} catch {
+			return { ok: false, reason: "symlink changed while being hashed" };
+		}
+		if (
+			!after.isSymbolicLink() || !samePathIdentity(before, after) || after.mode !== before.mode ||
+			!targetAfter.equals(target)
+		) {
+			return { ok: false, reason: "symlink identity changed while being hashed" };
+		}
+		hash.update(Buffer.from(`symlink\0${before.mode}:${target.length}\0`, "utf8"));
+		hash.update(target);
+		return { ok: true, kind: "symlink" };
+	}
+	if (
+		before.isDirectory() || before.isFIFO() || before.isSocket() || before.isBlockDevice() ||
+		before.isCharacterDevice()
+	) {
+		let after: Stats;
+		try {
+			after = lstatSync(file);
+		} catch {
+			return { ok: false, reason: "special path changed while being hashed" };
+		}
+		if (!samePathIdentity(before, after) || after.mode !== before.mode || after.size !== before.size ||
+			pathKindKey(before) !== pathKindKey(after)
+		) {
+			return { ok: false, reason: "special path identity changed while being hashed" };
+		}
+		// Only lstat metadata is hashed: a FIFO open could block forever and
+		// device/socket state has no safe byte stream to read.
+		hash.update(
+			Buffer.from(`special\0${before.mode}:${before.size}:${before.dev}:${before.ino}:${before.mtimeMs}\0`, "utf8"),
+		);
+		return { ok: true, kind: "special" };
+	}
+	if (!before.isFile()) return { ok: false, reason: "unsupported path kind" };
+	let fd: number | undefined;
+	try {
+		fd = openSync(file, fsConstants.O_RDONLY | O_NOFOLLOW_IF_AVAILABLE);
+		const opened = fstatSync(fd);
+		if (!opened.isFile() || !samePathIdentity(before, opened) || pathKindKey(opened) !== pathKindKey(before)) {
+			return { ok: false, reason: "opened file does not match the inspected path" };
+		}
+		if (opened.size > FINGERPRINT_MAX_FILE_BYTES) {
+			return { ok: false, reason: "file exceeds the fingerprint size cap" };
+		}
+		hash.update(Buffer.from(`file\0${opened.mode}:${opened.size}\0`, "utf8"));
+		const chunk = Buffer.allocUnsafe(Math.min(FINGERPRINT_READ_CHUNK_BYTES, Math.max(opened.size, 1)));
+		let read = 0;
+		while (read < opened.size) {
+			const want = Math.min(chunk.length, opened.size - read);
+			const got = readSync(fd, chunk, 0, want, read);
+			if (got <= 0) return { ok: false, reason: "file read made no progress" };
+			hash.update(got === chunk.length ? chunk : chunk.subarray(0, got));
+			read += got;
+		}
+		const after = fstatSync(fd);
+		if (!after.isFile() || !samePathIdentity(before, after) || after.size !== opened.size) {
+			return { ok: false, reason: "file changed while being hashed" };
+		}
+		closeSync(fd);
+		fd = undefined;
+		let afterPath: Stats;
+		try {
+			afterPath = lstatSync(file);
+		} catch {
+			return { ok: false, reason: "path changed while being hashed" };
+		}
+		if (!afterPath.isFile() || !samePathIdentity(before, afterPath) || afterPath.size !== opened.size) {
+			return { ok: false, reason: "path was swapped while being hashed" };
+		}
+		return { ok: true, kind: "file" };
+	} catch {
+		return { ok: false, reason: "file could not be hashed" };
+	} finally {
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* preserve the original failure */ }
+		}
+	}
+}
+
 function requiredGit(cwd: string, args: string[]): Buffer | undefined {
 	const result = runGitResult(cwd, args);
 	return result.ok ? result.stdout : undefined;
@@ -502,6 +658,16 @@ function createPatchArchive(baseDir: string, patch: Buffer): string {
 	}
 }
 
+/**
+ * Capture a content-based Git fingerprint of the working tree: tracked worktree
+ * diff, staged diff, and nonignored untracked paths with their contents. Paths
+ * are NUL-safe (git -z), gitignore-aware (--exclude-standard), and every path's
+ * bytes are hashed through hashPathWithoutFollowing, so no symlink is ever
+ * followed, no special file is ever opened, and no whole file is ever buffered
+ * in memory. File contents are hashed internally and never exposed; only path
+ * names are kept for the change diagnostic. Any unstable or oversized path
+ * fails the whole capture closed (undefined).
+ */
 export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 	const worktreeCheck = requiredGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
 	if (!worktreeCheck || worktreeCheck.toString("utf8").trim() !== "true") return undefined;
@@ -531,12 +697,7 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 		paths.add(relative);
 		hash.update(Buffer.from(relative, "utf8"));
 		hash.update(Buffer.from("\0"));
-		try {
-			hash.update(readFileSync(path.join(cwd, relative)));
-		} catch (error) {
-			if (!isMissingFile(error)) return undefined;
-			hash.update(Buffer.from("<missing>"));
-		}
+		if (!hashPathWithoutFollowing(hash, path.join(cwd, relative)).ok) return undefined;
 		hash.update(Buffer.from("\0"));
 	}
 	const status = requiredGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
@@ -555,15 +716,7 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 		const pathHash = createHash("sha256");
 		pathHash.update(statusByPath.get(relative) ?? "");
 		pathHash.update(Buffer.from("\\0worktree-content\\0"));
-		try {
-			const file = path.join(cwd, relative);
-			const stats = statSync(file);
-			pathHash.update(Buffer.from(`${stats.mode}:${stats.size}:`));
-			pathHash.update(readFileSync(file));
-		} catch (error) {
-			if (!isMissingFile(error)) return undefined;
-			pathHash.update(Buffer.from("<missing>"));
-		}
+		if (!hashPathWithoutFollowing(pathHash, path.join(cwd, relative)).ok) return undefined;
 		pathHash.update(Buffer.from("\\0unstaged-diff\\0"));
 		const unstaged = requiredGit(cwd, ["diff", "--no-color", "--binary", "--full-index", "--", relative]);
 		if (!unstaged) return undefined;
