@@ -4,7 +4,7 @@ import test from "node:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } from "./backends/backend.ts";
-import { agentFrontmatterFromTools, buildOpenCodeConfigContent, OpenCodeBackendAdapter } from "./backends/opencode.ts";
+import { agentFrontmatterFromTools, buildOpenCodeConfigContent, effectiveWorkerTools, OpenCodeBackendAdapter } from "./backends/opencode.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
 import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
 import { executorGateError } from "./backends/opencode.ts";
@@ -178,6 +178,79 @@ test("prepare keeps the profile allowlist when no model capability applies", () 
 		assert.doesNotMatch(text, /\n {2}skill: allow/);
 	} finally {
 		adapter.cleanupAgent(preparation.agentName);
+	}
+});
+
+test("effectiveWorkerTools restores tester bash while keeping edit/write excluded", () => {
+	// read_only tester: bash is restored ahead of the mode-filtered profile so
+	// verification shell access survives the head-truncating maxTools cut.
+	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "tester" }, "coding")], ["bash", "read", "glob", "grep"]);
+	// Profiles that already include bash keep their original order.
+	assert.deepEqual([...effectiveWorkerTools({ mode: "write", role: "tester" }, "coding")], ["read", "glob", "grep", "edit", "bash"]);
+	// Reviewer and unroled read_only workers never gain bash.
+	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "reviewer" }, "coding")], ["read", "glob", "grep"]);
+	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: undefined }, "coding")], ["read", "glob", "grep"]);
+});
+
+test("prepare grants read_only testers bash without edit in the agent definition", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+	const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role: "tester" };
+	const preparation = adapter.prepare(spawnInput({ spec }));
+	try {
+		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(bash,read,glob,grep\)/);
+		const text = agentDefinitionText(preparation.agentName);
+		assert.ok(text.includes('  "*": deny'));
+		assert.match(text, /\n {2}bash: allow/);
+		assert.match(text, /\n {2}read: allow/);
+		assert.doesNotMatch(text, /\n {2}edit: allow/);
+		assert.doesNotMatch(text, /\n {2}write: allow/);
+	} finally {
+		adapter.cleanupAgent(preparation.agentName);
+	}
+});
+
+test("prepare keeps bash as a required tester slot when maxTools caps apply", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: { "opencode-go/limited": { maxTools: 2 } },
+	});
+	const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role: "tester" };
+	const preparation = adapter.prepare(spawnInput({ spec, model: "opencode-go/limited" }));
+	try {
+		// The cap trims trailing tools but the reserved bash slot survives.
+		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(bash,read\)/);
+		const text = agentDefinitionText(preparation.agentName);
+		assert.match(text, /\n {2}bash: allow/);
+		assert.doesNotMatch(text, /\n {2}edit: allow/);
+	} finally {
+		adapter.cleanupAgent(preparation.agentName);
+	}
+});
+
+test("prepare denies bash for reviewer and unroled read_only workers", () => {
+	const adapter = new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+	for (const role of ["reviewer", undefined] as const) {
+		const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role };
+		const preparation = adapter.prepare(spawnInput({ spec }));
+		try {
+			const text = agentDefinitionText(preparation.agentName);
+			assert.doesNotMatch(text, /\n {2}bash: allow/);
+			assert.doesNotMatch(text, /\n {2}edit: allow/);
+		} finally {
+			adapter.cleanupAgent(preparation.agentName);
+		}
 	}
 });
 

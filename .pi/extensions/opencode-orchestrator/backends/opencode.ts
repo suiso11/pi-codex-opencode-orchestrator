@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ModelCapability, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
+import type { ModelCapability, TaskSpec, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
 import { enforceToolLimit, resolveToolProfile, TOOL_PROFILES, toolsForProfile } from "../types.ts";
 import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
@@ -154,12 +154,31 @@ export function buildOpenCodeConfigContent(
 	return JSON.stringify({ ...base, ...(override ? { permission } : {}) });
 }
 
+// Effective OpenCode tool set: the mode-filtered profile with bash restored
+// for the tester role. `toolsForProfile` strips bash for read_only, which
+// would silently break the tester contract ("bash is enabled for running
+// tests and verification commands" even in read_only mode, enforced by the
+// role permission override below and matching the Pi backend's tool list).
+// edit/write stay excluded for every role. bash is a required tester slot: it
+// is placed first so the head-truncating maxTools reduction can never drop
+// verification shell access; roles whose profile already includes bash keep
+// the profile order unchanged.
+export function effectiveWorkerTools(
+	spec: Pick<TaskSpec, "mode" | "role" | "toolProfile">,
+	fallback: ToolProfile,
+): readonly string[] {
+	const tools = toolsForProfile(resolveToolProfile(spec, fallback), spec.mode);
+	if (spec.role !== "tester" || tools.includes("bash")) return tools;
+	return ["bash", ...tools];
+}
+
 // OpenCode worker child construction. The tool allowlist is owned by a
 // generated agent definition (so the parent controls the tool set instead of
 // inheriting ambient OpenCode config); the definition is built from the
-// effective tool set, i.e. the profile after maxTools reduction, so tools
-// trimmed by a model capability are actually denied. Role workers get a forced
-// official permission override merged over any valid inline config.
+// effective tool set, i.e. the role-aware profile after maxTools reduction
+// (tester bash is a required slot), so tools trimmed by a model capability are
+// actually denied. Role workers get a forced official permission override
+// merged over any valid inline config.
 export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 	readonly id = "opencode" as const;
 	readonly displayName = "OpenCode";
@@ -183,7 +202,7 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 	prepare(input: BackendSpawnInput): BackendPreparation {
 		const profile = resolveToolProfile(input.spec, this.defaultToolProfile);
 		const capability = this.modelCapabilities[input.model];
-		const tools = enforceToolLimit(toolsForProfile(profile, input.spec.mode), capability);
+		const tools = enforceToolLimit(effectiveWorkerTools(input.spec, this.defaultToolProfile), capability);
 		const agentName = writeAgentDefinition(input.taskId, tools.tools, input.spec.executor === true);
 		const activity = [`agent profile: ${profile} (${tools.tools.join(",")})`];
 		if (tools.reduced && tools.reason) activity.push(`capability: ${tools.reason}`);
