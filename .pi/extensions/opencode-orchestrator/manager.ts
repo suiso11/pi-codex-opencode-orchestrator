@@ -321,6 +321,46 @@ function splitNul(buffer: Buffer): string[] {
 	return buffer.toString("utf8").split("\0").filter((value) => value.length > 0);
 }
 
+// One resolved path/status pair from a `git status --porcelain=v1 -z` record.
+export interface PorcelainStatusEntry {
+	path: string;
+	status: string;
+}
+
+// Parse NUL-delimited porcelain v1 status records into per-path pairs. A plain
+// record is "<XY> path" (untracked entries are "?? path"), but with -z a
+// rename/copy record is a positional pair: "<XY> new" followed by a separate
+// bare record holding the old path. The source record carries no XY prefix,
+// so it must be consumed as the next record and never re-parsed as a status
+// record of its own (a naive slice(3) would corrupt the source path and
+// register a phantom path). Whenever the index or the worktree status is R/C,
+// both the new and old paths are registered with the record's XY status so
+// both sides of the rename join the fingerprint.
+export function parsePorcelainStatusRecords(records: readonly string[]): PorcelainStatusEntry[] {
+	const entries: PorcelainStatusEntry[] = [];
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (record.length === 0) continue;
+		// A status record always carries an XY pair, one space, and at least one
+		// path character; positionally consumed rename sources never reach this
+		// branch, so only a malformed short record degrades to a bare path.
+		if (record.length <= 3 || record[2] !== " ") {
+			entries.push({ path: record, status: "" });
+			continue;
+		}
+		const status = record.slice(0, 2);
+		entries.push({ path: record.slice(3), status });
+		if (status[0] === "R" || status[1] === "R" || status[0] === "C" || status[1] === "C") {
+			const source = records[index + 1];
+			if (source !== undefined && source.length > 0) {
+				entries.push({ path: source, status });
+				index++;
+			}
+		}
+	}
+	return entries;
+}
+
 // A fingerprint is clean when no tracked/staged diff and no nonignored
 // untracked paths exist (paths are captured from porcelain status + untracked).
 function isCleanFingerprint(fp: GitFingerprint) {
@@ -502,15 +542,9 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 	const status = requiredGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
 	if (!status) return undefined;
 	const statusByPath = new Map<string, string>();
-	for (const entry of splitNul(status)) {
-		// porcelain v1 -z entries are "<XY> path"; untracked entries are "?? path".
-		if (entry.length > 3) {
-			const relative = entry.slice(3);
-			paths.add(relative);
-			statusByPath.set(relative, entry.slice(0, 2));
-		} else if (entry.length > 0) {
-			paths.add(entry);
-		}
+	for (const { path: relative, status: xy } of parsePorcelainStatusRecords(splitNul(status))) {
+		paths.add(relative);
+		statusByPath.set(relative, xy);
 	}
 
 	// Capture state for every currently dirty/untracked path. Besides the

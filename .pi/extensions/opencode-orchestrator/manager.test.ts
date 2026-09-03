@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { captureGitFingerprint, OpenCodeTaskManager } from "./manager.ts";
+import { captureGitFingerprint, parsePorcelainStatusRecords, OpenCodeTaskManager } from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
 import { buildWorkerEnv } from "./worker-env.ts";
 
@@ -190,6 +190,42 @@ test("GitFingerprint requires HEAD identity and observes a same-commit branch sw
 	} finally {
 		await repo.cleanup();
 	}
+});
+
+test("porcelain -z parser pairs rename records and preserves plain, untracked, spaced, and Unicode paths", () => {
+	// Plain status records and untracked entries keep their XY and verbatim path.
+	assert.deepEqual(parsePorcelainStatusRecords(["M  a.ts", " D b.ts", "?? 新しい c.txt"]), [
+		{ path: "a.ts", status: "M " },
+		{ path: "b.ts", status: " D" },
+		{ path: "新しい c.txt", status: "??" },
+	]);
+	// Rename records are positional pairs: the bare next record is the old path,
+	// consumed whole (never slice(3)-ed), and both paths share the record's XY.
+	assert.deepEqual(parsePorcelainStatusRecords(["R  src/新しい場所/renamed.txt", "src/古い 場所/old.txt"]), [
+		{ path: "src/新しい場所/renamed.txt", status: "R " },
+		{ path: "src/古い 場所/old.txt", status: "R " },
+	]);
+	// Copy records consume the source record the same way.
+	assert.deepEqual(parsePorcelainStatusRecords(["C  copies/コピー.txt", "コピー 元.txt"]), [
+		{ path: "copies/コピー.txt", status: "C " },
+		{ path: "コピー 元.txt", status: "C " },
+	]);
+	// R/C in either the index or the worktree column triggers source consumption.
+	assert.deepEqual(parsePorcelainStatusRecords(["RM m.txt", "o.txt"]), [
+		{ path: "m.txt", status: "RM" },
+		{ path: "o.txt", status: "RM" },
+	]);
+	assert.deepEqual(parsePorcelainStatusRecords([" R w.txt", "o.txt"]), [
+		{ path: "w.txt", status: " R" },
+		{ path: "o.txt", status: " R" },
+	]);
+	// A source record is consumed positionally, never re-parsed as its own
+	// status record; a trailing source-less rename degrades to the new path.
+	assert.deepEqual(parsePorcelainStatusRecords(["R  b.txt", "?? decoy"]), [
+		{ path: "b.txt", status: "R " },
+		{ path: "?? decoy", status: "R " },
+	]);
+	assert.deepEqual(parsePorcelainStatusRecords(["R  only.txt"]), [{ path: "only.txt", status: "R " }]);
 });
 
 async function fakeMutatingOpenCode(mutation = `writeFileSync("mutated.txt", "changed\\n", "utf8");`) {
@@ -1226,6 +1262,30 @@ test("direct write worker allows an in-scope tracked change", async () => {
 		const [settled] = await manager.wait([started.id]);
 		assert.equal(settled.status, "done");
 		assert.equal(await readFile(path.join(repo.dir, "src/a.txt"), "utf8"), "changed\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write worker allows an in-scope git mv rename", async () => {
+	// `git mv` stages a rename, so the post-run fingerprint must pair the
+	// porcelain v1 -z rename record (`R  new\0old`) instead of parsing the bare
+	// old-path record as a corrupted status record; both paths are in scope.
+	const fake = await fakeMutatingOpenCode('execFileSync("git", ["mv", "src/a.txt", "src/renamed.txt"]);');
+	const repo = await fakeGitRepo();
+	await mkdir(path.join(repo.dir, "src"), { recursive: true });
+	await writeFile(path.join(repo.dir, "src", "a.txt"), "rename me\n", "utf8");
+	repo.git(["add", "src/a.txt"]);
+	repo.git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "rename me"]);
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-git-mv", "write", ["src"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.ok(!existsSync(path.join(repo.dir, "src", "a.txt")), "the rename source must be gone");
+		assert.equal(await readFile(path.join(repo.dir, "src", "renamed.txt"), "utf8"), "rename me\n");
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();
