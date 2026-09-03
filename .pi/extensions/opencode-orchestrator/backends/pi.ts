@@ -45,12 +45,13 @@ export class PiBackendAdapter implements WorkerBackendAdapter {
 		];
 	}
 
-	buildEnv(env: NodeJS.ProcessEnv, _input: BackendSpawnInput): NodeJS.ProcessEnv {
+	buildEnv(env: NodeJS.ProcessEnv, _input: BackendSpawnInput, _preparation?: BackendPreparation): NodeJS.ProcessEnv {
 		return env;
 	}
 
-	cleanupAgent(_agentName: string | undefined): void {
+	cleanupAgent(_agentName: string | undefined, _preparation?: BackendPreparation): string | undefined {
 		// Pi has no agent definition to clean up.
+		return undefined;
 	}
 
 	// Pi output decoding: assistant text is appended at message_end (not

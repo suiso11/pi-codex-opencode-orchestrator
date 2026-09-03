@@ -23,6 +23,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Default worker model: `opencode-go/glm-5.2`
 - Explicit worker roles: `implementer`, `tester`, and `reviewer` with role-specific tool sets, model profiles, and safety behavior
 - Opt-in Executor MCP gateway for explicit OpenCode `implementer` tasks (`executor: true`) when `PI_ORCH_ENABLE_EXECUTOR=1`
+- Fail-closed OpenCode worker configuration isolation with private per-spawn config/agent directories, `--pure`, and project-config disabled
 - Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides; the `reviewer` role always resolves to `high`
 - Interactive `/orch-model` command for persistent parent and worker model changes applied to running sessions without restarting the orchestrator
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
@@ -78,7 +79,7 @@ Other settings:
 - `PI_OPENCODE_BIN`: OpenCode executable, default `opencode`
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
 - `PI_ORCH_ENABLE_EXECUTOR=1`: opt in to the Executor MCP gateway; `PI_EXECUTOR_BIN` optionally selects its executable (default `executor`)
-- `PI_ORCH_WORKER_ENV_ALLOWLIST`: optional comma/space-separated additional environment variable names passed to worker children; workers otherwise receive only runtime variables such as `PATH`, home/temp directories, locale, `CI`, and `OPENCODE_CONFIG_CONTENT`
+- `PI_ORCH_WORKER_ENV_ALLOWLIST`: optional comma/space-separated additional environment variable names passed to worker children; workers otherwise receive only runtime variables such as `PATH`, `HOME`, data/auth paths, temp directories, locale, and `CI`
 - `PI_CODEX_THINKING`: parent thinking level, default `medium`; set `high` for final risky approval or complex planning
 - `PI_OPENCODE_THINKING`: default worker thinking level, default `medium`; each task accepts a per-task `thinking` of `low|medium|high`
 - `/opencode-status`: show the current worker configuration inside Pi
@@ -162,7 +163,7 @@ Each worker route can use either the OpenCode backend or the Pi backend. The Pi 
 
 ### Opt-in Executor MCP gateway
 
-Set `PI_ORCH_ENABLE_EXECUTOR=1` and set `executor: true` on a task to add a local `mcp.executor` server to the generated OpenCode config. It is accepted only for the OpenCode backend with an explicit `role: "implementer"`; disabled, Pi/Collie, reviewer/tester, and no-role requests fail before spawning. The command is fixed to `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]`, and the generated config removes ambient MCP servers; it contains only the manager-generated `mcp.executor` entry when opted in (no other MCP server is inherited). Executor failures are terminal; there is no fallback backend. Keep authentication and other secrets out of task prompts and reports. Worker children receive a small runtime-only environment allowlist rather than the full parent environment. Provider environment keys should normally not be needed because workers use saved CLI authentication; if one is required, add its name explicitly to `PI_ORCH_WORKER_ENV_ALLOWLIST` (values and variable names are never included in worker reports).
+Set `PI_ORCH_ENABLE_EXECUTOR=1` and set `executor: true` on a task to add a local `mcp.executor` server to the generated OpenCode config. It is accepted only for the OpenCode backend with an explicit `role: "implementer"`; disabled, Pi/Collie, reviewer/tester, and no-role requests fail before spawning. The command is fixed to `[PI_EXECUTOR_BIN || "executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"]`. The generated config is fail-closed: ambient `OPENCODE_CONFIG_CONTENT` is discarded and only the manager-generated `mcp.executor` entry is present when opted in. Each worker also gets private `OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME` directories, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, and `--pure`; `HOME`/data locations remain available for saved CLI authentication. Executor failures are terminal; there is no fallback backend. Keep authentication and other secrets out of task prompts and reports. Provider environment keys should normally not be needed because workers use saved CLI authentication; if one is required, add its name explicitly to `PI_ORCH_WORKER_ENV_ALLOWLIST` (values and variable names are never included in worker reports).
 
 ### Experimental Collie backend
 
@@ -222,7 +223,7 @@ When a profile's tool count exceeds a valid `maxTools` (a finite positive intege
 
 ### How it reaches OpenCode
 
-OpenCode resolves agents by **name** from `~/.config/opencode/agent/<name>.md`. Per spawn, the manager writes a frontmatter-only agent definition with a first/default `"*": deny` permission followed by explicit `allow` entries for only the effective tool set (the profile after any `maxTools` reduction), passes `--agent <name>`, and removes the file on close/timeout. The Executor task additionally allows only the `mcp.executor.*` pattern. The parent decides the tool set; ambient global/project/`.opencode` config no longer affects worker tool availability.
+OpenCode resolves agents by **name** from the private per-spawn `OPENCODE_CONFIG_DIR/agent/<name>.md`. Per spawn, the manager writes a frontmatter-only agent definition with a first/default `"*": deny` permission followed by explicit `allow` entries for only the effective tool set (the profile after any `maxTools` reduction), passes `--agent <name>`, and recursively removes the private runtime directory on close/timeout. The Executor task additionally allows only the `mcp.executor.*` pattern. The parent decides the tool set; ambient global/project/`.opencode` config no longer affects worker tool availability.
 
 
 ## Using it in another repository

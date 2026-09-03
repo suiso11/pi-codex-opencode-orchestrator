@@ -102,12 +102,13 @@ export class CollieBackendAdapter implements WorkerBackendAdapter {
 		];
 	}
 
-	buildEnv(env: NodeJS.ProcessEnv, _input: BackendSpawnInput): NodeJS.ProcessEnv {
+	buildEnv(env: NodeJS.ProcessEnv, _input: BackendSpawnInput, _preparation?: BackendPreparation): NodeJS.ProcessEnv {
 		return env;
 	}
 
-	cleanupAgent(_agentName: string | undefined): void {
+	cleanupAgent(_agentName: string | undefined, _preparation?: BackendPreparation): string | undefined {
 		// Collie has no generated agent definition.
+		return undefined;
 	}
 
 	decodeStdoutLine(_line: string, event: Record<string, unknown> | undefined): BackendDecodedLine {

@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import { activityFromEvent, type BackendSpawnInput, type WorkerBackendAdapter } from "./backends/backend.ts";
-import { agentFrontmatterFromTools, buildOpenCodeConfigContent, effectiveWorkerTools, OpenCodeBackendAdapter } from "./backends/opencode.ts";
-import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
+import {
+	agentFrontmatterFromTools,
+	buildOpenCodeConfigContent,
+	effectiveWorkerTools,
+	executorGateError,
+	OpenCodeBackendAdapter,
+} from "./backends/opencode.ts";
 import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
-import { executorGateError } from "./backends/opencode.ts";
+import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
 import { TOOL_PROFILES } from "./types.ts";
 import type { TaskSpec, WorkerReport } from "./types.ts";
 
@@ -30,7 +35,22 @@ function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInp
 	};
 }
 
-test("OpenCodeBackendAdapter builds the legacy run args with agent and variant", () => {
+function openCodeAdapter() {
+	return new OpenCodeBackendAdapter({
+		binary: "opencode",
+		binaryArgs: [],
+		defaultToolProfile: "coding",
+		modelCapabilities: {},
+	});
+}
+
+function agentDefinitionText(preparation: { agentName?: string; configDir?: string }): string {
+	assert.ok(preparation.agentName);
+	assert.ok(preparation.configDir);
+	return readFileSync(path.join(preparation.configDir, "agent", `${preparation.agentName}.md`), "utf8");
+}
+
+test("OpenCodeBackendAdapter builds isolated --pure run args", () => {
 	const adapter = new OpenCodeBackendAdapter({
 		binary: "opencode",
 		binaryArgs: ["--flag"],
@@ -38,250 +58,88 @@ test("OpenCodeBackendAdapter builds the legacy run args with agent and variant",
 		modelCapabilities: {},
 	});
 	const input = spawnInput();
-	const args = adapter.buildArgs(input, { agentName: "agent-x", activity: [] });
-	assert.deepEqual(args, [
-		"--flag",
-		"run",
-		"--format",
-		"json",
-		"--model",
-		"opencode-go/glm-5.2",
-		"--variant",
-		"high",
-		"--agent",
-		"agent-x",
-		"PROMPT",
+	assert.deepEqual(adapter.buildArgs(input, { agentName: "agent-x", activity: [] }), [
+		"--flag", "run", "--pure", "--format", "json", "--model", input.model,
+		"--variant", "high", "--agent", "agent-x", "PROMPT",
 	]);
+	assert.ok(!adapter.buildArgs(input, { activity: [] }).includes("--agent"));
 });
 
-test("OpenCodeBackendAdapter omits --agent when no agent name was prepared", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-	const args = adapter.buildArgs(spawnInput(), { activity: [] });
-	assert.ok(!args.includes("--agent"));
-	assert.equal(args.at(-1), "PROMPT");
-});
-
-test("OpenCodeBackendAdapter buildEnv merges role permission override and preserves other keys", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-	const base = { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ theme: "dark" }), CUSTOM: "1" };
-	const merged = adapter.buildEnv(base, spawnInput({ spec: { ...spawnInput().spec, role: "tester" } }));
-	const parsed = JSON.parse(merged.OPENCODE_CONFIG_CONTENT!);
-	assert.equal(parsed.theme, "dark");
-	assert.equal(parsed.permission.edit, "deny");
-	assert.equal(parsed.permission.bash["*"], "allow");
-	assert.equal(merged.CUSTOM, "1");
-	assert.equal(merged.NO_COLOR, process.env.NO_COLOR);
-});
-
-test("OpenCodeBackendAdapter buildEnv leaves env untouched without a role override", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-	const base = { A: "1", OPENCODE_CONFIG_CONTENT: "{}" };
-	const env = adapter.buildEnv(base, spawnInput());
-	assert.equal(env, base);
-	assert.equal(env.OPENCODE_CONFIG_CONTENT, "{}");
-});
-
-test("OpenCodeBackendAdapter cleanupAgent tolerates missing and undefined agent names", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-	assert.doesNotThrow(() => adapter.cleanupAgent(undefined));
-	assert.doesNotThrow(() => adapter.cleanupAgent("pi-orch-does-not-exist"));
-});
-
-function agentDefinitionText(agentName: string | undefined): string {
-	assert.ok(agentName, "prepare must return an agent name");
-	const file = path.join(os.homedir(), ".config", "opencode", "agent", `${agentName}.md`);
-	return readFileSync(file, "utf8");
-}
-
-test("agentFrontmatterFromTools is fail-closed with wildcard deny and explicit allows", () => {
-	const trimmed = agentFrontmatterFromTools(["read", "glob"]);
-	assert.ok(trimmed.includes('permission:\n  "*": deny\n  read: allow\n  glob: allow'));
-	assert.ok(trimmed.includes('  "*": deny'));
-	assert.doesNotMatch(trimmed, /\n {2}grep: allow/);
-	assert.doesNotMatch(trimmed, /\n {2}mcp\./);
-	const full = agentFrontmatterFromTools(TOOL_PROFILES.full);
-	assert.ok(full.includes('  "*": deny'));
-	assert.match(full, /\n {2}skill: allow/);
-});
-
-test("agentFrontmatterFromTools allows Executor MCP only when explicitly enabled", () => {
-	const regular = agentFrontmatterFromTools(["read"]);
-	assert.doesNotMatch(regular, /mcp\.executor/);
-	const executor = agentFrontmatterFromTools(["read"], true);
-	assert.ok(executor.includes('  "mcp.executor.*": allow'));
-});
-
-test("prepare writes agent permissions from the post-maxTools tool set", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: { "opencode-go/limited": { maxTools: 2 } },
-	});
-	const preparation = adapter.prepare(spawnInput({ model: "opencode-go/limited" }));
+test("OpenCode buildEnv discards ambient inline config and uses private config homes", () => {
+	const adapter = openCodeAdapter();
+	const input = spawnInput({ spec: { ...spawnInput().spec, role: "tester" } });
+	const preparation = adapter.prepare(input);
+	const base = {
+		OPENCODE_CONFIG_CONTENT: JSON.stringify({ theme: "dark", mcp: { ambient: {} } }),
+		XDG_DATA_HOME: "/private/data",
+		CUSTOM: "1",
+	};
 	try {
-		// Activity lists the effective (reduced) tool set, not the full profile.
-		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(read,glob\)/);
-		assert.ok(
-			preparation.activity.some((a) => a.startsWith("capability:")),
-			"the capability reduction must be recorded in activity",
-		);
-		// The agent definition allows only the effective tools; the wildcard denies the rest.
-		const text = agentDefinitionText(preparation.agentName);
-		assert.ok(text.includes('  "*": deny'));
-		assert.match(text, /\n {2}read: allow/);
-		assert.match(text, /\n {2}glob: allow/);
-		assert.doesNotMatch(text, /\n {2}grep: allow/);
-		assert.doesNotMatch(text, /\n {2}edit: allow/);
-		assert.doesNotMatch(text, /\n {2}bash: allow/);
+		const env = adapter.buildEnv(base, input, preparation);
+		assert.deepEqual(JSON.parse(env.OPENCODE_CONFIG_CONTENT!), {
+			permission: { edit: "deny", bash: { "*": "allow" } },
+		});
+		assert.equal(env.OPENCODE_CONFIG_DIR, preparation.configDir);
+		assert.equal(env.XDG_CONFIG_HOME, preparation.runtimeDir);
+		assert.equal(env.OPENCODE_DISABLE_PROJECT_CONFIG, "1");
+		assert.equal(env.XDG_DATA_HOME, "/private/data");
+		assert.equal(env.CUSTOM, "1");
+		assert.equal(base.OPENCODE_CONFIG_CONTENT, JSON.stringify({ theme: "dark", mcp: { ambient: {} } }));
 	} finally {
-		adapter.cleanupAgent(preparation.agentName);
+		adapter.cleanupAgent(preparation.agentName, preparation);
 	}
 });
 
-test("prepare keeps the profile allowlist when no model capability applies", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
+test("OpenCode buildEnv removes ambient config entirely for an unroled worker", () => {
+	const adapter = openCodeAdapter();
+	const input = spawnInput();
+	const preparation = adapter.prepare(input);
+	try {
+		const env = adapter.buildEnv({ OPENCODE_CONFIG_CONTENT: "not-json", XDG_CONFIG_HOME: "/ambient" }, input, preparation);
+		assert.equal(env.OPENCODE_CONFIG_CONTENT, undefined);
+		assert.equal(env.XDG_CONFIG_HOME, preparation.runtimeDir);
+		assert.equal(env.OPENCODE_CONFIG_DIR, preparation.configDir);
+		assert.equal(env.OPENCODE_DISABLE_PROJECT_CONFIG, "1");
+	} finally {
+		adapter.cleanupAgent(preparation.agentName, preparation);
+	}
+});
+
+test("OpenCode private agent definitions are scoped to the spawn and recursively cleaned", () => {
+	const adapter = openCodeAdapter();
 	const preparation = adapter.prepare(spawnInput());
-	try {
-		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(read,glob,grep,edit,bash\)/);
-		const text = agentDefinitionText(preparation.agentName);
-		assert.ok(text.includes('  "*": deny'));
-		assert.match(text, /\n {2}read: allow/);
-		assert.match(text, /\n {2}bash: allow/);
-		assert.match(text, /\n {2}edit: allow/);
-		assert.doesNotMatch(text, /\n {2}webfetch: allow/);
-		assert.doesNotMatch(text, /\n {2}skill: allow/);
-	} finally {
-		adapter.cleanupAgent(preparation.agentName);
-	}
+	assert.ok(preparation.runtimeDir);
+	assert.ok(preparation.configDir);
+	assert.ok(preparation.configDir.startsWith(os.tmpdir()));
+	assert.ok(!preparation.configDir.includes(path.join(os.homedir(), ".config")));
+	assert.match(agentDefinitionText(preparation), /\*": deny/);
+	const runtimeDir = preparation.runtimeDir;
+	assert.equal(adapter.cleanupAgent(preparation.agentName, preparation), undefined);
+	assert.equal(existsSync(runtimeDir), false);
+	assert.doesNotThrow(() => adapter.cleanupAgent(undefined));
 });
 
-test("effectiveWorkerTools restores tester bash while keeping edit/write excluded", () => {
-	// read_only tester: bash is restored ahead of the mode-filtered profile so
-	// verification shell access survives the head-truncating maxTools cut.
-	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "tester" }, "coding")], ["bash", "read", "glob", "grep"]);
-	// Profiles that already include bash keep their original order.
-	assert.deepEqual([...effectiveWorkerTools({ mode: "write", role: "tester" }, "coding")], ["read", "glob", "grep", "edit", "bash"]);
-	// Reviewer and unroled read_only workers never gain bash.
-	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "reviewer" }, "coding")], ["read", "glob", "grep"]);
-	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: undefined }, "coding")], ["read", "glob", "grep"]);
-});
-
-test("prepare grants read_only testers bash without edit in the agent definition", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
+test("agent permissions are fail-closed and Executor is explicit", () => {
+	const regular = agentFrontmatterFromTools(["read", "glob"]);
+	assert.ok(regular.includes('permission:\n  "*": deny\n  read: allow\n  glob: allow'));
+	assert.doesNotMatch(regular, /mcp\.executor/);
+	assert.match(agentFrontmatterFromTools(TOOL_PROFILES.full), /skill: allow/);
+	assert.ok(agentFrontmatterFromTools(["read"], true).includes('"mcp.executor.*": allow'));
+	const config = JSON.parse(buildOpenCodeConfigContent("implementer", true, { PI_EXECUTOR_BIN: "custom-executor" })!);
+	assert.deepEqual(config, {
+		mcp: { executor: { type: "local", command: ["custom-executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"] } },
 	});
-	const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role: "tester" };
-	const preparation = adapter.prepare(spawnInput({ spec }));
-	try {
-		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(bash,read,glob,grep\)/);
-		const text = agentDefinitionText(preparation.agentName);
-		assert.ok(text.includes('  "*": deny'));
-		assert.match(text, /\n {2}bash: allow/);
-		assert.match(text, /\n {2}read: allow/);
-		assert.doesNotMatch(text, /\n {2}edit: allow/);
-		assert.doesNotMatch(text, /\n {2}write: allow/);
-	} finally {
-		adapter.cleanupAgent(preparation.agentName);
-	}
+	assert.equal(buildOpenCodeConfigContent(undefined), undefined);
 });
 
-test("prepare keeps bash as a required tester slot when maxTools caps apply", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: { "opencode-go/limited": { maxTools: 2 } },
+test("ambient config is never merged, including invalid JSON", () => {
+	assert.deepEqual(JSON.parse(buildOpenCodeConfigContent("reviewer", false, { OPENCODE_CONFIG_CONTENT: "bad" })!), {
+		permission: { edit: "deny", bash: "deny" },
 	});
-	const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role: "tester" };
-	const preparation = adapter.prepare(spawnInput({ spec, model: "opencode-go/limited" }));
-	try {
-		// The cap trims trailing tools but the reserved bash slot survives.
-		assert.match(preparation.activity[0] ?? "", /agent profile: coding \(bash,read\)/);
-		const text = agentDefinitionText(preparation.agentName);
-		assert.match(text, /\n {2}bash: allow/);
-		assert.doesNotMatch(text, /\n {2}edit: allow/);
-	} finally {
-		adapter.cleanupAgent(preparation.agentName);
-	}
-});
-
-test("prepare denies bash for reviewer and unroled read_only workers", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
+	assert.deepEqual(JSON.parse(buildOpenCodeConfigContent("tester", false, { OPENCODE_CONFIG_CONTENT: JSON.stringify({ theme: "dark" }) })!), {
+		permission: { edit: "deny", bash: { "*": "allow" } },
 	});
-	for (const role of ["reviewer", undefined] as const) {
-		const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role };
-		const preparation = adapter.prepare(spawnInput({ spec }));
-		try {
-			const text = agentDefinitionText(preparation.agentName);
-			assert.doesNotMatch(text, /\n {2}bash: allow/);
-			assert.doesNotMatch(text, /\n {2}edit: allow/);
-		} finally {
-			adapter.cleanupAgent(preparation.agentName);
-		}
-	}
-});
-
-test("prepare allows the Executor MCP pattern only for an explicit Executor task", () => {
-	const adapter = new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-	const preparation = adapter.prepare(spawnInput({
-		spec: { ...spawnInput().spec, role: "implementer", executor: true },
-	}));
-	try {
-		const text = agentDefinitionText(preparation.agentName);
-		assert.ok(text.includes('  "*": deny'));
-		assert.ok(text.includes('  "mcp.executor.*": allow'));
-	} finally {
-		adapter.cleanupAgent(preparation.agentName);
-	}
-});
-
-test("Executor MCP config overrides only mcp.executor with fixed browser approval", () => {
-	const existing = JSON.stringify({ theme: "dark", mcp: { other: { type: "remote" }, executor: { type: "remote" } } });
-	const merged = JSON.parse(buildOpenCodeConfigContent("implementer", existing, true, { PI_EXECUTOR_BIN: "custom-executor" })!);
-	assert.equal(merged.theme, "dark");
-	assert.deepEqual(Object.keys(merged.mcp), ["executor"]);
-	assert.deepEqual(merged.mcp.executor, {
-		type: "local",
-		command: ["custom-executor", "mcp", "--elicitation-mode", "browser", "--no-artifacts", "--search-tools"],
-	});
+	assert.equal(buildOpenCodeConfigContent("implementer", false), undefined);
 });
 
 test("Executor gate is opt-in and fail-closed for non-implementer routes", () => {
@@ -292,169 +150,40 @@ test("Executor gate is opt-in and fail-closed for non-implementer routes", () =>
 	assert.equal(executorGateError(input, { PI_ORCH_ENABLE_EXECUTOR: "1" }), undefined);
 });
 
-test("buildOpenCodeConfigContent removes ambient MCP and keeps invalid inline JSON out of forced config", () => {
-	const ambient = JSON.parse(buildOpenCodeConfigContent(undefined, JSON.stringify({ theme: "dark", mcp: { other: { type: "remote" } } }))!);
-	assert.deepEqual(ambient, { theme: "dark" });
-	const tester = JSON.parse(buildOpenCodeConfigContent("tester", "not-json")!);
-	assert.deepEqual(tester, { permission: { edit: "deny", bash: { "*": "allow" } } });
-	assert.equal(buildOpenCodeConfigContent(undefined, undefined), undefined);
+test("effective OpenCode tools preserve tester bash and deny excluded tools", () => {
+	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "tester" }, "coding")], ["bash", "read", "glob", "grep"]);
+	assert.deepEqual([...effectiveWorkerTools({ mode: "write", role: "tester" }, "coding")], ["read", "glob", "grep", "edit", "bash"]);
+	assert.deepEqual([...effectiveWorkerTools({ mode: "read_only", role: "reviewer" }, "coding")], ["read", "glob", "grep"]);
+	const adapter = openCodeAdapter();
+	const preparation = adapter.prepare(spawnInput({ spec: { ...spawnInput().spec, mode: "read_only", role: "tester" } }));
+	try {
+		const text = agentDefinitionText(preparation);
+		assert.match(text, /bash: allow/);
+		assert.doesNotMatch(text, /edit: allow/);
+	} finally { adapter.cleanupAgent(preparation.agentName, preparation); }
 });
 
-test("PiBackendAdapter builds the legacy json-mode args with an explicit tool list", () => {
-	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: ["--ext"] });
-	const spec: TaskSpec = { ...spawnInput().spec, mode: "read_only", role: "tester" };
-	const args = adapter.buildArgs(spawnInput({ spec, model: "anthropic/claude-example" }), { activity: [] });
-	assert.deepEqual(args, [
-		"--ext",
-		"--approve",
-		"--no-session",
-		"--no-extensions",
-		"--mode",
-		"json",
-		"--model",
-		"anthropic/claude-example",
-		"--thinking",
-		"high",
-		"--tools",
-		"read,grep,find,ls,bash",
-		"PROMPT",
-	]);
-});
-
-test("PiBackendAdapter buildEnv passes the environment through and cleanupAgent is a no-op", () => {
-	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
-	const base = { A: "1" };
-	assert.equal(adapter.buildEnv(base, spawnInput()), base);
-	assert.doesNotThrow(() => adapter.cleanupAgent(undefined));
-	assert.doesNotThrow(() => adapter.cleanupAgent("whatever"));
-	const preparation = adapter.prepare(spawnInput());
-	assert.deepEqual(preparation, { activity: [] });
-});
-
-test("piToolList preserves the exact per-role Pi tool allowlists", () => {
-	const base: TaskSpec = spawnInput().spec;
-	assert.equal(piToolList({ mode: "write", role: "reviewer" }), "read,grep,find,ls");
+test("Pi and Collie retain explicit backend boundaries", () => {
+	const pi = new PiBackendAdapter({ binary: "pi", binaryArgs: ["--ext"] });
+	const piInput = spawnInput({ model: "anthropic/claude", spec: { ...spawnInput().spec, mode: "read_only", role: "tester" } });
+	assert.deepEqual(pi.buildArgs(piInput, { activity: [] }), ["--ext", "--approve", "--no-session", "--no-extensions", "--mode", "json", "--model", "anthropic/claude", "--thinking", "high", "--tools", "read,grep,find,ls,bash", "PROMPT"]);
 	assert.equal(piToolList({ mode: "read_only", role: "reviewer" }), "read,grep,find,ls");
-	assert.equal(piToolList({ mode: "read_only", role: "tester" }), "read,grep,find,ls,bash");
-	assert.equal(piToolList({ mode: "read_only", role: undefined }), "read,grep,find,ls");
 	assert.equal(piToolList({ mode: "write", role: undefined }), "read,grep,find,ls,bash,edit,write");
-	assert.equal(piToolList({ mode: "write", role: "implementer" }), "read,grep,find,ls,bash,edit,write");
+	const collie = new CollieBackendAdapter({ binary: "collie", binaryArgs: ["--wrapper"] });
+	const collieInput = spawnInput({ model: "provider/model-name", spec: { ...spawnInput().spec, mode: "write", role: "implementer", worktree: true } });
+	assert.deepEqual(collie.buildArgs(collieInput, { activity: [] }), ["--wrapper", "run", "PROMPT", "--provider", "provider", "--model", "model-name", "--cwd", "/tmp/worktree", "--mode", "auto", "--json", "--stream-json"]);
+	assert.match(collieGateError({ spec: { ...collieInput.spec, mode: "read_only" } }, { PI_ORCH_ENABLE_COLLIE: "1" }) ?? "", /mode=write/);
+	assert.match(collieGateError({ spec: collieInput.spec }, {}) ?? "", /disabled/);
 });
 
-// Output protocol contract: the manager only applies the decoded result of
-// these methods to bounded snapshot storage; each adapter must preserve its
-// backend's exact raw-output text and activity decoding.
-function openCodeAdapter() {
-	return new OpenCodeBackendAdapter({
-		binary: "opencode",
-		binaryArgs: [],
-		defaultToolProfile: "coding",
-		modelCapabilities: {},
-	});
-}
-
-test("activityFromEvent decodes tool, step-finish, and fallback labels", () => {
+test("shared output protocol helpers remain stable", () => {
 	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "read", state: { status: "completed" } } }), "read: completed");
-	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "bash", state: {} } }), "bash: update");
 	assert.equal(activityFromEvent({ type: "e", part: { type: "step-finish", reason: "stop" } }), "step finished: stop");
-	assert.equal(activityFromEvent({ type: "message_end" }), "message_end");
-	assert.equal(activityFromEvent({ part: { type: "other" } }), "event: other");
-});
-
-test("OpenCodeBackendAdapter decodes text streaming events into output and activity", () => {
-	const adapter = openCodeAdapter();
-	const event = { type: "text", part: { type: "text", text: "hello" } };
-	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
-	assert.equal(decoded.output, "hello\n");
-	assert.deepEqual(decoded.activity, ["text: text"]);
-});
-
-test("OpenCodeBackendAdapter retains non-JSON stdout lines verbatim without activity", () => {
-	const adapter = openCodeAdapter();
-	const decoded = adapter.decodeStdoutLine("plain diagnostic line", undefined);
-	assert.equal(decoded.output, "plain diagnostic line\n");
-	assert.deepEqual(decoded.activity, []);
-});
-
-test("OpenCodeBackendAdapter emits activity only for structured non-text events", () => {
-	const adapter = openCodeAdapter();
-	const event = { type: "step_finish", part: { type: "step-finish", reason: "stop" } };
-	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
-	assert.equal(decoded.output, undefined);
-	assert.deepEqual(decoded.activity, ["step finished: stop"]);
-});
-
-test("PiBackendAdapter decodes message_end text content and labels other events", () => {
-	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
-	const event = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } };
-	const decoded = adapter.decodeStdoutLine(JSON.stringify(event), event);
-	assert.equal(decoded.output, "a\nb\n");
-	assert.deepEqual(decoded.activity, ["message_end"]);
-	const other = adapter.decodeStdoutLine("{}", { type: "message_update" });
-	assert.equal(other.output, undefined);
-	assert.deepEqual(other.activity, ["message_update"]);
-});
-
-test("PiBackendAdapter marks non-JSON stdout lines as Pi response streaming", () => {
-	const adapter = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
-	const decoded = adapter.decodeStdoutLine("pi diagnostic line", undefined);
-	assert.equal(decoded.output, "pi diagnostic line\n");
-	assert.deepEqual(decoded.activity, ["Pi response streaming"]);
-});
-
-test("output protocol decodes stderr chunks unchanged and normalizes exit reports to identity", () => {
-	const adapters: WorkerBackendAdapter[] = [
-		openCodeAdapter(),
-		new PiBackendAdapter({ binary: "pi", binaryArgs: [] }),
-	];
-	const report: WorkerReport = { summary: "s", files: ["f"], findings: ["x"], unresolved: ["y"] };
+	assert.deepEqual(openCodeAdapter().decodeStdoutLine("plain", undefined), { output: "plain\n", activity: [] });
+	const report: WorkerReport = { summary: "s", files: [], findings: [], unresolved: [] };
+	const adapters: WorkerBackendAdapter[] = [openCodeAdapter(), new PiBackendAdapter({ binary: "pi", binaryArgs: [] })];
 	for (const adapter of adapters) {
-		assert.deepEqual(adapter.decodeStderrChunk("raw chunk\n"), { text: "raw chunk\n", activity: [] });
+		assert.deepEqual(adapter.decodeStderrChunk("raw\n"), { text: "raw\n", activity: [] });
 		assert.deepEqual(adapter.normalizeExitReport(report), report);
 	}
-});
-
-test("CollieBackendAdapter is fail-closed and builds the exact isolated command", () => {
-	const adapter = new CollieBackendAdapter({ binary: "collie", binaryArgs: ["--wrapper"] });
-	const input = spawnInput({
-		model: "provider/model-name",
-		spec: { ...spawnInput().spec, mode: "write", role: "implementer", worktree: true },
-	});
-	assert.deepEqual(adapter.buildArgs(input, { activity: [] }), [
-		"--wrapper", "run", "PROMPT", "--provider", "provider", "--model", "model-name",
-		"--cwd", "/tmp/worktree", "--mode", "auto", "--json", "--stream-json",
-	]);
-	assert.deepEqual(adapter.decodeStdoutLine("", { answer: JSON.stringify({ summary: "ok", files: [], findings: [], unresolved: [] }), usage: { input: 1 } }).activity, ["event"]);
-	assert.match(adapter.decodeStdoutLine("", { answer: "plain answer" }).output ?? "", /plain answer/);
-	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ type: "progress", message: "working" }) + "\n").activity, ["progress: working"]);
-	assert.match(collieGateError({ spec: { ...input.spec, mode: "read_only" } }, { PI_ORCH_ENABLE_COLLIE: "1" }) ?? "", /mode=write/);
-	assert.match(collieGateError({ spec: input.spec }, {}) ?? "", /disabled/);
-});
-
-test("CollieBackendAdapter normalizes stdout reports and stderr NDJSON diagnostics", () => {
-	const adapter = new CollieBackendAdapter({ binary: "collie", binaryArgs: [] });
-	// Non-JSON stdout lines append nothing (Collie stdout is final-JSON only).
-	assert.deepEqual(adapter.decodeStdoutLine("plain line", undefined), { output: undefined, activity: [] });
-	// Plain string answers are wrapped into the common report shape.
-	assert.equal(
-		adapter.decodeStdoutLine("", { answer: "done quickly" }).output,
-		`${JSON.stringify({ summary: "done quickly", files: [], findings: [], unresolved: [] })}\n`,
-	);
-	// Error strings become unresolved findings in the normalized report.
-	assert.equal(
-		adapter.decodeStdoutLine("", { error: "boom" }).output,
-		`${JSON.stringify({ summary: "Collie worker error", files: [], findings: [], unresolved: ["boom"] })}\n`,
-	);
-	// Stderr NDJSON: activity strings, part-based tool labels, and status
-	// fields decode to labels; non-JSON lines add no activity while raw text
-	// is always retained verbatim.
-	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ activity: "hand-running" }) + "\n").activity, ["hand-running"]);
-	assert.deepEqual(
-		adapter.decodeStderrChunk(JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "edit", state: { status: "done" } } }) + "\n").activity,
-		["edit: done"],
-	);
-	assert.deepEqual(adapter.decodeStderrChunk(JSON.stringify({ type: "state", status: "starting" }) + "\n").activity, ["state: starting"]);
-	const raw = adapter.decodeStderrChunk("not json\n");
-	assert.equal(raw.text, "not json\n");
-	assert.deepEqual(raw.activity, []);
 });

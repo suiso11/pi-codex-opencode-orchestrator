@@ -1,14 +1,16 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ModelCapability, TaskSpec, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
 import { enforceToolLimit, resolveToolProfile, TOOL_PROFILES, toolsForProfile } from "../types.ts";
 import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
-function opencodeAgentDir(): string {
-	// OpenCode resolves agents by name from ~/.config/opencode/agent/ on every platform.
-	return path.join(os.homedir(), ".config", "opencode", "agent");
+// The generated agent definition lives inside the per-spawn private runtime
+// dir: `<runtimeDir>/opencode/agent/<name>.md`, where `<runtimeDir>/opencode`
+// is exactly the directory forced as OPENCODE_CONFIG_DIR on the child.
+function agentFilePath(configDir: string, name: string): string {
+	return path.join(configDir, "agent", `${name}.md`);
 }
 
 // The OpenCode tool universe is the "full" profile. Start with a default
@@ -32,23 +34,21 @@ export function agentFrontmatterFromTools(allowed: readonly string[], executor =
 	].join("\n");
 }
 
-function writeAgentDefinition(taskId: string, allowedTools: readonly string[], executor = false): string {
+function writeAgentDefinition(configDir: string, taskId: string, allowedTools: readonly string[], executor = false): string {
 	const frontmatter = agentFrontmatterFromTools(allowedTools, executor);
 	const body = "You are a bounded worker delegated by a parent Pi orchestrator. Follow the repository's AGENTS.md. Do not read secrets or git-ignored runtime configuration. Stay within the declared scope and report missing scope instead of broadening the task.";
-	const dir = opencodeAgentDir();
+	const dir = path.join(configDir, "agent");
 	mkdirSync(dir, { recursive: true });
 	const name = `pi-orch-${taskId}-${randomBytes(4).toString("hex")}`;
-	const file = path.join(dir, `${name}.md`);
+	const file = agentFilePath(configDir, name);
 	writeFileSync(file, `${frontmatter}
 ${body}
 `, { encoding: "utf-8" });
 	return name;
 }
 
-function cleanupAgentDefinition(name: string | undefined) {
-	if (!name) return;
-	const file = path.join(opencodeAgentDir(), `${name}.md`);
-	try { unlinkSync(file); } catch { /* already removed or missing */ }
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 interface RolePermissionOverride {
@@ -90,68 +90,33 @@ function rolePermissionOverride(role: WorkerRole | undefined): RolePermissionOve
 }
 
 /**
- * Merge a valid existing OPENCODE_CONFIG_CONTENT with the role-specific
- * permission override for the OpenCode child. Any existing top-level keys and
- * non-forced permission keys are preserved, except ambient MCP servers; an
- * invalid existing value is ignored in favor of the forced override. Executor
- * mode installs only the manager-generated mcp.executor entry. Returns
- * undefined when no existing config or forced setting is present.
+ * Build the forced inline config for an OpenCode worker child, fail-closed.
+ * Ambient OPENCODE_CONFIG_CONTENT is never merged or preserved: the returned
+ * config contains only the manager-generated role permission override and,
+ * for explicitly opted-in Executor tasks, the single manager-generated
+ * mcp.executor entry. Returns undefined when neither is present; the caller
+ * then removes OPENCODE_CONFIG_CONTENT from the child environment entirely.
  */
 export function buildOpenCodeConfigContent(
 	role: WorkerRole | undefined,
-	existingContent: string | undefined,
 	executor = false,
 	env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
 	const override = rolePermissionOverride(role);
-	if (!override && !executor && !existingContent) return undefined;
-	let base: Record<string, unknown> = {};
-	let parsedExisting = false;
-	if (existingContent) {
-		try {
-			const parsed: unknown = JSON.parse(existingContent);
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				base = parsed as Record<string, unknown>;
-				parsedExisting = true;
-			}
-		} catch {
-			// Invalid existing inline config is ignored when a forced config is
-			// needed; otherwise preserve it so OpenCode reports the parse error.
-			if (!override && !executor) return existingContent;
-		}
-	}
-	// Never inherit ambient MCP servers. The only MCP entry a worker may see is
-	// the manager-generated Executor gateway below when explicitly opted in.
-	const hadAmbientMcp = Object.prototype.hasOwnProperty.call(base, "mcp");
-	delete base.mcp;
-	let permission: Record<string, unknown> | undefined;
+	if (!override && !executor) return undefined;
+	const config: Record<string, unknown> = {};
 	if (override) {
-		permission = base.permission && typeof base.permission === "object" && !Array.isArray(base.permission)
-			? { ...(base.permission as Record<string, unknown>) }
-			: {};
-		permission.edit = override.edit;
-		if (override.bash === "deny") {
-			permission.bash = "deny";
-		} else {
-			const existingBash = permission.bash && typeof permission.bash === "object" && !Array.isArray(permission.bash)
-				? { ...(permission.bash as Record<string, unknown>) }
-				: {};
-			// Remove any prior "*" rule and re-insert it last so the forced override
-			// is the final matching bash rule.
-			delete existingBash["*"];
-			existingBash["*"] = override.bash["*"];
-			permission.bash = existingBash;
-		}
+		// Official permission semantics: edit covers edit/write/patch, and the
+		// last matching bash rule wins. The forced bash rule is the only rule
+		// and therefore always wins; bash immutability is never claimed.
+		config.permission = override.bash === "deny"
+			? { edit: override.edit, bash: "deny" }
+			: { edit: override.edit, bash: { "*": override.bash["*"] } };
 	}
 	if (executor) {
-		const mcp = base.mcp && typeof base.mcp === "object" && !Array.isArray(base.mcp)
-			? { ...(base.mcp as Record<string, unknown>) }
-			: {};
-		mcp[EXECUTOR_CONFIG_KEY] = { type: "local", command: executorCommand(env) };
-		base.mcp = mcp;
+		config.mcp = { [EXECUTOR_CONFIG_KEY]: { type: "local", command: executorCommand(env) } };
 	}
-	if (!override && !executor && parsedExisting && !hadAmbientMcp) return existingContent;
-	return JSON.stringify({ ...base, ...(override ? { permission } : {}) });
+	return JSON.stringify(config);
 }
 
 // Effective OpenCode tool set: the mode-filtered profile with bash restored
@@ -177,8 +142,8 @@ export function effectiveWorkerTools(
 // inheriting ambient OpenCode config); the definition is built from the
 // effective tool set, i.e. the role-aware profile after maxTools reduction
 // (tester bash is a required slot), so tools trimmed by a model capability are
-// actually denied. Role workers get a forced official permission override
-// merged over any valid inline config.
+// actually denied. Role workers get a manager-generated permission config;
+// ambient inline config is discarded rather than merged.
 export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 	readonly id = "opencode" as const;
 	readonly displayName = "OpenCode";
@@ -203,16 +168,28 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		const profile = resolveToolProfile(input.spec, this.defaultToolProfile);
 		const capability = this.modelCapabilities[input.model];
 		const tools = enforceToolLimit(effectiveWorkerTools(input.spec, this.defaultToolProfile), capability);
-		const agentName = writeAgentDefinition(input.taskId, tools.tools, input.spec.executor === true);
-		const activity = [`agent profile: ${profile} (${tools.tools.join(",")})`];
-		if (tools.reduced && tools.reason) activity.push(`capability: ${tools.reason}`);
-		return { agentName, activity };
+		// Private per-spawn runtime isolation: a fresh mkdtemp directory holds
+		// the generated agent definition under its OpenCode config dir, so the
+		// worker never reads or writes the user's ambient OpenCode config.
+		const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "pi-opencode-worker-"));
+		const configDir = path.join(runtimeDir, "opencode");
+		try {
+			const agentName = writeAgentDefinition(configDir, input.taskId, tools.tools, input.spec.executor === true);
+			const activity = [`agent profile: ${profile} (${tools.tools.join(",")})`];
+			if (tools.reduced && tools.reason) activity.push(`capability: ${tools.reason}`);
+			return { agentName, runtimeDir, configDir, activity };
+		} catch (error) {
+			try { rmSync(runtimeDir, { recursive: true, force: true }); } catch { /* preserve preparation failure */ }
+			throw error;
+		}
 	}
 
 	buildArgs(input: BackendSpawnInput, preparation: BackendPreparation): string[] {
 		return [
 			...this.binaryArgs,
 			"run",
+			// Official CLI flag (1.18.18): run without ambient user config side effects.
+			"--pure",
 			"--format",
 			"json",
 			"--model",
@@ -224,19 +201,42 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		];
 	}
 
-	buildEnv(env: NodeJS.ProcessEnv, input: BackendSpawnInput): NodeJS.ProcessEnv {
-		const mergedConfig = buildOpenCodeConfigContent(
-			input.spec.role,
-			env.OPENCODE_CONFIG_CONTENT,
-			input.spec.executor === true,
-			env,
-		);
-		if (mergedConfig === undefined || mergedConfig === env.OPENCODE_CONFIG_CONTENT) return env;
-		return { ...env, OPENCODE_CONFIG_CONTENT: mergedConfig };
+	buildEnv(env: NodeJS.ProcessEnv, input: BackendSpawnInput, preparation: BackendPreparation): NodeJS.ProcessEnv {
+		if (!preparation.runtimeDir || !preparation.configDir) {
+			throw new Error("OpenCode worker preparation is missing its private config directories.");
+		}
+		const next: NodeJS.ProcessEnv = { ...env };
+		// Fail-closed: ambient OpenCode config selectors and inline config are
+		// discarded; the child only ever sees the manager-generated config.
+		delete next.OPENCODE_CONFIG;
+		delete next.XDG_CONFIG_DIRS;
+		const forced = buildOpenCodeConfigContent(input.spec.role, input.spec.executor === true, env);
+		if (forced === undefined) delete next.OPENCODE_CONFIG_CONTENT;
+		else next.OPENCODE_CONFIG_CONTENT = forced;
+		// Private per-spawn config isolation: ambient global/project config,
+		// plugins, and MCP servers cannot reach the worker. HOME/USERPROFILE/
+		// XDG_DATA_HOME/LOCALAPPDATA are deliberately left untouched so saved
+		// CLI authentication keeps working. XDG_CONFIG_HOME is the exception:
+		// it is private above so global config cannot leak into this worker.
+		next.OPENCODE_CONFIG_DIR = preparation.configDir;
+		next.XDG_CONFIG_HOME = preparation.runtimeDir;
+		next.OPENCODE_DISABLE_PROJECT_CONFIG = "1";
+		return next;
 	}
 
-	cleanupAgent(agentName: string | undefined): void {
-		cleanupAgentDefinition(agentName);
+	cleanupAgent(agentName: string | undefined, preparation?: BackendPreparation): string | undefined {
+		if (!preparation?.runtimeDir) return undefined;
+		const errors: string[] = [];
+		if (agentName && preparation.configDir) {
+			try { unlinkSync(agentFilePath(preparation.configDir, agentName)); } catch (error) {
+				const code = (error as NodeJS.ErrnoException | null)?.code;
+				if (code !== "ENOENT") errors.push(`agent definition cleanup failed: ${errorMessage(error)}`);
+			}
+		}
+		try { rmSync(preparation.runtimeDir, { recursive: true, force: true }); } catch (error) {
+			errors.push(`runtime dir cleanup failed: ${errorMessage(error)}`);
+		}
+		return errors.length > 0 ? errors.join("; ") : undefined;
 	}
 
 	// OpenCode output decoding: text streaming events (`type: "text"` with

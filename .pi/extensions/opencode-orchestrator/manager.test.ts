@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { buildOpenCodeConfigContent } from "./backends/opencode.ts";
 import { captureGitFingerprint, OpenCodeTaskManager } from "./manager.ts";
 import { clearAmbientModelConfigEnv } from "./test-helpers.ts";
 import { buildWorkerEnv } from "./worker-env.ts";
@@ -220,6 +219,28 @@ async function fakeEchoEnv() {
 		`
 const value = process.env.OPENCODE_CONFIG_CONTENT ?? "";
 process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: value } }) + "\\n");
+`,
+	);
+	return {
+		binary: process.execPath,
+		binaryArgs: [script],
+		cleanup: () => rm(dir, { recursive: true, force: true }),
+	};
+}
+
+async function fakeEchoIsolationEnv() {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "fake-isolation-env-"));
+	const script = path.join(dir, "env.mjs");
+	await writeFile(
+		script,
+		`
+const result = {
+  configDir: process.env.OPENCODE_CONFIG_DIR,
+  xdgConfigHome: process.env.XDG_CONFIG_HOME,
+  dataHome: process.env.XDG_DATA_HOME,
+  disableProject: process.env.OPENCODE_DISABLE_PROJECT_CONFIG,
+};
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: JSON.stringify(result) } }) + "\\n");
 `,
 	);
 	return {
@@ -753,6 +774,30 @@ test("manager passes --agent with a generated definition file to OpenCode worker
 	}
 });
 
+test("manager passes private OpenCode config paths while preserving data-home auth", async () => {
+	const fake = await fakeEchoIsolationEnv();
+	const originalDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = path.join(os.tmpdir(), "pi-opencode-auth-data");
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("config-isolation", "read_only", ["src"]), process.cwd());
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		const env = JSON.parse(settled.output.trim()) as Record<string, string | undefined>;
+		assert.ok(env.configDir?.startsWith(os.tmpdir()));
+		assert.ok(env.xdgConfigHome?.startsWith(os.tmpdir()));
+		assert.notEqual(env.configDir, env.xdgConfigHome);
+		assert.equal(env.dataHome, process.env.XDG_DATA_HOME);
+		assert.equal(env.disableProject, "1");
+		assert.equal(existsSync(env.xdgConfigHome ?? ""), false, "private worker runtime must be cleaned after close");
+	} finally {
+		await manager.dispose();
+		if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
+		else process.env.XDG_DATA_HOME = originalDataHome;
+		await fake.cleanup();
+	}
+});
+
 test("Pi tester tool list includes bash and excludes edit/write", async () => {
 	const fake = await fakeEchoArgs();
 	const repo = await fakeGitRepo();
@@ -926,38 +971,6 @@ test("role-based tester/reviewer model routing honors explicit model and profile
 	}
 });
 
-test("buildOpenCodeConfigContent preserves unrelated config and forces role permissions", () => {
-	const existing = JSON.stringify({
-		theme: "dark",
-		permission: { edit: "allow", read: true, bash: { "*": "deny", "npm test": "allow" } },
-	});
-	const tester = JSON.parse(buildOpenCodeConfigContent("tester", existing)!);
-	assert.equal(tester.theme, "dark");
-	assert.equal(tester.permission.read, true);
-	assert.equal(tester.permission.edit, "deny");
-	assert.deepEqual(tester.permission.bash, { "npm test": "allow", "*": "allow" });
-	assert.equal(Object.keys(tester.permission.bash).at(-1), "*", "forced bash rule must be last");
-	assert.equal(tester.permission.bash["*"], "allow", "tester bash is not immutable; only the final rule wins");
-
-	const reviewer = JSON.parse(buildOpenCodeConfigContent("reviewer", existing)!);
-	assert.equal(reviewer.theme, "dark");
-	assert.equal(reviewer.permission.read, true);
-	assert.equal(reviewer.permission.edit, "deny");
-	assert.equal(reviewer.permission.bash, "deny");
-
-	assert.equal(buildOpenCodeConfigContent("implementer", existing), existing);
-	assert.equal(buildOpenCodeConfigContent(undefined, undefined), undefined);
-});
-
-test("buildOpenCodeConfigContent is deterministic for invalid existing JSON", () => {
-	const invalid = "not-json { broken";
-	const tester = JSON.parse(buildOpenCodeConfigContent("tester", invalid)!);
-	assert.deepEqual(tester, { permission: { edit: "deny", bash: { "*": "allow" } } });
-	const reviewer = JSON.parse(buildOpenCodeConfigContent("reviewer", invalid)!);
-	assert.deepEqual(reviewer, { permission: { edit: "deny", bash: "deny" } });
-	assert.equal(buildOpenCodeConfigContent("implementer", invalid), invalid);
-});
-
 test("manager injects the Executor MCP gateway only for an opted-in OpenCode implementer", async () => {
 	const fake = await fakeEchoEnv();
 	const repo = await fakeGitRepo();
@@ -998,45 +1011,27 @@ test("manager rejects Executor routes before task or worktree creation", async (
 	}
 });
 
-test("manager injects forced role permission config into child OPENCODE_CONFIG_CONTENT", async () => {
+test("manager discards ambient config before launching role workers", async () => {
 	const fake = await fakeEchoEnv();
 	const repo = await fakeGitRepo();
 	const original = process.env.OPENCODE_CONFIG_CONTENT;
 	process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
 		theme: "dark",
-		permission: { edit: "allow", bash: { "*": "deny", "npm test": "allow" } },
+		mcp: { ambient: { type: "remote" } },
 	});
 	try {
-		const manager = new OpenCodeTaskManager({
-			binary: fake.binary,
-			binaryArgs: fake.binaryArgs,
-			timeoutMs: 2_000,
-		});
+		const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
 		try {
-			const tester = manager.spawn(
-				{ ...spec("env-tester", "read_only", ["src"]), role: "tester" },
-				repo.dir,
-			);
+			const tester = manager.spawn({ ...spec("env-tester", "read_only", ["src"]), role: "tester" }, repo.dir);
 			const [testerSettled] = await manager.wait([tester.id]);
 			assert.equal(testerSettled.status, "done");
-			const testerConfig = JSON.parse(testerSettled.output.trim());
-			assert.equal(testerConfig.theme, "dark");
-			assert.equal(testerConfig.permission.edit, "deny");
-			assert.deepEqual(testerConfig.permission.bash, { "npm test": "allow", "*": "allow" });
+			assert.deepEqual(JSON.parse(testerSettled.output.trim()), { permission: { edit: "deny", bash: { "*": "allow" } } });
 
-			const reviewer = manager.spawn(
-				{ ...spec("env-reviewer", "read_only", ["src"]), role: "reviewer" },
-				repo.dir,
-			);
+			const reviewer = manager.spawn({ ...spec("env-reviewer", "read_only", ["src"]), role: "reviewer" }, repo.dir);
 			const [reviewerSettled] = await manager.wait([reviewer.id]);
 			assert.equal(reviewerSettled.status, "done");
-			const reviewerConfig = JSON.parse(reviewerSettled.output.trim());
-			assert.equal(reviewerConfig.theme, "dark");
-			assert.equal(reviewerConfig.permission.edit, "deny");
-			assert.equal(reviewerConfig.permission.bash, "deny");
-		} finally {
-			await manager.dispose();
-		}
+			assert.deepEqual(JSON.parse(reviewerSettled.output.trim()), { permission: { edit: "deny", bash: "deny" } });
+		} finally { await manager.dispose(); }
 	} finally {
 		if (original === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
 		else process.env.OPENCODE_CONFIG_CONTENT = original;

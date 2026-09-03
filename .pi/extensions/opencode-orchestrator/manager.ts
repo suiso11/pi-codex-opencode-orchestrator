@@ -65,6 +65,8 @@ interface ManagedTask {
 	snapshot: TaskSnapshot;
 	child?: ChildProcess;
 	agentName?: string;
+	preparation?: BackendPreparation;
+	backendCleanupDone?: boolean;
 	buffer: string;
 	stderrBuffer: string;
 	settleListeners: Set<() => void>;
@@ -855,7 +857,12 @@ export class OpenCodeTaskManager {
 	private failSpawn(entry: ManagedTask, error: unknown) {
 		const adapter = this.backends[entry.snapshot.backend];
 		let agentCleanupError: string | undefined;
-		try { adapter.cleanupAgent(entry.agentName); } catch (cleanupError) { agentCleanupError = processError(cleanupError); }
+		entry.backendCleanupDone = true;
+		try {
+			agentCleanupError = adapter.cleanupAgent(entry.agentName, entry.preparation);
+		} catch (cleanupError) {
+			agentCleanupError = processError(cleanupError);
+		}
 		const wt = entry.worktree;
 		if (!wt) {
 			this.tasks.delete(entry.snapshot.id);
@@ -889,6 +896,17 @@ export class OpenCodeTaskManager {
 		this.finishSettle(entry);
 	}
 
+	private cleanupBackend(entry: ManagedTask, adapter: WorkerBackendAdapter) {
+		if (entry.backendCleanupDone) return;
+		entry.backendCleanupDone = true;
+		try {
+			const failure = adapter.cleanupAgent(entry.agentName, entry.preparation);
+			if (failure) entry.snapshot.error ??= `${adapter.displayName} worker cleanup failed: ${failure}`;
+		} catch (error) {
+			entry.snapshot.error ??= `${adapter.displayName} worker cleanup failed: ${processError(error)}`;
+		}
+	}
+
 	private start(entry: ManagedTask, spec: TaskSpec, cwd: string) {
 		const prompt = buildWorkerPrompt(spec);
 		const thinking = resolveThinkingLevel(spec, this.thinkingLevel);
@@ -906,6 +924,7 @@ export class OpenCodeTaskManager {
 			cwd,
 		};
 		const preparation: BackendPreparation = adapter.prepare(spawnInput);
+		entry.preparation = preparation;
 		const agentName = preparation.agentName;
 		entry.agentName = agentName;
 		if (preparation.activity.length > 0) {
@@ -913,9 +932,12 @@ export class OpenCodeTaskManager {
 			if (entry.snapshot.activity.length > MAX_ACTIVITY_ITEMS) entry.snapshot.activity.shift();
 		}
 		const args = adapter.buildArgs(spawnInput, preparation);
-		// Workers inherit the environment; OpenCode role workers additionally get
-		// a forced official permission override merged over any valid inline config.
-		const env = adapter.buildEnv({ ...buildWorkerEnv(), NO_COLOR: "1", FORCE_COLOR: "0" }, spawnInput);
+		// Build the child environment from the explicit runtime allowlist. Keep
+		// the user's data-home location so CLI auth remains available, while the
+		// adapter receives its private per-spawn config preparation separately.
+		const workerEnv: NodeJS.ProcessEnv = { ...buildWorkerEnv(), NO_COLOR: "1", FORCE_COLOR: "0" };
+		if (process.env.XDG_DATA_HOME !== undefined) workerEnv.XDG_DATA_HOME = process.env.XDG_DATA_HOME;
+		const env = adapter.buildEnv(workerEnv, spawnInput, preparation);
 		const child = spawn(adapter.binary, args, {
 			cwd,
 			env,
@@ -929,7 +951,7 @@ export class OpenCodeTaskManager {
 			entry.snapshot.timedOut = true;
 			entry.snapshot.error = `${backendName} worker timed out after ${this.timeoutMs} ms.`;
 			killProcessTree(child, "SIGTERM");
-			setTimeout(() => { killProcessTree(child, "SIGKILL"); adapter.cleanupAgent(agentName); }, 5_000).unref();
+			setTimeout(() => { killProcessTree(child, "SIGKILL"); this.cleanupBackend(entry, adapter); }, 5_000).unref();
 		}, this.timeoutMs);
 		timeout.unref();
 
@@ -941,7 +963,7 @@ export class OpenCodeTaskManager {
 		});
 		child.on("close", (code) => {
 			clearTimeout(timeout);
-			adapter.cleanupAgent(agentName);
+			this.cleanupBackend(entry, adapter);
 			if (entry.buffer.trim()) this.consumeLine(entry, entry.buffer);
 			entry.buffer = "";
 			if (entry.stderrBuffer.trim()) this.consumeStderrLine(entry, entry.stderrBuffer);

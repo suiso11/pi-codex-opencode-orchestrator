@@ -20,8 +20,16 @@ export interface BackendSpawnInput {
 // allowlist handle the manager must pass back to cleanupAgent when the child
 // exits or times out. `activity` items are appended to the task snapshot by
 // the manager (snapshot state stays manager-owned).
+//
+// OpenCode additionally prepares a private per-spawn runtime directory:
+// `runtimeDir` is the mkdtemp root (forced as the child's XDG_CONFIG_HOME) and
+// `configDir` is the OpenCode config dir under it (forced as
+// OPENCODE_CONFIG_DIR), holding the generated `agent/` definition. Both are
+// removed again by cleanupAgent. Other backends leave them undefined.
 export interface BackendPreparation {
 	agentName?: string;
+	runtimeDir?: string;
+	configDir?: string;
 	activity: string[];
 }
 
@@ -87,8 +95,12 @@ export interface WorkerBackendAdapter {
 	readonly binaryArgs: string[];
 	prepare(input: BackendSpawnInput): BackendPreparation;
 	buildArgs(input: BackendSpawnInput, preparation: BackendPreparation): string[];
-	buildEnv(env: NodeJS.ProcessEnv, input: BackendSpawnInput): NodeJS.ProcessEnv;
-	cleanupAgent(agentName: string | undefined): void;
+	buildEnv(env: NodeJS.ProcessEnv, input: BackendSpawnInput, preparation: BackendPreparation): NodeJS.ProcessEnv;
+	// Remove any backend-generated agent definition and per-spawn runtime
+	// state (for OpenCode: the agent file plus the whole private runtime dir,
+	// recursively). Returns an error message when cleanup failed so the
+	// manager can surface it as activity/error, or undefined on success.
+	cleanupAgent(agentName: string | undefined, preparation?: BackendPreparation): string | undefined;
 	// Decode one raw stdout line from the worker child. `event` is the parsed
 	// JSON object when the line parsed as a JSON object, otherwise undefined.
 	// Implementations must preserve the exact raw-output text and activity
