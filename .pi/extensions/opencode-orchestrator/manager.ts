@@ -1546,9 +1546,11 @@ export class OpenCodeTaskManager {
 
 	// Convert an absolute path to a POSIX-separated repo-relative path for the
 	// public view, falling back to the input when it escapes the repository.
+	// A path equal to the repo root itself is rendered as "." so the public
+	// RetainedWorktreeView.scopes never exposes the absolute repo root.
 	private repoRelative(repoRoot: string, abs: string): string {
 		const rel = path.relative(repoRoot, abs);
-		if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return abs;
+		if (rel === "") return ".";
 		return rel.split(path.sep).join(path.posix.sep);
 	}
 

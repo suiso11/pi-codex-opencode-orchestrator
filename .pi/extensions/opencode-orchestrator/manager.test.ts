@@ -315,6 +315,29 @@ test("cancellation after worker exit prevents queued worktree integration", asyn
 	}
 });
 
+test("retained worktree view redacts a repo-root scope to '.' and keeps child scopes repo-relative", async () => {
+	const fake = await fakeOpenCode();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn({ ...spec("root-scope", "write", [".", "base.txt"], "quick"), worktree: true }, repo.dir);
+		const [cancelled] = await manager.cancel([started.id]);
+		assert.equal(cancelled.status, "cancelled");
+		assert.equal(cancelled.worktree?.status, "retained");
+		const view = manager.getRetainedWorktree(started.id);
+		assert.deepEqual(view.scopes, [".", "base.txt"], "repo-root scope is redacted to '.' and child scopes stay repo-relative");
+		for (const scope of view.scopes) {
+			assert.ok(!path.isAbsolute(scope), "no scope may expose an absolute repository path");
+			assert.ok(!scope.includes(os.tmpdir()), "no scope may leak the temp or repo layout");
+		}
+		manager.discardRetainedWorktree(started.id);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
 test("adapter launch exceptions clean up prepared worktrees and poison the batch", async () => {
 	const repo = await fakeGitRepo();
 	let cleanupCalls = 0;
