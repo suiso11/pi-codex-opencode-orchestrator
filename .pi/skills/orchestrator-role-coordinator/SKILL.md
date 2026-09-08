@@ -11,7 +11,8 @@ description: On-demand procedural reference for the Pi Codex OpenCode orchestrat
 
 - The parent plans, delegates, integrates, and decides; implementation and command-based verification are delegated to workers.
 - Keep only trivial safe reads (read, grep, find, ls) on the parent for planning and final judgment.
-- Spawn independent tasks together, then wait once for the whole batch.
+- Show a brief visible plan, use high thinking by default for quality-first results, and give concise action/status summaries rather than raw reasoning; use low explicitly for speed.
+- Prefer spawning independent tasks in the background; wait only when results are actually needed, then preserve spawn-together/wait-once batching.
 - Declare concrete relevant paths; concurrent writes need disjoint scopes.
 - Use `worktree: true` for parallel writes: clean root, disjoint scopes, one worktree-write phase.
 - Route models through profiles and settings; never hardcode models or retarget running workers.
@@ -25,7 +26,7 @@ The parent is coordinator-only. It may do trivial safe reads for planning and fo
 
 - `implementer`: applies scoped changes under `write` mode.
 - `tester`: runs tests and verification commands under `read_only` mode; edit tools are denied.
-- `reviewer`: performs static review under `read_only` mode without command execution tooling; always `high` thinking.
+- `reviewer`: performs static review under `read_only` mode without command execution tooling; remains forced to `high` thinking.
 
 Do not broaden a task; if the declared scope is insufficient, stop and report what is missing.
 
@@ -84,12 +85,12 @@ A worktree that fails, is cancelled, times out, commits, changes out-of-scope pa
 - An explicit `role` selects the matching profile; `tester` has its own configurable profile. A role is never inferred from the task name.
 - A direct `model` override is allowed only from current configuration.
 - New workers pick up profile/model changes; already-running workers keep the model they started with and are never retargeted.
-- `reviewer` always resolves `high` thinking; other roles keep explicit `thinking`, then the configured default.
+- `reviewer` always resolves `high` thinking; other roles keep explicit `thinking`, then the configured high default (use `low` explicitly for speed).
 
 ## Evidence and final approval
 
 - `tester` runs tests and verification commands and reports results; a mutation marks the task as error. This is post-run detection, not a sandbox.
-- `reviewer` gives an independent static review at `high` thinking.
+- `reviewer` gives an independent static review at forced `high` thinking.
 - Workers provide evidence; the parent makes the final judgment by inspecting the diff with safe reads and weighing tester/reviewer reports. Final approval stays with the parent.
 
 ## Output and handoff caps

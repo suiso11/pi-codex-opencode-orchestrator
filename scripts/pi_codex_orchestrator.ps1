@@ -9,7 +9,7 @@ $model = if ($env:PI_CODEX_MODEL) {
 $thinking = if ($env:PI_CODEX_THINKING) {
     $env:PI_CODEX_THINKING
 } else {
-    "medium"
+    "high"
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

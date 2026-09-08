@@ -865,7 +865,7 @@ test("manager can bypass OpenCode and run a Pi-backed worker", async () => {
 	}
 });
 
-test("manager applies default medium thinking to OpenCode --variant", async () => {
+test("manager applies default high thinking to OpenCode --variant", async () => {
 	const fake = await fakeEchoArgs();
 	const manager = new OpenCodeTaskManager({
 		binary: fake.binary,
@@ -873,14 +873,14 @@ test("manager applies default medium thinking to OpenCode --variant", async () =
 		timeoutMs: 2_000,
 	});
 	try {
-		assert.equal(manager.configuration().thinkingLevel, "medium");
+		assert.equal(manager.configuration().thinkingLevel, "high");
 		const started = manager.spawn(spec("echo", "read_only", ["src"]), process.cwd());
 		const [settled] = await manager.wait([started.id]);
 		assert.equal(settled.status, "done");
 		const args = JSON.parse(settled.output.trim());
 		const variantIdx = args.indexOf("--variant");
 		assert.ok(variantIdx >= 0, "--variant not found in args");
-		assert.equal(args[variantIdx + 1], "medium");
+		assert.equal(args[variantIdx + 1], "high");
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();

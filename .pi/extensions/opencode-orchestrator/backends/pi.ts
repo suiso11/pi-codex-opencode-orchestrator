@@ -85,7 +85,26 @@ export class PiBackendAdapter implements WorkerBackendAdapter {
 				}
 			}
 		}
-		return { output, activity: [activityFromEvent(event)] };
+		const activityEvent = event.type === "tool_execution_start" || event.type === "tool_execution_update" || event.type === "tool_execution_end"
+			? {
+				type: event.type,
+				part: {
+					type: "tool",
+					// Pi's documented shape uses top-level toolName and args. Keep
+					// the older fields as a compatibility fallback.
+					tool: typeof event.toolName === "string" ? event.toolName : (typeof event.tool === "string" ? event.tool : "tool"),
+					state: {
+						status: (typeof event.toolName === "string" || (event.args && typeof event.args === "object"))
+							? (event.type === "tool_execution_end" ? (event.isError === true ? "error" : "completed") : "running")
+							: (typeof event.status === "string" ? event.status : "update"),
+					},
+					input: event.args && typeof event.args === "object"
+						? event.args
+						: (event.input && typeof event.input === "object" ? event.input : undefined),
+				},
+			} as Record<string, unknown>
+			: event;
+		return { output, activity: [activityFromEvent(activityEvent)] };
 	}
 
 	decodeStderrChunk(chunk: string): BackendDecodedStderrChunk {

@@ -178,6 +178,23 @@ test("Pi and Collie retain explicit backend boundaries", () => {
 
 test("shared output protocol helpers remain stable", () => {
 	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "read", state: { status: "completed" } } }), "read: completed");
+	assert.equal(activityFromEvent({ type: "e", part: { type: "tool", tool: "read", state: { status: "running", input: { file: "src/a.ts" } } } }), "read: running src/a.ts");
+	const pi = new PiBackendAdapter({ binary: "pi", binaryArgs: [] });
+	const piStart = { type: "tool_execution_start", toolName: "read", args: { file: "src/a.ts" } };
+	const piUpdate = { type: "tool_execution_update", toolName: "read", args: { file: "src/a.ts" } };
+	const piEnd = { type: "tool_execution_end", toolName: "read", args: { file: "src/a.ts" }, isError: false };
+	assert.equal(pi.decodeStdoutLine(JSON.stringify(piStart), piStart).activity[0], "read: running src/a.ts");
+	assert.equal(pi.decodeStdoutLine(JSON.stringify(piUpdate), piUpdate).activity[0], "read: running src/a.ts");
+	assert.equal(pi.decodeStdoutLine(JSON.stringify(piEnd), piEnd).activity[0], "read: completed src/a.ts");
+	const piError = { ...piEnd, isError: true };
+	assert.equal(pi.decodeStdoutLine(JSON.stringify(piError), piError).activity[0], "read: error src/a.ts");
+	const collie = new CollieBackendAdapter({ binary: "collie" });
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ type: "progress", message: "streaming" })).activity, ["progress: streaming"]);
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ type: "progress", status: "streaming" })).activity, ["progress: streaming"]);
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ type: "Collie free-form reasoning", message: "streaming" })).activity, []);
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ type: "progress", message: "run rm -rf /tmp/x" })).activity, []);
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ type: "progress", message: "hidden reasoning" })).activity, []);
+	assert.deepEqual(collie.decodeStderrChunk(JSON.stringify({ activity: "hidden reasoning" })).activity, []);
 	assert.equal(activityFromEvent({ type: "e", part: { type: "step-finish", reason: "stop" } }), "step finished: stop");
 	assert.deepEqual(openCodeAdapter().decodeStdoutLine("plain", undefined), { output: "plain\n", activity: [] });
 	const report: WorkerReport = { summary: "s", files: [], findings: [], unresolved: [] };

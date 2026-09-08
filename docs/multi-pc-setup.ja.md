@@ -116,13 +116,13 @@ PI_OPENCODE_MODEL=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_IMPLEMENTER=opencode-go/glm-5.2
 PI_OPENCODE_PROFILE_REVIEWER=opencode-go/kimi-k3
 PI_OPENCODE_PROFILE_TESTER=opencode-go/glm-5.2
-PI_CODEX_THINKING=medium
-PI_OPENCODE_THINKING=medium
+PI_CODEX_THINKING=high
+PI_OPENCODE_THINKING=high
 # worker子プロセスへ追加で渡す環境変数名（任意、カンマ/空白区切り）
 PI_ORCH_WORKER_ENV_ALLOWLIST=
 ```
 
-親・workerともに思考レベルの既定は `medium`。タスクごとに `low|medium|high` を指定できる。`reviewer` ロールは常に `high` に解決される。最終承認などリスクの高い判断では `high` を選ぶこと。`medium` は常に十分という意味ではない。
+親・workerともに思考レベルの既定は `high`（品質優先）。速度を優先する場合は `low` を明示的に利用でき、タスクごとに `low|medium|high` を指定できる。`reviewer` ロールは常に `high` に解決される。`low` は品質要件が許す場合の高速・低コスト向け選択肢である。ブロッキングツール（`opencode_task`・`opencode_wait`・workflow待機など）は約1秒ごとに簡潔な進捗（ID・状態・経過時間・最新の安全なactivity、最大6行/800文字）を `onUpdate` で流し、最終結果のall-settledバッチ配送は維持する。worker activityは安全で bounded な行動要約（`tool: status [ファイル名程度]`、最大120文字）のみで、生の推論・フルコマンド・秘密情報・worktree絶対パスは出さない。workerタイムアウトは速度制御ではなく失敗ガードのため変更しない。ダッシュボードは10行以内を維持する。
 
 Pi内の `/orch-model` では、各worker経路についてbackendとmodelを対話的に選べる。
 
@@ -321,11 +321,11 @@ Piのグローバル設定例:
 {
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-sol",
-  "defaultThinkingLevel": "medium"
+  "defaultThinkingLevel": "high"
 }
 ```
 
-ランチャーは `PI_CODEX_THINKING`（既定 `medium`）で親の思考レベルを上書きする。最終承認などでは `high` を使うこと。
+ランチャーは `PI_CODEX_THINKING`（既定 `high`）で親の思考レベルを上書きする。速度を優先する場合は `low` を明示的に指定できる。親はspawn前に1〜3行の可視プランを述べ、結果が不要な段階では即時ブロックせずバックグラウンドspawnを優先すること。
 
 プロジェクト固有のビルド、テスト、サービス再起動、秘密情報の扱いは各プロジェクトの `AGENTS.md` に置く。全プロジェクト共通の短い個人ルールだけをグローバルな `AGENTS.md` に置く。
 

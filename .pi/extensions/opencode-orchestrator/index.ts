@@ -22,7 +22,7 @@ import type {
 import { taskResultText, taskResultsText, taskSummary } from "./types.ts";
 import { OpenCodeWorkflowManager } from "./workflow.ts";
 import { buildVerifiedPhases, REQUIRE_RESOLVED_GATE } from "./verified-workflow.ts";
-import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard, sumWorkerUsage, type DashboardUsage } from "./dashboard.ts";
+import { DASHBOARD_INTERVAL_MS, DASHBOARD_KEY, formatDashboard, formatElapsed, sumWorkerUsage, type DashboardUsage } from "./dashboard.ts";
 import { HerdrStatusReporter, resolveHerdrEnv } from "./herdr.ts";
 import { ModelConfigSync, registerModelCommand } from "./model-command.ts";
 
@@ -264,10 +264,102 @@ export function coordinatorBlockReason(name: string): string {
 export function coordinatorContractText(): string {
 	return `${COORDINATOR_CONTRACT_HEADER}
 - You are the coordinator-only parent: plan, delegate, integrate, and decide.
+- State a brief visible plan (1-3 lines) before spawning workers so progress stays transparent.
+- Prefer opencode_spawn (background) and continue useful orchestration work; call opencode_wait only when results are actually needed instead of blocking immediately after spawn.
 - Implementation and command-based testing/verification must be delegated to workers through opencode_* tools.
 - Trivial repository reading (read, grep, find, ls) is allowed for planning.
+- Routine work defaults to high thinking for quality-first results; use low explicitly when speed matters (reviewer is always high).
+- Progress is concise action/status summaries only; never paste raw reasoning, full shell commands, secrets, or absolute worktree paths.
 - Never claim workers are sandboxes.`;
 }
+
+export const MAX_PROGRESS_LINES = 6;
+export const MAX_PROGRESS_CHARS = 800;
+export const PROGRESS_POLL_MS = 1000;
+
+type ProgressUpdate = (update: {
+	content: Array<{ type: "text"; text: string }>;
+	details: { partial: true };
+}) => void;
+
+/** Poll bounded live progress for blocking tools until completion or abort. */
+export function startProgressPolling(
+	signal: AbortSignal | undefined,
+	onUpdate: unknown,
+	buildText: () => string | undefined,
+	intervalMs = PROGRESS_POLL_MS,
+): () => void {
+	if (typeof onUpdate !== "function") return () => {};
+
+	let stopped = false;
+	let timer: ReturnType<typeof setInterval> | undefined;
+	const update = onUpdate as ProgressUpdate;
+	const poll = () => {
+		if (stopped) return;
+		let text: string | undefined;
+		try {
+			text = buildText();
+		} catch {
+			return;
+		}
+		if (text === undefined) return;
+		try {
+			update({ content: [{ type: "text", text }], details: { partial: true } });
+		} catch {
+			// Progress reporting must never interrupt the blocking operation.
+		}
+	};
+	const stop = () => {
+		if (stopped) return;
+		stopped = true;
+		if (timer !== undefined) clearInterval(timer);
+		signal?.removeEventListener("abort", stop);
+	};
+	if (signal?.aborted) return stop;
+	timer = setInterval(poll, intervalMs);
+	const unref = (timer as unknown as { unref?: () => void }).unref;
+	if (typeof unref === "function") unref.call(timer);
+	signal?.addEventListener("abort", stop, { once: true });
+	return stop;
+}
+
+function conciseActivity(activity: string[]): string {
+	const latest = activity[activity.length - 1] ?? "starting";
+	const collapsed = latest.replace(/\s+/g, " ").trim() || "starting";
+	if (collapsed.length <= 80) return collapsed;
+	return `${collapsed.slice(0, 79).trimEnd()}…`;
+}
+
+/** One-line concise progress for a single worker: id, status, elapsed, latest safe activity. */
+export function formatTaskProgress(task: TaskSnapshot, now = Date.now()): string {
+	const elapsed = formatElapsed(now, task.createdAt, task.settledAt);
+	return `${task.id} [${task.status}] "${task.name}" ${elapsed} · ${conciseActivity(task.activity)}`;
+}
+
+/** Bounded multi-task partial progress for blocking wait/task tools. */
+export function formatTasksProgressText(tasks: readonly TaskSnapshot[], now = Date.now()): string {
+	const lines = tasks.slice(0, MAX_PROGRESS_LINES).map((task) => formatTaskProgress(task, now));
+	if (tasks.length > MAX_PROGRESS_LINES) lines.push(`… ${tasks.length - MAX_PROGRESS_LINES} more`);
+	const text = `Working: ${tasks.length} task(s)\n${lines.join("\n")}`;
+	return text.length <= MAX_PROGRESS_CHARS ? text : `${text.slice(0, MAX_PROGRESS_CHARS - 1)}…`;
+}
+
+/** Bounded workflow partial progress for blocking workflow tools. */
+export function formatWorkflowProgressText(
+	workflow: WorkflowSnapshot,
+	tasks: readonly TaskSnapshot[],
+	now = Date.now(),
+): string {
+	const phase = workflow.currentPhase === undefined
+		? "-"
+		: `${workflow.currentPhase + 1}/${workflow.phases.length}`;
+	const lines = tasks.slice(0, MAX_PROGRESS_LINES).map((task) => formatTaskProgress(task, now));
+	const body = lines.length > 0 ? `\n${lines.join("\n")}` : "";
+	const text = `Working: workflow ${workflow.id} [${workflow.status}] phase ${phase}${body}`;
+	if (tasks.length > MAX_PROGRESS_LINES) return `${text}\n… ${tasks.length - MAX_PROGRESS_LINES} more`.slice(0, MAX_PROGRESS_CHARS);
+	return text.length <= MAX_PROGRESS_CHARS ? text : `${text.slice(0, MAX_PROGRESS_CHARS - 1)}…`;
+}
+
 
 export function activateToolGroup(current: readonly string[], groupName: ToolGroupName) {
 	const group = TOOL_GROUPS[groupName];
@@ -705,9 +797,10 @@ export default function (pi: ExtensionAPI) {
 			"Start one bounded worker through its configured OpenCode or Pi backend. Up to four workers run concurrently. Read-only workers may overlap; write workers run concurrently only when every concurrently running write opts into worktree isolation (worktree=true) and their concrete relevant_paths do not overlap.",
 		promptSnippet: "Start a bounded worker in the background with read-only or path-scoped write access",
 		promptGuidelines: [
+			"State a brief visible plan (1-3 lines) before spawning so the user sees what will run.",
 			"Use opencode_spawn for independent repository exploration, mechanical implementation, tests, docs, or review; give each worker one objective and concrete relevant_paths.",
 			"Keep trivial one-read or tiny one-file work with the parent; do not spawn a worker for it.",
-			"Spawn independent workers together in one batch and call opencode_wait once to collect all their results.",
+			"Prefer background spawn and continue useful orchestration work; call opencode_wait only when results are actually needed instead of blocking immediately. Spawn independent workers together in one batch and call opencode_wait once to collect all their results.",
 			"The implementer and reviewer profile names are routing aliases; honor their currently configured backend and model rather than assuming a specific model family.",
 			"An explicit role is never inferred from the task name. Tester and reviewer roles require read_only mode: tester keeps bash for running verification commands behind a repository mutation guard, and reviewer gets no bash.",
 			"Keep final approval with the parent model; a delegated worker does not grant final approval.",
@@ -739,11 +832,23 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Waiting for ${params.ids.join(", ")}...` }],
 				details: { ids: params.ids, pending: true },
 			});
-			const results = await tasks.wait(params.ids, signal, true);
-			return {
-				content: [{ type: "text", text: taskResultsText(results) }],
-				details: { results: results.map((task) => ({ id: task.id, status: task.status })) },
-			};
+			const stop = startProgressPolling(signal, onUpdate, () => {
+				const snapshots = params.ids
+					.map((id) => tasks.get(id))
+					.filter((snapshot): snapshot is TaskSnapshot => snapshot !== undefined);
+				if (snapshots.length === 0) return undefined;
+				if (snapshots.every((snapshot) => snapshot.status !== "running")) return undefined;
+				return formatTasksProgressText(snapshots);
+			});
+			try {
+				const results = await tasks.wait(params.ids, signal, true);
+				return {
+					content: [{ type: "text", text: taskResultsText(results) }],
+					details: { results: results.map((task) => ({ id: task.id, status: task.status })) },
+				};
+			} finally {
+				stop();
+			}
 		},
 	});
 
@@ -835,11 +940,20 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Running ${task.id}...` }],
 				details: { id: task.id, status: task.status },
 			});
-			const [result] = await tasks.wait([task.id], signal, true);
-			return {
-				content: [{ type: "text", text: taskResultText(result) }],
-				details: { id: result.id, status: result.status, role: result.role, worktree: result.worktree?.status },
-			};
+			const stop = startProgressPolling(signal, onUpdate, () => {
+				const snapshot = tasks.get(task.id);
+				if (!snapshot || snapshot.status !== "running") return undefined;
+				return formatTasksProgressText([snapshot]);
+			});
+			try {
+				const [result] = await tasks.wait([task.id], signal, true);
+				return {
+					content: [{ type: "text", text: taskResultText(result) }],
+					details: { id: result.id, status: result.status, role: result.role, worktree: result.worktree?.status },
+				};
+			} finally {
+				stop();
+			}
 		},
 	});
 
@@ -865,11 +979,23 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Running workflow ${workflow.id}...` }],
 				details: { id: workflow.id, status: workflow.status, background: false },
 			});
-			const result = await workflows.wait(workflow.id, signal, true);
-			return {
-				content: [{ type: "text", text: workflows.resultText(result) }],
-				details: { id: result.id, status: result.status, background: false },
-			};
+			const stop = startProgressPolling(signal, onUpdate, () => {
+				const snapshot = workflows.get(workflow.id);
+				if (!snapshot || snapshot.status !== "running") return undefined;
+				const running = snapshot.taskIds
+					.map((id) => tasks.get(id))
+					.filter((item): item is TaskSnapshot => item !== undefined && item.status === "running");
+				return formatWorkflowProgressText(snapshot, running);
+			});
+			try {
+				const result = await workflows.wait(workflow.id, signal, true);
+				return {
+					content: [{ type: "text", text: workflows.resultText(result) }],
+					details: { id: result.id, status: result.status, background: false },
+				};
+			} finally {
+				stop();
+			}
 		},
 	});
 
@@ -883,11 +1009,23 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Waiting for workflow ${params.id}...` }],
 				details: { id: params.id, pending: true },
 			});
-			const result = await workflows.wait(params.id, signal, true);
-			return {
-				content: [{ type: "text", text: workflows.resultText(result) }],
-				details: { id: result.id, status: result.status },
-			};
+			const stop = startProgressPolling(signal, onUpdate, () => {
+				const snapshot = workflows.get(params.id);
+				if (!snapshot || snapshot.status !== "running") return undefined;
+				const running = snapshot.taskIds
+					.map((id) => tasks.get(id))
+					.filter((item): item is TaskSnapshot => item !== undefined && item.status === "running");
+				return formatWorkflowProgressText(snapshot, running);
+			});
+			try {
+				const result = await workflows.wait(params.id, signal, true);
+				return {
+					content: [{ type: "text", text: workflows.resultText(result) }],
+					details: { id: result.id, status: result.status },
+				};
+			} finally {
+				stop();
+			}
 		},
 	});
 
@@ -977,7 +1115,20 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Running verified workflow ${workflow.id}...` }],
 				details: { id: workflow.id, status: workflow.status, gate: REQUIRE_RESOLVED_GATE, background: false },
 			});
-			const result = await workflows.wait(workflow.id, signal, true);
+			const stop = startProgressPolling(signal, onUpdate, () => {
+				const snapshot = workflows.get(workflow.id);
+				if (!snapshot || snapshot.status !== "running") return undefined;
+				const running = snapshot.taskIds
+					.map((id) => tasks.get(id))
+					.filter((item): item is TaskSnapshot => item !== undefined && item.status === "running");
+				return formatWorkflowProgressText(snapshot, running);
+			});
+			let result;
+			try {
+				result = await workflows.wait(workflow.id, signal, true);
+			} finally {
+				stop();
+			}
 			return {
 				content: [{
 					type: "text",

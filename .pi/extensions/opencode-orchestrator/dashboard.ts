@@ -54,8 +54,13 @@ export function formatElapsed(now: number, startedAt: number, settledAt?: number
 	return `${hours}h${mins.toString().padStart(2, "0")}m`;
 }
 
+export const MAX_DASHBOARD_ACTIVITY_CHARS = 80;
+
 export function formatLatestActivity(activity: string[]): string {
-	return activity[activity.length - 1] ?? "starting";
+	const latest = activity[activity.length - 1] ?? "starting";
+	const collapsed = latest.replace(/\s+/g, " ").trim() || "starting";
+	if (collapsed.length <= MAX_DASHBOARD_ACTIVITY_CHARS) return collapsed;
+	return `${collapsed.slice(0, MAX_DASHBOARD_ACTIVITY_CHARS - 1).trimEnd()}…`;
 }
 
 export function formatWorkerRow(task: TaskSnapshot, now: number): string {

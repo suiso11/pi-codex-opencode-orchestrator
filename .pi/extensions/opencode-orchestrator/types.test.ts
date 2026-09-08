@@ -366,16 +366,17 @@ test("mergeUsage accumulates tokens, costs, cache, and reasoning across events",
 	assert.equal(merged.totalTokens, undefined);
 });
 
-test("configuredThinkingLevel reads PI_OPENCODE_THINKING and defaults to medium", () => {
-	assert.equal(configuredThinkingLevel({}), "medium");
+test("configuredThinkingLevel reads PI_OPENCODE_THINKING and defaults to high", () => {
+	assert.equal(configuredThinkingLevel({}), "high");
 	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "high" }), "high");
 	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "LOW" }), "low");
-	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "bogus" }), "medium");
+	assert.equal(configuredThinkingLevel({ PI_OPENCODE_THINKING: "bogus" }), "high");
 });
 
-test("resolveThinkingLevel prefers spec over fallback", () => {
-	assert.equal(resolveThinkingLevel({ thinking: "high" }, "medium"), "high");
-	assert.equal(resolveThinkingLevel({}, "low"), "low");
+test("resolveThinkingLevel prefers explicit per-task thinking over the high fallback", () => {
+	assert.equal(resolveThinkingLevel({ thinking: "high" }, "high"), "high");
+	assert.equal(resolveThinkingLevel({ thinking: "low" }, "high"), "low");
+	assert.equal(resolveThinkingLevel({}, "high"), "high");
 });
 
 test("resolveThinkingLevel forces high for reviewer and preserves explicit thinking for other roles", () => {

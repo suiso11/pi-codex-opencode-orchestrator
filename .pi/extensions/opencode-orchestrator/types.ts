@@ -19,7 +19,7 @@ export type WorkerRole = "implementer" | "tester" | "reviewer";
 export type WorkerBackend = "opencode" | "pi" | "collie";
 export type ThinkingLevel = "low" | "medium" | "high";
 
-export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "high";
 
 export interface TaskUsage {
 	inputTokens?: number;

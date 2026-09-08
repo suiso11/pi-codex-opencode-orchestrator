@@ -2,7 +2,7 @@
 set -euo pipefail
 
 model="${PI_CODEX_MODEL:-openai-codex/gpt-5.6-sol}"
-thinking="${PI_CODEX_THINKING:-medium}"
+thinking="${PI_CODEX_THINKING:-high}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 extension="$script_dir/../.pi/extensions/opencode-orchestrator/index.ts"
 

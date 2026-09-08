@@ -1,5 +1,5 @@
 import type { WorkerReport } from "../types.ts";
-import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
+import { activityFromEvent, sanitizeActivityLabel, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 const COLLIE_ENABLE_ENV = "PI_ORCH_ENABLE_COLLIE";
 
@@ -45,20 +45,19 @@ function commonReportText(answer: unknown, error: unknown): string {
 	return "";
 }
 
+const COLLIE_ACTIVITY_TYPES = new Set(["progress"]);
+const COLLIE_ACTIVITY_DETAILS = new Set(["streaming"]);
+
 function stderrActivity(line: string): string | undefined {
 	try {
 		const parsed: unknown = JSON.parse(line);
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
 		const event = parsed as Record<string, unknown>;
-		if (typeof event.activity === "string") return event.activity.slice(0, 500);
-		if (event.part && typeof event.part === "object") return activityFromEvent(event).slice(0, 500);
-		const type = typeof event.type === "string" ? event.type : "stderr";
-		const detail = typeof event.message === "string"
-			? event.message
-			: typeof event.status === "string"
-				? event.status
-				: undefined;
-		return `${type}${detail ? `: ${detail}` : ""}`.slice(0, 500);
+		const type = typeof event.type === "string" && COLLIE_ACTIVITY_TYPES.has(event.type) ? event.type : undefined;
+		if (!type) return undefined;
+		const rawDetail = typeof event.message === "string" ? event.message : event.status;
+		const detail = typeof rawDetail === "string" && COLLIE_ACTIVITY_DETAILS.has(rawDetail) ? rawDetail : undefined;
+		return detail ? sanitizeActivityLabel(`${type}: ${detail}`) : undefined;
 	} catch {
 		return undefined;
 	}

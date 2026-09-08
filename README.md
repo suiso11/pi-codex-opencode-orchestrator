@@ -24,7 +24,7 @@ It adds background task control, safe parallel scheduling for declared file scop
 - Explicit worker roles: `implementer`, `tester`, and `reviewer` with role-specific tool sets, model profiles, and safety behavior
 - Opt-in Executor MCP gateway for explicit OpenCode `implementer` tasks (`executor: true`) when `PI_ORCH_ENABLE_EXECUTOR=1`
 - Fail-closed OpenCode worker configuration isolation with private per-spawn config/agent directories, `--pure`, and project-config disabled
-- Medium thinking by default for parent and workers, with per-task `low|medium|high` overrides; the `reviewer` role always resolves to `high`
+- High thinking by default for parent and workers (quality-first), with per-task `low|medium|high` overrides; `low` remains available explicitly for speed, and the `reviewer` role always resolves to `high`
 - Interactive `/orch-model` command for persistent parent and worker model changes applied to running sessions without restarting the orchestrator
 - Live Pi widget with each running worker's model, elapsed time, mode, task name, and latest activity
 
@@ -80,12 +80,12 @@ Other settings:
 - `PI_OPENCODE_TIMEOUT_MS`: timeout per worker, default 600000 ms, maximum 30 minutes
 - `PI_ORCH_ENABLE_EXECUTOR=1`: opt in to the Executor MCP gateway; `PI_EXECUTOR_BIN` optionally selects its executable (default `executor`)
 - `PI_ORCH_WORKER_ENV_ALLOWLIST`: optional comma/space-separated additional environment variable names passed to worker children; workers otherwise receive only runtime variables such as `PATH`, `HOME`, data/auth paths, temp directories, locale, and `CI`
-- `PI_CODEX_THINKING`: parent thinking level, default `medium`; set `high` for final risky approval or complex planning
-- `PI_OPENCODE_THINKING`: default worker thinking level, default `medium`; each task accepts a per-task `thinking` of `low|medium|high`
+- `PI_CODEX_THINKING`: parent thinking level, default `high`; use `low` explicitly for faster responses
+- `PI_OPENCODE_THINKING`: default worker thinking level, default `high`; each task accepts a per-task `thinking` of `low|medium|high`
 - `/opencode-status`: show the current worker configuration inside Pi
 - `/opencode-usage`: report actual parent and worker token usage plus workflow handoff duplication
 
-Medium is the cost-aware default for both parent and workers, not a guarantee of sufficiency. Ambiguous, risky, or final-approval work should opt into `high` (via `PI_CODEX_THINKING=high` for the parent, or a per-task `thinking: high` for a dedicated review worker).
+High is the quality-first default for both parent and workers. Low remains available explicitly for faster, cost-aware responses when quality requirements allow it; per-task `thinking: low` and `PI_CODEX_THINKING=low`/`PI_OPENCODE_THINKING=low` are supported. The `reviewer` role always resolves to `high` regardless of the default.
 
 Change models interactively inside Pi:
 
@@ -130,6 +130,10 @@ HERDR_BIN_PATH=<path-to-herdr>
 Reports use `pane report-agent` with `--source custom:pi-orch` and `--agent pi-orch`; shutdown uses `pane release-agent`. The mapping is `working` when workers/workflows are running, `blocked` when retained or cleanup-failed worktrees await a decision, and `idle` otherwise. Only coarse state transitions are sent, with a monotonically increasing sequence number. Messages contain counts only; prompts, secrets, repository paths, and worktree paths are not sent.
 
 Herdr reporting is fail-open: a missing or failing CLI never affects orchestration, and bounded path-free diagnostics are available in `/opencode-status`. No Herdr installation or configuration is required outside a Herdr-managed pane.
+
+## Fast, transparent orchestration UX
+
+Routine parent and worker thinking default to `high` for quality-first results; `low` remains available explicitly for faster responses, and the `reviewer` role always resolves to `high`. Blocking tools (`opencode_task`, `opencode_wait`, `opencode_workflow` foreground, `opencode_workflow_wait`, `opencode_verified_task` foreground) stream concise live progress about once per second via `onUpdate` (one line per worker: id, status, elapsed time, latest safe activity; bounded to 6 lines / 800 chars) while keeping the existing all-settled background batching for final delivery. Worker activity labels are safe, bounded action summaries (`tool: status [file-ish target]`, max 120 chars): raw reasoning text, full shell commands, secrets, and absolute managed-worktree paths are never exposed (absolute paths collapse to `<path>/basename`, secrets to `[redacted]`). The worker timeout is unchanged (a failure guard, not a speed control), and the dashboard stays within its 10-line bound.
 
 ## Live activity dashboard
 
@@ -415,9 +419,11 @@ Manage retained or conflicted worktrees in the running session with `/opencode-w
 ### When to delegate vs. stay on the parent
 
 - Trivial one-read or tiny one-file work stays on the parent. Do not spawn a worker for it.
+- State a brief visible plan (1-3 lines) before spawning workers so progress stays transparent.
+- Prefer background `opencode_spawn` and continue useful orchestration work; call `opencode_wait` only when results are actually needed instead of blocking immediately after spawn.
 - Bounded, mechanical work (scoped implementation, test additions, docs updates) delegates to a worker.
 - Broad independent research parallelizes across multiple `opencode_spawn` workers (up to four).
-- Ambiguous, risky, or final-review work stays on the parent. Use `PI_CODEX_THINKING=high` (or a per-task `thinking: high` for a dedicated review worker) for these; `medium` is the cost-aware default, not a guarantee of sufficiency.
+- Ambiguous, risky, or final-review work stays on the parent. High thinking is the quality-first default; use `PI_CODEX_THINKING=low` or a per-task `thinking: low` explicitly when speed matters.
 
 ### Compact results and raw output
 

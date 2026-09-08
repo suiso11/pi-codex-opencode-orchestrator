@@ -76,10 +76,10 @@ function printModels(config) {
 		const source = environmentValue ? setting.env : savedValue ? "saved" : "default";
 		console.log(`${name.padEnd(7)} ${displayValue}  (${source})`);
 	}
-	const parentThinking = process.env.PI_CODEX_THINKING?.trim() || "medium";
-	const workerThinking = process.env.PI_OPENCODE_THINKING?.trim() || "medium";
+  const parentThinking = process.env.PI_CODEX_THINKING?.trim() || "high";
+  const workerThinking = process.env.PI_OPENCODE_THINKING?.trim() || "high";
 	console.log(`\nThinking  parent ${parentThinking}  worker ${workerThinking}  (per-task: low|medium|high)`);
-	console.log(`  PI_CODEX_THINKING / PI_OPENCODE_THINKING override; use high for final risky approval.`);
+	console.log(`  PI_CODEX_THINKING / PI_OPENCODE_THINKING override; use low explicitly for faster responses.`);
 	console.log(`\nConfig: ${configPath}`);
 	console.log("Change: pi-orch model <parent|worker|implementer|reviewer|tester> [pi|opencode] <provider/model>");
 	console.log("Reset:  pi-orch model reset [parent|worker|implementer|reviewer|tester]");
