@@ -1,0 +1,7 @@
+# Native OMP workers own workspace isolation; pi-orch's isolation stays disabled.
+task:
+  maxConcurrency: 4
+  isolation:
+    enabled: true
+    merge: patch
+    apply: true

@@ -161,7 +161,7 @@ export async function chooseModel(
 			});
 
 		let chosen: string | undefined;
-		if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+		if ((ctx.mode === "tui" || (ctx.mode as string) === "omp") && typeof ctx.ui.custom === "function") {
 			const result = await showModelPicker(ctx, `${MODEL_SETTING_DEFINITIONS[name].label} model`, entries);
 			if (result.action === "cancel") return undefined;
 			if (result.action === "refresh") continue;

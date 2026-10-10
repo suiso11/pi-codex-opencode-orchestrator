@@ -186,39 +186,7 @@ test("registered schemas reject invalid role, profile, and thinking values", () 
 	);
 });
 
-test("registered schemas accept boolean worktree and reject non-boolean values", () => {
-	const { tools } = activateExtension();
-	for (const toolName of ["opencode_spawn", "opencode_task"]) {
-		const schema = tools.get(toolName)?.parameters;
-		assert.ok(schema, `${toolName} not registered`);
-		assert.equal(Value.Check(schema, taskPayload({ worktree: true })), true, `${toolName} rejected worktree: true`);
-		assert.equal(Value.Check(schema, taskPayload({ worktree: false })), true, `${toolName} rejected worktree: false`);
-		assert.equal(Value.Check(schema, taskPayload({ worktree: "yes" })), false, `${toolName} accepted string worktree`);
-		assert.equal(Value.Check(schema, taskPayload({ worktree: 1 })), false, `${toolName} accepted numeric worktree`);
-	}
-	const workflowSchema = tools.get("opencode_workflow")?.parameters;
-	assert.ok(workflowSchema, "opencode_workflow not registered");
-	const workflow = (worktree: unknown) => ({
-		name: "worktree-workflow",
-		phases: [
-			{ name: "one", tasks: [taskPayload({ mode: "write", worktree })] },
-			{ name: "two", tasks: [taskPayload()] },
-		],
-	});
-	assert.equal(Value.Check(workflowSchema, workflow(true)), true, "workflow rejected worktree: true");
-	assert.equal(Value.Check(workflowSchema, workflow(false)), true, "workflow rejected worktree: false");
-	assert.equal(Value.Check(workflowSchema, workflow("yes")), false, "workflow accepted string worktree");
-});
 
-test("registered spawn schema round-trips worktree into toTaskSpec", () => {
-	const { tools } = activateExtension();
-	const schema = tools.get("opencode_spawn")?.parameters;
-	assert.ok(schema, "opencode_spawn not registered");
-	const payload = taskPayload({ mode: "write", worktree: true });
-	assert.equal(Value.Check(schema, payload), true, "spawn schema rejected a valid worktree task");
-	const spec = toTaskSpec(payload as Parameters<typeof toTaskSpec>[0]);
-	assert.equal(spec.worktree, true);
-});
 
 test("registered schemas accept boolean executor and reject non-boolean values", () => {
 	const { tools } = activateExtension();
@@ -293,61 +261,7 @@ test("toTaskSpec forwards executor and omits it for bare tasks", () => {
 	assert.equal(bare.executor, undefined);
 });
 
-test("worktree state surfaces in status text and details without leaking into worker prompts", () => {
-	const snapshot = task({
-		worktree: { isolated: true, baseHead: "abc1234", status: "pending", changedPaths: [] },
-	});
-	// Status text (taskSummary) shows the isolation state.
-	assert.match(taskSummary(snapshot), /\[worktree:pending\]/);
-	// The public details source (snapshot.worktree) never carries the worktree path.
-	assert.equal("path" in (snapshot.worktree ?? {}), false, "worktree path must not appear in public details");
 
-	const spec = toTaskSpec({
-		name: "implement",
-		mode: "write",
-		objective: "Implement",
-		relevant_paths: ["src"],
-		expected_output: "result",
-		worktree: true,
-	});
-	const prompt = buildWorkerPrompt(spec);
-	assert.match(prompt, /isolated Git worktree/);
-	assert.doesNotMatch(prompt, /oc-worktrees/, "worktree temp root must not leak into the prompt");
-	assert.doesNotMatch(prompt, /abc1234/, "worktree base head must not leak into the prompt");
-});
-
-test("toTaskSpec forwards role, profile, thinking, and worktree into TaskSpec", () => {
-	const spec = toTaskSpec({
-		name: "verify",
-		mode: "read_only",
-		objective: "Verify",
-		relevant_paths: ["src", "tests"],
-		expected_output: "result",
-		role: "tester",
-		profile: "implementer",
-		thinking: "low",
-		worktree: true,
-	});
-	assert.equal(spec.role, "tester");
-	assert.equal(spec.profile, "implementer");
-	assert.equal(spec.thinking, "low");
-	assert.equal(spec.worktree, true);
-	assert.deepEqual(spec.relevantPaths, ["src", "tests"]);
-	assert.deepEqual(spec.constraints, []);
-	assert.equal(spec.expectedOutput, "result");
-
-	const bare = toTaskSpec({
-		name: "bare",
-		mode: "read_only",
-		objective: "Bare",
-		relevant_paths: ["src"],
-		expected_output: "result",
-	});
-	assert.equal(bare.role, undefined);
-	assert.equal(bare.profile, undefined);
-	assert.equal(bare.thinking, undefined);
-	assert.equal(bare.worktree, undefined);
-});
 
 test("opencode-status surfaces the configured tester profile and worker thinking", async () => {
 	const original = process.env.PI_OPENCODE_PROFILE_TESTER;
@@ -627,7 +541,6 @@ test("opencode_verified_task schema accepts the full verified workflow payload a
 	assert.equal(
 		Value.Check(schema, verifiedPayload({
 			constraints: ["Do not touch README"],
-			worktree: true,
 			implementer_model: "provider/impl",
 			tester_model: "provider/test",
 			reviewer_model: "provider/review",
@@ -636,7 +549,6 @@ test("opencode_verified_task schema accepts the full verified workflow payload a
 		true,
 		"rejected full payload",
 	);
-	assert.equal(Value.Check(schema, verifiedPayload({ worktree: "yes" })), false, "accepted string worktree");
 	assert.equal(Value.Check(schema, verifiedPayload({ relevant_paths: [] })), false, "accepted empty relevant_paths");
 	assert.equal(Value.Check(schema, verifiedPayload({ name: "" })), false, "accepted empty name");
 });
@@ -708,146 +620,27 @@ function fakeManager(views: RetainedWorktreeView[] = []): FakeManager {
 	};
 }
 
-test("worktree inspection tools register read-only list/status schemas", () => {
-	const { tools } = activateExtension();
-	const listSchema = tools.get("opencode_worktree_list")?.parameters;
-	const statusSchema = tools.get("opencode_worktree_status")?.parameters;
-	assert.ok(listSchema, "opencode_worktree_list not registered");
-	assert.ok(statusSchema, "opencode_worktree_status not registered");
-	// list takes no parameters; it must not expose any mutation input.
-	assert.equal(Value.Check(listSchema, {}), true);
-	assert.equal(Value.Check(listSchema, { discard: "oc-1" }), true, "list ignores extra keys (no mutation action)");
-	// status requires exactly one string id.
-	assert.equal(Value.Check(statusSchema, { id: "oc-1" }), true);
-	assert.equal(Value.Check(statusSchema, {}), false);
-	assert.equal(Value.Check(statusSchema, { id: 1 }), false);
-});
 
-test("worktree inspection tools report empty list and unknown-id status errors", async () => {
-	const { tools } = activateExtension();
-	const list = tools.get("opencode_worktree_list")!;
-	const status = tools.get("opencode_worktree_status")!;
-	const listResult = await (list.execute as (...args: unknown[]) => Promise<{ content: { text: string }[] }>)("id", {});
-	assert.match(listResult.content[0].text, /No retained worktrees/);
-	await assert.rejects(
-		() => (status.execute as (...args: unknown[]) => Promise<unknown>)("id", { id: "oc-unknown" }),
-		/No retained worktree found/,
-	);
-});
 
-test("worktree inspection tools join the inspection group and stay coordinator-allowed", async () => {
-	const { tools, listeners, active } = activateExtension();
-	const activation = activateToolGroup(["opencode_tools"], "inspection");
-	for (const name of ["opencode_worktree_list", "opencode_worktree_status"]) {
-		assert.ok(activation.active.includes(name), `${name} missing from inspection group`);
-	}
-	active.push("read", "grep", "find", "ls", "opencode_task", "opencode_spawn", "opencode_wait", "opencode_tools");
-	const tool = tools.get("opencode_tools")!;
-	assert.ok(tool, "opencode_tools not registered");
-	await (tool.execute as (...args: unknown[]) => Promise<unknown>)("id", { group: "inspection" });
-	for (const name of ["opencode_worktree_list", "opencode_worktree_status"]) {
-		assert.ok(active.includes(name), `${name} not activated by inspection group`);
-	}
-	for (const name of ["opencode_worktree_list", "opencode_worktree_status"]) {
-		const result = await emitToolCall(listeners, { toolCallId: "id", toolName: name, input: {} });
-		assert.equal(result, undefined, `${name} should be allowed through the coordinator gate`);
-	}
-});
 
-test("opencode-worktrees command is registered", () => {
-	const { commands } = activateExtension();
-	assert.ok(commands.has("opencode-worktrees"), "opencode-worktrees not registered");
-});
 
-test("opencode-worktrees list and status work through notify without a UI", async () => {
-	const manager = fakeManager([retainedView()]);
-	const notified: string[] = [];
-	await handleWorktreeCommand(manager, "list", { ui: { notify: (message: string) => notified.push(message) } });
-	assert.match(notified[0] ?? "", /oc-1/);
-	assert.deepEqual(manager.calls, ["list"]);
-	await handleWorktreeCommand(manager, "status oc-1", { ui: { notify: (message: string) => notified.push(message) } });
-	assert.match(notified[1] ?? "", /Repository: repo/);
-	assert.match(notified[1] ?? "", /Base head: abc123/);
-	assert.deepEqual(manager.calls, ["list", "get:oc-1"]);
-});
 
-test("opencode-worktrees retry/discard reject without an interactive UI", async () => {
-	const manager = fakeManager([retainedView()]);
-	const notified: string[] = [];
-	await handleWorktreeCommand(manager, "retry oc-1", { hasUI: false, ui: { notify: (message: string) => notified.push(message) } });
-	assert.match(notified.join("\n"), /requires an interactive UI/);
-	assert.match(notified.join("\n"), /no non-interactive bypass/);
-	assert.deepEqual(manager.calls, [], "retry must not reach the manager without UI");
 
-	const notified2: string[] = [];
-	await handleWorktreeCommand(manager, "discard oc-1", { ui: { notify: (message: string) => notified2.push(message) } });
-	assert.match(notified2.join("\n"), /requires an interactive UI/);
-	assert.deepEqual(manager.calls, [], "discard must not reach the manager without UI");
-});
 
-test("opencode-worktrees retry/discard cancel (no-op) when confirmation is declined", async () => {
-	const manager = fakeManager([retainedView()]);
-	const notified: string[] = [];
-	await handleWorktreeCommand(manager, "retry oc-1", {
-		hasUI: true,
-		ui: { notify: (message: string) => notified.push(message), confirm: () => false },
-	});
-	assert.match(notified.join("\n"), /Cancelled retry/);
-	await handleWorktreeCommand(manager, "discard oc-1", {
-		hasUI: true,
-		ui: { notify: (message: string) => notified.push(message), confirm: () => false },
-	});
-	assert.match(notified.join("\n"), /Cancelled discard/);
-	assert.deepEqual(manager.calls, [], "declined confirmation must not call the manager");
-});
 
-test("opencode-worktrees retry integrates and discard cleans up after confirmation", async () => {
-	const manager = fakeManager([retainedView()]);
-	const notified: string[] = [];
-	await handleWorktreeCommand(manager, "retry oc-1", {
-		hasUI: true,
-		ui: { notify: (message: string) => notified.push(message), confirm: () => true },
-	});
-	assert.deepEqual(manager.calls, ["retry:oc-1"]);
-	assert.match(notified.join("\n"), /Integrated retained worktree/);
 
-	const notified2: string[] = [];
-	await handleWorktreeCommand(manager, "discard oc-1", {
-		hasUI: true,
-		ui: { notify: (message: string) => notified2.push(message), confirm: () => true },
-	});
-	assert.deepEqual(manager.calls, ["retry:oc-1", "discard:oc-1"]);
-	assert.match(notified2.join("\n"), /Discarded retained worktree/);
-});
 
-test("opencode-worktrees reports cleanup-failed and retained outcomes", () => {
-	const cleanupFailed = retainedView({ status: "done", error: "cleanup failed", kind: "cleanup-failed", rootIntegrated: true });
-	assert.match(describeWorktreeMutationOutcome("retry", cleanupFailed), /cleanup failed/);
-	assert.match(describeWorktreeMutationOutcome("discard", cleanupFailed), /Cleanup failed/);
-	const retained = retainedView({ error: "blocked", rootIntegrated: false });
-	assert.match(describeWorktreeMutationOutcome("retry", retained), /entry retained/);
-});
 
-test("retained worktree views and formatting expose no absolute temp path", () => {
-	const view = retainedView();
-	assert.equal("path" in view, false, "retained view must not carry an absolute path");
-	for (const text of [formatRetainedWorktreeList([view]), formatRetainedWorktreeDetail(view)]) {
-		assert.doesNotMatch(text, /oc-worktrees/);
-		assert.doesNotMatch(text, /[A-Za-z]:\\/);
-	}
-});
-
-test("opencode-worktrees TUI no-args uses select to pick an entry then an action", async () => {
-	const manager = fakeManager([retainedView()]);
-	const notified: string[] = [];
-	const selections: (string | undefined)[] = ["oc-1", "inspect"];
-	await handleWorktreeCommand(manager, "", {
-		hasUI: true,
-		ui: {
-			notify: (message: string) => notified.push(message),
-			select: async () => selections.shift(),
-		},
-	});
-	assert.deepEqual(manager.calls, ["list", "get:oc-1"]);
-	assert.match(notified.join("\n"), /Repository: repo/);
+ test("extension omits worktree tools, commands, schemas and task forwarding", () => {
+ const { tools, commands } = activateExtension();
+ assert.equal(commands.has("opencode-worktrees"), false);
+ for (const group of ["inspection", "all"] as const) {
+  assert.equal(activateToolGroup([], group).active.some(name => name.includes("worktree")), false);
+ }
+ for (const name of ["opencode_spawn", "opencode_task", "opencode_verified_task"]) {
+  const schema = tools.get(name)!.parameters as { properties: Record<string, unknown> };
+  assert.equal("worktree" in schema.properties, false);
+ }
+ assert.equal([...tools.keys()].some(name => name.includes("worktree")), false);
+ assert.equal(toTaskSpec({...taskPayload({worktree: true}), mode: "write", worktree: true}).worktree, undefined);
 });

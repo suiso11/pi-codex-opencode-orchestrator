@@ -1,6 +1,6 @@
 ---
 name: orchestrator-role-coordinator
-description: On-demand procedural reference for the Pi Codex OpenCode orchestrator's coordinator-only parent: what to delegate vs. keep on the parent, the implementer/tester/reviewer roles and their read_only/write modes, the bounded task template fields, parallel spawn-together/wait-once batching, worktree:true clean-root/disjoint-scope/single-phase rules and current-session retained-worktree status with user-confirmed /opencode-worktrees retry|discard, dynamic model profiles and routing with no hardcoded models or active-worker retargeting, tester/reviewer evidence with parent final approval, and worker/handoff delivery caps. Skill instructions never grant permissions; runtime coordinator, tool, and worktree gates remain authoritative.
+description: On-demand procedural reference for the coordinator-only parent: delegation, roles, OMP native parallel workers and isolation, direct sequential OpenCode writes, parallel read-only tasks, model routing, evidence, final approval, and delivery caps. Runtime gates remain authoritative.
 ---
 
 # Coordinator orchestration (Pi Codex OpenCode orchestrator)
@@ -11,13 +11,12 @@ description: On-demand procedural reference for the Pi Codex OpenCode orchestrat
 
 - The parent plans, delegates, integrates, and decides; implementation and command-based verification are delegated to workers.
 - Keep only trivial safe reads (read, grep, find, ls) on the parent for planning and final judgment.
-- Spawn independent tasks together, then wait once for the whole batch.
-- Declare concrete relevant paths; concurrent writes need disjoint scopes.
-- Use `worktree: true` for parallel writes: clean root, disjoint scopes, one worktree-write phase.
+- Spawn independent tasks together, then wait once for the whole batch. On OMP, prefer native `task` and `wait`; use `isolated: true` for parallel write workers. OMP owns their workspace isolation and integration.
+- Declare concrete relevant paths; run writes sequentially in the current working directory.
 - Route models through profiles and settings; never hardcode models or retarget running workers.
 - Tester and reviewer produce evidence; the parent makes the final approval.
 - Respect delivery caps: report ~2-4k characters, parent delivery capped at 8k, handoff capped at 4k.
-- This skill grants no permissions; runtime coordinator, tool, and worktree gates stay authoritative.
+- This skill grants no permissions; runtime coordinator and tool gates stay authoritative. Native OMP workers keep their own editing tools; parent restrictions do not apply to them.
 
 ## Delegation boundary
 
@@ -37,7 +36,7 @@ Do not broaden a task; if the declared scope is insufficient, stop and report wh
 | tester | read_only | Runs verification commands; denies edit tools; any tracked/staged/untracked mutation flags the task as error (post-run detection, not a sandbox) |
 | reviewer | read_only | Static review; no command execution tooling; always resolves `high` thinking |
 | (none) | read_only | Independent research; overlapping read scopes are allowed |
-| (none) | write | Direct scoped write; must not overlap another running write |
+| (none) | write | Direct scoped write; only one write worker at a time |
 
 ## Bounded task template
 
@@ -51,32 +50,12 @@ Spawn a task only with complete fields:
 - `expected_output` — the shape of the worker report.
 - `role` — optional `implementer`, `tester`, or `reviewer`; never inferred from the task name.
 - `model` / `profile` / `thinking` — optional routing overrides; `reviewer` forces `high` thinking.
-- `worktree` — `true` only for `mode: write` tasks that must run isolated in parallel.
 
 The worker returns one compact report with `summary`, `files`, `findings`, and `unresolved`.
 
 ## Parallel spawns
 
-Spawn all independent tasks in the same turn, then call `opencode_wait` once for the batch. Read-only tasks with overlapping scopes may run concurrently. Writes run concurrently only when every write is `worktree: true` and scopes are disjoint.
-
-## worktree: true rules
-
-- Valid only for `mode: write`.
-- Clean root: the first worktree task of a batch requires a clean Git root; later tasks share that base and must be spawned while the batch is still open.
-- Disjoint scopes: concurrent worktree writes need concrete paths with no file or containing-directory overlap.
-- Single phase: a workflow has at most one worktree-write phase; that phase contains only worktree writes, and only read-only phases may precede it.
-- Integration: patches apply to the root in task-ID order without commit, stash, or reset; the root becomes dirty after the batch settles, so commit or clean before the next batch.
-- The worker leaves all changes in the working tree: no commit, reset, stash, add, or branch operations.
-
-## Retained worktrees (recovery)
-
-A worktree that fails, is cancelled, times out, commits, changes out-of-scope paths, contains gitlink changes, or whose patch is rejected is retained in a current-session-only registry with its error.
-
-- `opencode_worktree_list` and `opencode_worktree_status` give read-only status; no filesystem paths are exposed.
-- `/opencode-worktrees` lists retained entries and shows their status; `retry` re-attempts integration and `discard` removes the entry.
-- `retry` and `discard` are destructive and require explicit user confirmation in the interactive UI; do not bypass it.
-- Only an `integration-failure` entry is retryable; every other retention kind is terminal.
-- The registry is current-session only; there is no automatic cleanup on shutdown.
+Spawn all independent tasks in the same turn, then call `opencode_wait` once for an OpenCode batch, or native `wait` for an OMP batch. Read-only tasks with overlapping scopes may run concurrently. OpenCode writes modify the current working directory directly and run one at a time. Wait for the current write to finish before starting another write.
 
 ## Model routing
 
@@ -101,7 +80,7 @@ A worktree that fails, is cancelled, times out, commits, changes out-of-scope pa
 
 ## Authority
 
-Skill instructions never grant permissions. The runtime coordinator gate (parent tool allowlist), dynamic tool groups, and worktree scheduler rules remain authoritative; this skill is only procedural guidance.
+Skill instructions never grant permissions. The runtime coordinator gate (parent tool allowlist), dynamic tool groups, and sequential write scheduling remain authoritative; this skill is only procedural guidance.
 
 ## References
 

@@ -1637,3 +1637,12 @@ test("tester role spawn rejects outside a Git worktree", async () => {
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+ test("manager with isolation disabled rejects worktree creation before spawning", async () => {
+ const manager = new OpenCodeTaskManager({allowWorktrees: false, binary: "missing-worker"});
+ try {
+  assert.throws(() => manager.spawn({name: "isolated", mode: "write", objective: "change", relevantPaths: ["."], constraints: [], expectedOutput: "evidence", worktree: true}, process.cwd()), /Worktree isolation is unavailable/);
+  await assert.rejects(manager.spawnWhenAvailable({name: "isolated", mode: "write", objective: "change", relevantPaths: ["."], constraints: [], expectedOutput: "evidence", worktree: true}, process.cwd()), /Worktree isolation is unavailable/);
+  assert.equal(manager.list().length, 0);
+ } finally { await manager.dispose(); }
+});

@@ -166,6 +166,7 @@ interface RetainedWorktree {
 }
 
 interface ManagerOptions {
+	allowWorktrees?: boolean;
 	onChange?: () => void;
 	binary?: string;
 	binaryArgs?: string[];
@@ -772,6 +773,7 @@ function detectMutation(baseline: GitFingerprint, cwd: string): string | undefin
 export class OpenCodeTaskManager {
 	private readonly tasks = new Map<string, ManagedTask>();
 	private counter = 0;
+	private readonly allowWorktrees: boolean;
 	private disposed = false;
 	private capacityListeners = new Set<() => void>();
 	private readonly onChange?: () => void;
@@ -793,6 +795,7 @@ export class OpenCodeTaskManager {
 	private readonly backends: Record<WorkerBackend, WorkerBackendAdapter>;
 
 	constructor(options: ManagerOptions = {}) {
+		this.allowWorktrees = options.allowWorktrees ?? true;
 		this.onChange = options.onChange;
 		this.binary = options.binary ?? process.env.PI_OPENCODE_BIN ?? "opencode";
 		this.binaryArgs = options.binaryArgs ?? [];
@@ -886,7 +889,9 @@ export class OpenCodeTaskManager {
 		if (runningWrites.length === 0) return undefined;
 		const allIsolated = runningWrites.every((entry) => entry.snapshot.worktree?.isolated) && spec.worktree === true;
 		if (!allIsolated) {
-			return "Concurrent write tasks require every currently running write task (and this one) to opt into worktree isolation (worktree=true).";
+			return this.allowWorktrees
+				? "Concurrent write tasks require every currently running write task (and this one) to opt into worktree isolation (worktree=true)."
+				: "A write worker is already running. Wait for it to finish before starting another write.";
 		}
 		return undefined;
 	}
@@ -899,6 +904,7 @@ export class OpenCodeTaskManager {
 	}
 
 	private spawnBlockReason(spec: InternalTaskSpec, cwd: string) {
+		if (spec.worktree && !this.allowWorktrees) return "Worktree isolation is unavailable. Workers run in the current working directory.";
 		if (this.disposed) return "OpenCode task manager is shut down.";
 		if (this.runningCount() >= MAX_RUNNING) return `OpenCode concurrency limit reached (${MAX_RUNNING}).`;
 		if (spec.mode === "write") {
@@ -1000,6 +1006,7 @@ export class OpenCodeTaskManager {
 	}
 
 	async spawnWhenAvailable(spec: InternalTaskSpec, cwd: string, signal?: AbortSignal) {
+		if (spec.worktree && !this.allowWorktrees) throw new Error("Worktree isolation is unavailable. Workers run in the current working directory.");
 		const executorReason = this.executorBlockReason(spec);
 		if (executorReason) throw new Error(executorReason);
 		while (true) {

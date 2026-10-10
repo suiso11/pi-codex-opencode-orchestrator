@@ -18,7 +18,15 @@ if (-not (Test-Path -LiteralPath $extension)) {
     throw "OpenCode orchestrator extension was not found at $extension."
 }
 
-$piCommand = Get-Command pi -ErrorAction Stop
+$runtime = if ($env:PI_ORCH_RUNTIME) { $env:PI_ORCH_RUNTIME } else { "omp" }
+if ($runtime -notin @("omp", "pi")) { throw "PI_ORCH_RUNTIME must be omp or pi" }
+$runtimeCommand = Get-Command $runtime -ErrorAction Stop
+if ($runtime -eq "omp") {
+    $extension = Join-Path (Split-Path -Parent $scriptDir) ".pi\extensions\opencode-orchestrator\omp.ts"
+    $runtimeArgs = @("--allow-home", "--no-extensions", "--config", (Join-Path $scriptDir "omp-orchestrator.yml"))
+} else {
+    $runtimeArgs = @("--approve")
+}
 $opencodeCommand = Get-Command opencode -ErrorAction Stop
 
 if (-not $env:PI_OPENCODE_BIN -and
@@ -31,35 +39,12 @@ if (-not $env:PI_OPENCODE_BIN -and
     $env:PI_OPENCODE_BIN = $opencodeExe
 }
 
-$tools = @(
-    "read",
-    "grep",
-    "find",
-    "ls",
-    "bash",
-    "subagent",
-    "subagent_resume",
-    "subagent_kill",
-    "opencode_task",
-    "opencode_spawn",
-    "opencode_wait",
-    "opencode_check",
-    "opencode_cancel",
-    "opencode_list",
-    "opencode_output",
-    "opencode_workflow",
-    "opencode_workflow_wait",
-    "opencode_workflow_check",
-    "opencode_workflow_cancel",
-    "opencode_workflow_list"
-) -join ","
+$tools = if ($runtime -eq "omp") {
+    "read,grep,glob,task,wait,opencode_task,opencode_spawn,opencode_wait,opencode_tools"
+} else {
+    "read,grep,find,ls,opencode_task,opencode_spawn,opencode_wait,opencode_tools"
+}
 
-& $piCommand.Source `
-    --approve `
-    --extension $extension `
-    --model $model `
-    --thinking $thinking `
-    --tools $tools `
-    @args
+& $runtimeCommand.Source @runtimeArgs --extension $extension --model $model --thinking $thinking --tools $tools @args
 
 exit $LASTEXITCODE

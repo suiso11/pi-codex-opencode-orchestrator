@@ -1,5 +1,9 @@
 # Pi Codex OpenCode Orchestrator
 
+> Local installation: `pi-orch` launches OMP by default. Its native `task`/`wait` tools manage parallel workers and optional workspace isolation (`isolated: true`), with patch integration enabled. OpenCode workers remain available through `opencode_*` tools and write directly, one at a time. pi-orch's own worktree tools stay omitted. Use `PI_ORCH_RUNTIME=pi pi-orch` to launch the original Pi runtime. Explicit `pi::` worker routes still use Pi.
+
+
+
 A lightweight [Pi coding agent](https://github.com/earendil-works/pi) extension that uses Codex as the primary orchestrator and OpenCode as a bounded worker backend.
 
 It adds background task control, safe parallel scheduling for declared file scopes, and phased workflows without depending on Claude/Anthropic models.

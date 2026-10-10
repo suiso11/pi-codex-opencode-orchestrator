@@ -65,9 +65,6 @@ const TaskSchema = Type.Object({
 	role: Type.Optional(RoleSchema),
 	thinking: Type.Optional(ThinkingSchema),
 	tool_profile: Type.Optional(ToolProfileSchema),
-	worktree: Type.Optional(Type.Boolean({
-		description: "Opt-in write isolation. Valid only for mode=write: the worker runs in a detached git worktree and changes integrate through a per-repo ID-ordered queue after the worker exits.",
-	})),
 	executor: Type.Optional(Type.Boolean({
 		description: "Opt-in Executor MCP gateway. Requires PI_ORCH_ENABLE_EXECUTOR=1 plus the OpenCode backend with an explicit implementer role; any other combination fails before spawning.",
 	})),
@@ -108,9 +105,6 @@ const VerifiedTaskSchema = Type.Object({
 		maxItems: 32,
 	})),
 	expected_output: Type.String({ description: "Evidence/result the implementer must produce and the tester/reviewer verify.", minLength: 1 }),
-	worktree: Type.Optional(Type.Boolean({
-		description: "Opt-in write isolation for the implementer phase only: the write worker runs in a detached git worktree and changes integrate before the gated read-only phases start.",
-	})),
 	implementer_model: Type.Optional(Type.String({ description: "Optional model override for the implementer (write) phase." })),
 	tester_model: Type.Optional(Type.String({ description: "Optional model override for the tester (read_only, gated) phase." })),
 	reviewer_model: Type.Optional(Type.String({ description: "Optional model override for the reviewer (read_only, gated) phase." })),
@@ -148,7 +142,6 @@ export function toTaskSpec(raw: RawTask): TaskSpec {
 		role: raw.role,
 		thinking: raw.thinking,
 		toolProfile: raw.tool_profile,
-		worktree: raw.worktree,
 		executor: raw.executor,
 	};
 }
@@ -176,8 +169,6 @@ const OPTIONAL_ORCHESTRATOR_TOOLS = [
 	"opencode_workflow_cancel",
 	"opencode_workflow_list",
 	"opencode_verified_task",
-	"opencode_worktree_list",
-	"opencode_worktree_status",
 ] as const;
 
 // Exact set of orchestration tool names this extension registers. The
@@ -198,8 +189,6 @@ const TOOL_GROUPS: Record<ToolGroupName, readonly string[]> = {
 		"opencode_list",
 		"opencode_workflow_check",
 		"opencode_workflow_list",
-		"opencode_worktree_list",
-		"opencode_worktree_status",
 	],
 	control: ["opencode_cancel", "opencode_workflow_cancel"],
 	workflows: [
@@ -583,7 +572,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	tasks = new OpenCodeTaskManager({ onChange: updateStatus });
+	tasks = new OpenCodeTaskManager({ onChange: updateStatus, allowWorktrees: false });
 	workflows = new OpenCodeWorkflowManager(tasks, { onChange: updateStatus });
 
 	const modelSync = new ModelConfigSync(pi, tasks);
@@ -702,7 +691,7 @@ export default function (pi: ExtensionAPI) {
 		name: "opencode_spawn",
 		label: "Spawn Worker",
 		description:
-			"Start one bounded worker through its configured OpenCode or Pi backend. Up to four workers run concurrently. Read-only workers may overlap; write workers run concurrently only when every concurrently running write opts into worktree isolation (worktree=true) and their concrete relevant_paths do not overlap.",
+			"Start one bounded worker through its configured OpenCode or Pi backend. Up to four workers run concurrently. Read-only workers may overlap; write workers run one at a time in the current working directory.",
 		promptSnippet: "Start a bounded worker in the background with read-only or path-scoped write access",
 		promptGuidelines: [
 			"Use opencode_spawn for independent repository exploration, mechanical implementation, tests, docs, or review; give each worker one objective and concrete relevant_paths.",
@@ -711,8 +700,7 @@ export default function (pi: ExtensionAPI) {
 			"The implementer and reviewer profile names are routing aliases; honor their currently configured backend and model rather than assuming a specific model family.",
 			"An explicit role is never inferred from the task name. Tester and reviewer roles require read_only mode: tester keeps bash for running verification commands behind a repository mutation guard, and reviewer gets no bash.",
 			"Keep final approval with the parent model; a delegated worker does not grant final approval.",
-			"Only one non-worktree write may run at a time. For parallel writes, set worktree=true on every concurrent write task and partition relevant_paths so no file or containing directory overlaps; the extension rejects conflicting scopes and non-isolated concurrent writes.",
-			"Worktree writes need a clean Git root for the first task of a batch; later worktree tasks in the same batch share that base and must be spawned before the batch settles.",
+			"Write workers modify the current working directory directly. Run writes sequentially; independent read-only workers may run concurrently.",
 			"After opencode_spawn, continue useful orchestration work, then call opencode_wait before relying on worker results.",
 		],
 		parameters: TaskSchema,
@@ -723,7 +711,7 @@ export default function (pi: ExtensionAPI) {
 					type: "text",
 					text: boundParentText(`Started ${taskSummary(task)}\nScopes: ${task.relevantPaths.join(", ")}`),
 				}],
-				details: { id: task.id, status: task.status, mode: task.mode, role: task.role, scopes: task.scopes, worktree: task.worktree?.status },
+				details: { id: task.id, status: task.status, mode: task.mode, role: task.role, scopes: task.scopes },
 			};
 		},
 	});
@@ -818,7 +806,7 @@ export default function (pi: ExtensionAPI) {
 			const all = tasks.list();
 			return {
 				content: [{ type: "text", text: boundParentText(all.length ? all.map(taskSummary).join("\n") : "No OpenCode workers.") }],
-				details: { tasks: all.map((task) => ({ id: task.id, status: task.status, mode: task.mode, worktree: task.worktree?.status })) },
+				details: { tasks: all.map((task) => ({ id: task.id, status: task.status, mode: task.mode })) },
 			};
 		},
 	});
@@ -838,7 +826,7 @@ export default function (pi: ExtensionAPI) {
 			const [result] = await tasks.wait([task.id], signal, true);
 			return {
 				content: [{ type: "text", text: taskResultText(result) }],
-				details: { id: result.id, status: result.status, role: result.role, worktree: result.worktree?.status },
+				details: { id: result.id, status: result.status, role: result.role },
 			};
 		},
 	});
@@ -958,7 +946,6 @@ export default function (pi: ExtensionAPI) {
 				relevantPaths: params.relevant_paths,
 				constraints: params.constraints,
 				expectedOutput: params.expected_output,
-				worktree: params.worktree,
 				implementerModel: params.implementer_model,
 				testerModel: params.tester_model,
 				reviewerModel: params.reviewer_model,
@@ -989,38 +976,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "opencode_worktree_list",
-		label: "List Retained Worktrees",
-		description: "List retained (never auto-deleted) worktree isolation entries that failed integration or cleanup and await a decision. Read-only: no mutation or absolute path is exposed.",
-		parameters: Type.Object({}),
-		async execute() {
-			const views = tasks.listRetainedWorktrees();
-			return {
-				content: [{ type: "text", text: boundParentText(formatRetainedWorktreeList(views)) }],
-				details: { retained: views },
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "opencode_worktree_status",
-		label: "Inspect Retained Worktree",
-		description: "Inspect one retained worktree isolation entry without modifying it. Read-only: no retry/discard and no absolute path is exposed.",
-		parameters: Type.Object({ id: Type.String({ description: "Retained worktree task id." }) }),
-		async execute(_toolCallId, params) {
-			const view = tasks.getRetainedWorktree(params.id);
-			return {
-				content: [{ type: "text", text: boundParentText(formatRetainedWorktreeDetail(view)) }],
-				details: view,
-			};
-		},
-	});
-
-	pi.registerTool({
 		name: "opencode_tools",
 		label: "OpenCode Tool Groups",
 		description:
-			"Activate a group of optional OpenCode orchestration tools additively for this session. Core tools (opencode_task, opencode_spawn, opencode_wait, opencode_tools) are always active. Groups: inspection (opencode_check, opencode_output, opencode_list, opencode_workflow_check, opencode_workflow_list, opencode_worktree_list, opencode_worktree_status), control (opencode_cancel, opencode_workflow_cancel), workflows (opencode_workflow, opencode_workflow_wait, opencode_workflow_check, opencode_workflow_cancel, opencode_workflow_list, opencode_verified_task), all (every OpenCode tool). Activation is additive and persists for the session; call opencode_output on demand after enabling inspection/all to fetch a retained raw output slice.",
+			"Activate a group of optional OpenCode orchestration tools additively for this session. Core tools (opencode_task, opencode_spawn, opencode_wait, opencode_tools) are always active. Groups: inspection (opencode_check, opencode_output, opencode_list, opencode_workflow_check, opencode_workflow_list), control (opencode_cancel, opencode_workflow_cancel), workflows (opencode_workflow, opencode_workflow_wait, opencode_workflow_check, opencode_workflow_cancel, opencode_workflow_list, opencode_verified_task), all (every OpenCode tool). Activation is additive and persists for the session; call opencode_output on demand after enabling inspection/all to fetch a retained raw output slice.",
 		promptSnippet: "Activate a group of optional OpenCode orchestration tools for this session",
 		parameters: Type.Object({ group: ToolGroupSchema }),
 		async execute(_toolCallId, params) {
@@ -1090,10 +1049,4 @@ export default function (pi: ExtensionAPI) {
 
 	registerModelCommand(pi, tasks, modelSync);
 
-	pi.registerCommand("opencode-worktrees", {
-		description: "Inspect and clean up retained worktree isolation entries. list/status are read-only; retry/discard require interactive UI confirmation",
-		handler: async (args, ctx) => {
-			await handleWorktreeCommand(tasks, args, ctx);
-		},
-	});
 }
