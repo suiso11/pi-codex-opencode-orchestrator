@@ -1,2 +1,14 @@
 node_modules/
 npm-debug.log*
+
+# Secret / environment state — never commit (auth stays per PC)
+.env
+.env.*
+*.env
+
+# Local / generated state
+*.log
+*.tsbuildinfo
+dist/
+.DS_Store
+Thumbs.db

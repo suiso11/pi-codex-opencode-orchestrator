@@ -1,6 +1,6 @@
 # Pi Codex OpenCode Orchestrator
 
-> Local installation: `pi-orch` launches OMP by default. Its native `task`/`wait` tools manage parallel workers and optional workspace isolation (`isolated: true`), with patch integration enabled. OpenCode workers remain available through `opencode_*` tools and write directly, one at a time. pi-orch's own worktree tools stay omitted. Use `PI_ORCH_RUNTIME=pi pi-orch` to launch the original Pi runtime. Explicit `pi::` worker routes still use Pi.
+> Local installation: `pi-orch` launches OMP by default. The parent uses native `task`/`wait` for work decomposition, parallel coordination, progress tracking, and IRC communication. Native children coordinate their assignments and delegate implementation and command-based verification through `opencode_*`; direct repository edits and commands are blocked for these coordinators. Use `isolated: true` for native coordinators whose OpenCode workers write in parallel, keep worker cwd/scopes inside each assigned workspace, and collect OpenCode results before returning. OMP owns workspace isolation and patch integration. A single bounded task can also be delegated directly from the parent through `opencode_*`. pi-orch's own worktree tools stay omitted. Use `PI_ORCH_RUNTIME=pi pi-orch` to launch the original Pi runtime. Explicit `pi::` worker routes still use Pi.
 
 
 
@@ -35,15 +35,29 @@ It adds background task control, safe parallel scheduling for declared file scop
 ## Requirements
 
 - Node.js 22 or newer
-- Pi with a configured Codex/OpenAI provider
+- OMP (oh-my-pi) — the default `pi-orch` runtime
 - OpenCode CLI with access to the selected worker model
+- Pi (optional) for the legacy `PI_ORCH_RUNTIME=pi` runtime
 - Codex CLI for optional GPT-5.6 Sol final-review subagents
 
-Install Pi and OpenCode according to their upstream documentation, then authenticate each provider before starting the launcher.
+Install each tool from its upstream installer, then authenticate per PC before starting the launcher.
+
+OMP ([can1357/oh-my-pi](https://github.com/can1357/oh-my-pi), [omp.sh](https://omp.sh)):
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+# macOS / Linux
+curl -fsSL https://omp.sh/install | sh
+# Windows PowerShell
+irm https://omp.sh/install.ps1 | iex
+```
+
+Other upstream channels: `bun install -g @oh-my-pi/pi-coding-agent`, `brew install can1357/tap/omp`, `nix profile add github:can1357/oh-my-pi`, or a pinned release via the installer's `--binary --ref v<version>` flag. Update an existing install with `omp update`.
+
+OpenCode workers, the optional Pi runtime, and the optional Codex CLI:
+
+```bash
 npm install -g opencode-ai@1.18.18
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
 npm install -g @openai/codex
 ```
 
@@ -54,12 +68,12 @@ For setup on additional PCs, configuration sharing, and update procedures, see [
 ```bash
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
 cd pi-codex-opencode-orchestrator
-npm install
+npm ci
 npm link
 pi-orch
 ```
 
-`npm link` registers the `pi-orch` command globally. After that, launch the orchestrator from any directory with:
+`npm ci` installs exactly the locked dependencies, and `npm link` registers the `pi-orch` command globally. After that, launch the orchestrator from any directory with:
 
 ```bash
 pi-orch
@@ -68,7 +82,15 @@ pi-orch
 You can still run `scripts/pi_codex_orchestrator.sh` directly, or
 `.\scripts\pi_codex_orchestrator.ps1` on Windows PowerShell, without creating the global command.
 
-On the first Pi run, use `/login` and select the Codex/OpenAI provider. The launcher defaults to `openai-codex/gpt-5.6-sol` for the parent and final approval.
+Authenticate on each PC; credentials are never shared through Git:
+
+```bash
+opencode auth login        # OpenCode worker models
+omp login openai-codex     # parent / final approval (or run `omp` and use /login)
+codex login                # optional Codex CLI final review
+```
+
+On the first run inside the orchestrator, use `/login` and select the Codex/OpenAI provider if you have not logged in on the command line. With `PI_ORCH_RUNTIME=pi`, use `pi` and `/login` instead. The launcher defaults to `openai-codex/gpt-5.6-sol` for the parent and final approval.
 
 You can override both models:
 
@@ -112,7 +134,7 @@ For worker routes, `opencode` runs the OpenCode CLI and `pi` bypasses OpenCode c
 
 The `tester` profile model is configured through the same surfaces: `pi-orch model tester [pi|opencode] <provider/model>`, the `PI_OPENCODE_PROFILE_TESTER` environment variable, or the saved per-user config. `/opencode-status` shows the active tester profile. `tester` and `reviewer` require `read_only` mode and are never inferred from the task name.
 
-After updating the extension code itself (for example `git pull` plus `npm install`), restart or reload Pi once so the running session uses the new extension code. Once that reload has happened, subsequent model changes through `/orch-model` or `pi-orch model` remain live without another restart.
+After updating the extension code itself (for example `git pull` plus `npm ci`), restart or reload Pi once so the running session uses the new extension code. Once that reload has happened, subsequent model changes through `/orch-model` or `pi-orch model` remain live without another restart.
 
 How changes apply to a running session:
 
@@ -412,7 +434,7 @@ Manage retained or conflicted worktrees in the running session with `/opencode-w
 ### Roles and extension reload
 
 - `tester` and `reviewer` roles are unchanged and remain read-only; they are not affected by worktree write isolation.
-- This feature requires the new extension code. After updating the extension (for example `git pull` plus `npm install`), reload Pi once so the running session uses the new code.
+- This feature requires the new extension code. After updating the extension (for example `git pull` plus `npm ci`), reload Pi once so the running session uses the new code.
 
 ## Routing and token-aware delivery
 

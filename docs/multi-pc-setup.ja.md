@@ -2,44 +2,57 @@
 
 この環境を複数PCで使う場合は、このリポジトリを唯一の配布元にし、実行プログラム、共有設定、認証情報を分離する。
 
-- Pi、OpenCode、Codex CLIは各PCへグローバルインストールする
-- オーケストレーター本体とランチャーはこのリポジトリで管理する
+- OMP（既定ランタイム）、OpenCode、および任意のPi・Codex CLIは各PCへインストールする
+- オーケストレーター本体とランチャーはこのリポジトリで管理する（clone → `npm ci` → `npm link`）
 - 一般的なエージェント指示と秘密情報を含まない設定だけを同期する
-- Codex、OpenCode、Piの認証はPCごとに行い、認証ファイルやAPIキーはGitへ入れない
+- OMP/OpenCode/Codex/Piの認証はPCごとに行い、認証ファイルやAPIキーはGitへ入れない
 
 ## 前提
 
 - Git
 - Node.js 22以降
 - npm
+- OMP（oh-my-pi）: ランチャー `pi-orch` の既定ランタイム
 - OpenAI/Codex、OpenCode Go、およびPiから使用するプロバイダーの利用権限
 
 ## 現在利用できる導入方法
 
-Windows PowerShellでは次を実行する。
-
-```powershell
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
-npm install -g opencode-ai@1.18.18
-npm install -g @openai/codex
-
-git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
-Set-Location pi-codex-opencode-orchestrator
-npm install
-.\scripts\pi_codex_orchestrator.ps1
-```
+最初に、既定ランタイムのOMPとOpenCodeを各PCへインストールする。OMPは上流（[can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) / [omp.sh](https://omp.sh)）の公式インストーラーを使う。
 
 LinuxまたはmacOSでは次を実行する。
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+curl -fsSL https://omp.sh/install | sh
 npm install -g opencode-ai@1.18.18
-npm install -g @openai/codex
+npm install -g @openai/codex   # 任意: Codex CLIによる最終レビュー用
 
 git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
 cd pi-codex-opencode-orchestrator
-npm install
-scripts/pi_codex_orchestrator.sh
+npm ci
+npm link
+pi-orch
+```
+
+Windows PowerShellでは次を実行する。
+
+```powershell
+irm https://omp.sh/install.ps1 | iex
+npm install -g opencode-ai@1.18.18
+npm install -g @openai/codex   # 任意
+
+git clone https://github.com/suiso11/pi-codex-opencode-orchestrator.git
+Set-Location pi-codex-opencode-orchestrator
+npm ci
+npm link
+pi-orch
+```
+
+OMPの他の上流導入手段（bun・Homebrew・Nix・バージョン固定）は upstream README を参照すること。`npm ci` は `package-lock.json` 通りの再現可能なインストール、`npm link` は `pi-orch` コマンドのグローバル登録を行う。グローバルコマンドを作りたくない場合は、引き続き `scripts/pi_codex_orchestrator.sh` または `.\scripts\pi_codex_orchestrator.ps1` を直接実行してよい。
+
+`PI_ORCH_RUNTIME=pi` で旧Piランタイムを使う場合のみ、追加でPiをインストールする。
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
 ```
 
 別のプロジェクトでプロジェクトローカル拡張として使う場合は、オーケストレーターを対象リポジトリへコピーする。
@@ -56,16 +69,16 @@ cp -R .pi/extensions/opencode-orchestrator /path/to/project/.pi/extensions/
 認証情報はPC間でコピーせず、新しいPCでそれぞれログインする。
 
 ```bash
-codex login
-opencode auth login
-pi
+opencode auth login        # OpenCode workerモデル
+omp login openai-codex     # 親・最終承認（`omp` 起動後の `/login` でもよい）
+codex login                # 任意: Codex CLI最終レビュー用
 ```
 
-Piが起動したら `/login` を実行し、Codex/OpenAIプロバイダーを選択する。ログイン状態は必要に応じて次で確認する。
+`PI_ORCH_RUNTIME=pi` を使う場合のみ、`pi` を起動して `/login` を実行し、Codex/OpenAIプロバイダーを選択する。ログイン状態は必要に応じて次で確認する。
 
 ```bash
-codex login status
 opencode auth list
+codex login status
 ```
 
 次の情報はGit、共有フォルダー、dotfilesリポジトリへ入れない。
@@ -335,22 +348,25 @@ Piのグローバル設定例:
 
 ```bash
 git pull --ff-only
-npm install
+npm ci
+npm link
 npm test
 npm run typecheck
 ```
 
-グローバルCLIを更新する場合:
+`npm link` は既にグローバル登録済みでも再実行して問題ない。グローバルCLIを更新する場合:
 
 ```bash
-pi update --self
+omp update
 npm update -g opencode-ai @openai/codex
+# PI_ORCH_RUNTIME=pi を使う場合のみ
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
 ```
 
 更新後はランチャーと各CLIを確認する。
 
 ```bash
-pi --version
+omp --version
 opencode --version
 codex --version
 ```

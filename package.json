@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Pi extension for Codex-orchestrated OpenCode workers",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "pi-orch": "scripts/pi-orch.mjs"
   },
