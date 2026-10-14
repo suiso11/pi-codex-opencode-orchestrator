@@ -359,6 +359,48 @@ test("child cwd is the isolated worktree preserving the original cwd-relative su
 	}
 });
 
+test("worktree isolation integrates when the spawn cwd uses an alias spelling of the repo", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	// Alias spelling of the same repo directory: the Linux analogue of native
+	// Windows short/long (RUNNER~1) spellings, where git reports the canonical
+	// form while Node holds the original spelling. Child-cwd derivation and
+	// scope math must come from git authority, not cross-spelling string math.
+	const aliasBase = await mkdtemp(path.join(os.tmpdir(), "wt-alias-"));
+	const aliasDir = path.join(aliasBase, "alias-repo");
+	try {
+		try {
+			await symlink(repo.dir, aliasDir, "dir");
+		} catch {
+			return;
+		}
+		const started = manager.spawn(
+			{
+				...spec("wt-alias", "write", ["src/a.txt"], "WRITE_SRC_A"),
+				worktree: true,
+			},
+			path.join(aliasDir, "サブ ディレクトリ"),
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(settled.worktree?.status, "integrated");
+		assert.equal(await readFile(path.join(repo.subDir, "src", "a.txt"), "utf8"), "A-from-worker\n");
+		assertNoWorktreePathsLeak(settled);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		if (id) await cleanupRepo(repo, [id]);
+		await rm(aliasBase, { recursive: true, force: true });
+	}
+});
+
 test("absolute worktree-relative report.files paths become repo-relative after settle", async () => {
 	const fake = await fakeWorker();
 	const repo = await fakeGitRepo();

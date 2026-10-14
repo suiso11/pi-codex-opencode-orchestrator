@@ -1305,6 +1305,32 @@ export class OpenCodeTaskManager {
 		const toplevel = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 		if (!toplevel) throw new Error("Worktree isolation requires a Git repository root.");
 		const repoRoot = path.resolve(toplevel.toString("utf8").trim());
+		// The cwd's repo-relative subdirectory straight from git (the same
+		// authority as --show-toplevel), so no cross-spelling string math is
+		// needed between git's canonical long form and Node's os.tmpdir()
+		// 8.3 short form on native Windows. --show-prefix prints the
+		// repo-relative path of cwd with forward slashes (empty for the root
+		// itself); realpath canonicalization alone did not converge the two
+		// spellings on the Windows runner, which broke child-cwd derivation
+		// and every downstream integration assertion.
+		const prefixBuffer = runGit(cwd, ["rev-parse", "--show-prefix"]);
+		if (!prefixBuffer) throw new Error("Worktree isolation requires a Git repository prefix.");
+		const relCwd = prefixBuffer
+			.toString("utf8")
+			.trim()
+			.split("/")
+			.filter((segment) => segment.length > 0 && segment !== ".")
+			.join(path.sep);
+		// Re-base the caller-spelled absolute scopes onto the git-canonical
+		// repoRoot spelling through same-spelling relative math against cwd
+		// joined under the git-reported cwd prefix, so scope containment and
+		// repo-relative views below compare a single spelling. A scope outside
+		// cwd is kept as-is and still fails closed downstream.
+		const canonicalScopes = scopes.map((scope) => {
+			const rel = path.relative(cwd, scope);
+			if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return scope;
+			return path.join(repoRoot, relCwd, rel);
+		});
 		const key = pathForScopeComparison(repoRoot);
 		const baseDir = worktreeRootDir(repoRoot);
 		let batch = this.worktreeBatches.get(key);
@@ -1342,14 +1368,13 @@ export class OpenCodeTaskManager {
 				);
 				throw new Error(`Failed to create isolated worktree: ${stderr || "git worktree add failed"}`);
 			}
-			const relCwd = canonicalRelative(repoRoot, cwd);
 			const childCwd = relCwd ? path.join(wtPath, relCwd) : wtPath;
 			entry.worktree = {
 				path: wtPath,
 				repoRoot,
 				childCwd,
 				baseHead: batch.baseHead,
-				scopes,
+				scopes: canonicalScopes,
 				batch,
 			};
 			entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
