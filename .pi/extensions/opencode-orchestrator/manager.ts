@@ -42,18 +42,22 @@ import {
 	DEFAULT_MODEL,
 	DEFAULT_TOOL_PROFILE,
 	extractUsageFromEvent,
-	findScopeConflict,
+	frozenScopeKeysOverlap,
+	isGitEntryInScope,
 	MAX_ACTIVITY_ITEMS,
 	MAX_RUNNING,
 	MAX_TRACKED,
 	mergeUsage,
 	MODEL_PROFILE_DEFAULTS,
+	normalizeGitEntryRel,
 	normalizeScopes,
 	normalizeWorkerModelValue,
+	parseGitPrefixSegments,
 	parseWorkerReport,
 	pathForScopeComparison,
 	resolveModel,
 	resolveThinkingLevel,
+	stripGitLineTerminator,
 	type ModelCapability,
 	type ToolProfile,
 } from "./types.ts";
@@ -79,6 +83,13 @@ interface ManagedTask {
 	cwd?: string;
 	childCwd?: string;
 	baselineFingerprint?: GitFingerprint;
+	// Frozen scope authority captured at task acceptance, before the worker
+	// can mutate the tree. scopeKeys are pathForScopeComparison snapshots for
+	// overlap checks (never re-canonicalized, so a worker-retargeted scope
+	// leaf cannot widen them). scopeAuthority maps every scope to its
+	// repo-relative Git entry namespace form for lexical entry authorization.
+	scopeKeys?: string[];
+	scopeAuthority?: { repoRoot: string; scopeRels: string[] };
 	// Direct write workers use the same post-run Git guard as tester workers,
 	// but additionally enforce the worker's declared scopes.
 	gitGuard?: "tester" | "direct-write";
@@ -115,6 +126,11 @@ interface WorktreeRuntime {
 	childCwd: string;
 	baseHead: string;
 	scopes: string[];
+	// Frozen repo-relative Git entry namespace forms of scopes, captured in
+	// prepareWorktree before the worker runs. Entry authorization compares
+	// changed Git entry names against these lexically (never realpaths an
+	// entry or a scope leaf), so symlinks cannot disguise outside entries.
+	scopeRels: string[];
 	batch: WorktreeBatch;
 	patchPath?: string;
 	patchBuffer?: Buffer;
@@ -380,14 +396,6 @@ function sameGitFingerprint(left: GitFingerprint, right: GitFingerprint): boolea
 	return true;
 }
 
-function pathWithinScope(fileAbs: string, scope: string) {
-	// Containment is decided with path.relative (not a string prefix) so that
-	// Japanese/space-containing paths and prefix lookalikes (e.g. scope "src/a"
-	// vs file "src/a-b/c") are handled correctly on every platform.
-	const relative = canonicalRelative(pathForScopeComparison(scope), pathForScopeComparison(fileAbs));
-	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-}
-
 // Relative path between two locations that may use different spellings of the
 // same directory. On native Windows, git reports the canonical long form
 // (`C:/Users/runneradmin/...`) while Node's os.tmpdir() uses the 8.3 short
@@ -397,8 +405,73 @@ function pathWithinScope(fileAbs: string, scope: string) {
 // pathForScopeComparison (realpath canonicalization, case-folded on Windows)
 // so identical locations compare equal. Pure string math on canonical forms;
 // callers still treat any escaping result as outside (fail closed).
+// Identity/reporting use only (child-cwd derivation, report normalization,
+// redaction): NEVER use this to authorize a Git entry by name. Changed Git
+// entries are authorized lexically in the entry namespace (isGitEntryInScope
+// against frozen scopeRels) so symlinks cannot disguise outside entries.
 function canonicalRelative(from: string, to: string): string {
 	return path.relative(pathForScopeComparison(from), pathForScopeComparison(to));
+}
+
+// Parse `rev-parse --show-toplevel` output into an absolute repo root. Only
+// the Git line terminator is stripped: trim() would destroy valid leading
+// whitespace in a cwd directory (e.g. ` workspace`) or a trailing-space repo
+// root. Hash/ref/boolean outputs are unaffected and keep trim().
+function parseGitToplevel(buffer: Buffer): string {
+	return path.resolve(stripGitLineTerminator(buffer.toString("utf8")));
+}
+
+// Parse `rev-parse --show-prefix` into an OS-relative cwd prefix. Segment
+// whitespace is preserved; only the line terminator is stripped.
+function parseGitPrefix(buffer: Buffer): string {
+	return parseGitPrefixSegments(buffer.toString("utf8")).join(path.sep);
+}
+
+// Repo-relative POSIX form of a lexical relative path for the Git entry
+// namespace (no filesystem access, so no symlink is ever followed). Only the
+// native filesystem separator is folded: on POSIX the split is a no-op, so a
+// literal backslash in a Git-provided name is preserved verbatim; on Windows
+// native backslash separators become `/` before entry normalization.
+function toEntryRel(value: string): string {
+	return normalizeGitEntryRel(value.split(path.sep).join(path.posix.sep));
+}
+
+// Freeze scope authority at task acceptance, before the worker can mutate the
+// tree. The cwd's repo-relative position comes straight from git (the same
+// --show-prefix authority prepareWorktree uses for child-cwd derivation), and
+// each scope is mapped lexically from the caller-spelled cwd without any
+// realpath, so directory aliases/junctions converge while a worker-retargeted
+// scope leaf (e.g. an ignored scope file symlinked at an outside tracked
+// directory) can never widen the frozen form. Scopes escaping the working
+// directory map to `..`, which contains no entry (fail closed).
+function freezeScopeAuthority(cwd: string, scopes: string[]): { repoRoot: string; scopeRels: string[] } | undefined {
+	const top = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	const prefix = runGit(cwd, ["rev-parse", "--show-prefix"]);
+	if (!top || !prefix) return undefined;
+	const repoRoot = parseGitToplevel(top);
+	const cwdRel = toEntryRel(parseGitPrefix(prefix));
+	const scopeRels = scopes.map((scope) => {
+		const rel = path.relative(cwd, scope);
+		if (rel === "") return cwdRel === "" ? "." : cwdRel;
+		if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return "..";
+		const relPosix = toEntryRel(rel);
+		return cwdRel === "" ? relPosix : `${cwdRel}/${relPosix}`;
+	});
+	return { repoRoot, scopeRels };
+}
+
+// Lexical Git-entry authorization against frozen scope authority. Changed
+// entry names (repo-relative, as reported by git) stay entry names: neither
+// the entry nor any scope leaf is realpathed, so a tracked outside-link
+// symlink resolving to an in-scope target, a direct write disguising an
+// outside entry as a symlink to an allowed target, or a newly replaced
+// ancestor directory symlink can never read as in-scope. Git already reports
+// the entry namespace verbatim (`-z`, forward slashes), so the entry is
+// normalized verbatim on every platform: a literal backslash stays a
+// filename character and never authorizes as a separator.
+function gitEntryInScope(scopeRels: readonly string[], entryRel: string): boolean {
+	const entry = normalizeGitEntryRel(entryRel);
+	return scopeRels.some((scopeRel) => isGitEntryInScope(scopeRel, entry));
 }
 
 // Stable OS-temp base directory derived from the repository root hash. Working
@@ -696,10 +769,19 @@ function createPatchArchive(baseDir: string, patch: Buffer): string {
 export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 	const worktreeCheck = requiredGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
 	if (!worktreeCheck || worktreeCheck.toString("utf8").trim() !== "true") return undefined;
-	const head = requiredGit(cwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
+	// Unify every path to the repository-root-relative entry namespace: run
+	// all commands from the toplevel so `status --porcelain` (root-relative),
+	// `ls-files --others` (cwd-relative), and `diff -- <pathspec>` agree on
+	// one namespace. Without this a subdirectory cwd mixes namespaces and
+	// scope mapping cannot be lexical. Only the line terminator is stripped
+	// from the toplevel so whitespace directory names survive.
+	const top = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	if (!top) return undefined;
+	const gitRoot = parseGitToplevel(top);
+	const head = requiredGit(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
 	const headOid = head?.toString("utf8").trim();
 	if (!headOid) return undefined;
-	const headRefResult = runGitResult(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	const headRefResult = runGitResult(gitRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
 	const headRef = headRefResult.ok ? headRefResult.stdout.toString("utf8").trim() || undefined : undefined;
 	const hash = createHash("sha256");
 	hash.update(Buffer.from("head-oid\0"));
@@ -708,24 +790,24 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 	const paths = new Set<string>();
 
 	hash.update(Buffer.from("worktree-diff\0"));
-	const worktreeDiff = requiredGit(cwd, ["diff", "--no-color", "--binary"]);
+	const worktreeDiff = requiredGit(gitRoot, ["diff", "--no-color", "--binary"]);
 	if (!worktreeDiff) return undefined;
 	hash.update(worktreeDiff);
 	hash.update(Buffer.from("\0staged-diff\0"));
-	const stagedDiff = requiredGit(cwd, ["diff", "--cached", "--no-color", "--binary"]);
+	const stagedDiff = requiredGit(gitRoot, ["diff", "--cached", "--no-color", "--binary"]);
 	if (!stagedDiff) return undefined;
 	hash.update(stagedDiff);
 	hash.update(Buffer.from("\0untracked\0"));
-	const untracked = requiredGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+	const untracked = requiredGit(gitRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
 	if (!untracked) return undefined;
 	for (const relative of splitNul(untracked)) {
 		paths.add(relative);
 		hash.update(Buffer.from(relative, "utf8"));
 		hash.update(Buffer.from("\0"));
-		if (!hashPathWithoutFollowing(hash, path.join(cwd, relative)).ok) return undefined;
+		if (!hashPathWithoutFollowing(hash, path.join(gitRoot, relative)).ok) return undefined;
 		hash.update(Buffer.from("\0"));
 	}
-	const status = requiredGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+	const status = requiredGit(gitRoot, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
 	if (!status) return undefined;
 	const statusByPath = new Map<string, string>();
 	for (const { path: relative, status: xy } of parsePorcelainStatusRecords(splitNul(status))) {
@@ -741,13 +823,13 @@ export function captureGitFingerprint(cwd: string): GitFingerprint | undefined {
 		const pathHash = createHash("sha256");
 		pathHash.update(statusByPath.get(relative) ?? "");
 		pathHash.update(Buffer.from("\\0worktree-content\\0"));
-		if (!hashPathWithoutFollowing(pathHash, path.join(cwd, relative)).ok) return undefined;
+		if (!hashPathWithoutFollowing(pathHash, path.join(gitRoot, relative)).ok) return undefined;
 		pathHash.update(Buffer.from("\\0unstaged-diff\\0"));
-		const unstaged = requiredGit(cwd, ["diff", "--no-color", "--binary", "--full-index", "--", relative]);
+		const unstaged = requiredGit(gitRoot, ["diff", "--no-color", "--binary", "--full-index", "--", relative]);
 		if (!unstaged) return undefined;
 		pathHash.update(unstaged);
 		pathHash.update(Buffer.from("\\0staged-diff\\0"));
-		const staged = requiredGit(cwd, ["diff", "--cached", "--no-color", "--binary", "--full-index", "--", relative]);
+		const staged = requiredGit(gitRoot, ["diff", "--cached", "--no-color", "--binary", "--full-index", "--", relative]);
 		if (!staged) return undefined;
 		pathHash.update(staged);
 		pathHashes.set(relative, pathHash.digest("hex"));
@@ -896,10 +978,23 @@ export class OpenCodeTaskManager {
 	private conflictFor(spec: InternalTaskSpec, cwd: string) {
 		if (spec.mode !== "write") return undefined;
 		const scopes = normalizeScopes(cwd, spec.relevantPaths);
+		const keys = scopes.map((scope) => pathForScopeComparison(scope));
 		for (const entry of this.runningEntries()) {
 			if (entry.snapshot.mode !== "write") continue;
-			const conflict = findScopeConflict(scopes, entry.snapshot.scopes);
-			if (conflict) return { task: entry.snapshot, conflict };
+			// Compare against the running task's acceptance-time frozen keys:
+			// re-canonicalizing its live scopes now would follow a leaf the
+			// worker has since retargeted and widen the authority.
+			const otherKeys = entry.scopeKeys ?? entry.snapshot.scopes.map((scope) => pathForScopeComparison(scope));
+			for (let i = 0; i < keys.length; i++) {
+				for (let j = 0; j < otherKeys.length; j++) {
+					if (frozenScopeKeysOverlap(keys[i], otherKeys[j])) {
+						return {
+							task: entry.snapshot,
+							conflict: { left: scopes[i], right: entry.snapshot.scopes[j] ?? otherKeys[j] },
+						};
+					}
+				}
+			}
 		}
 		return undefined;
 	}
@@ -993,6 +1088,10 @@ export class OpenCodeTaskManager {
 			delivered: false,
 			cancelRequested: false,
 		};
+		// Freeze the scope authority at task acceptance, before the worker can
+		// mutate the tree: canonical overlap keys plus the repo-relative Git
+		// entry namespace forms used for post-run authorization.
+		entry.scopeKeys = scopes.map((scope) => pathForScopeComparison(scope));
 		try {
 			let childCwd = cwd;
 			if (spec.worktree) childCwd = this.prepareWorktree(entry, cwd, scopes);
@@ -1017,6 +1116,13 @@ export class OpenCodeTaskManager {
 				entry.baselineFingerprint = baseline;
 				entry.cwd = cwd;
 				entry.gitGuard = guard;
+				if (guard === "direct-write") {
+					const authority = freezeScopeAuthority(cwd, scopes);
+					if (!authority) {
+						throw new Error("Direct write workers require a Git worktree with a capturable baseline; refusing to spawn without scope enforcement.");
+					}
+					entry.scopeAuthority = authority;
+				}
 			}
 			this.tasks.set(id, entry);
 			this.prune();
@@ -1254,17 +1360,24 @@ export class OpenCodeTaskManager {
 			entry.snapshot.status = "error";
 			entry.snapshot.error = `Direct write worker scope enforcement failed: ${comparison.error}; files were NOT reverted.`;
 		} else if (entry.gitGuard === "direct-write" && comparison?.mutated) {
-			const scopes = entry.snapshot.scopes;
-			const outOfScope = comparison.changedPaths.filter((relative) => {
-				const absolute = path.resolve(entry.cwd!, relative);
-				return !scopes.some((scope) => pathWithinScope(absolute, scope));
-			});
-			if (outOfScope.length > 0) {
+			// Lexical Git-entry authorization against the acceptance-time
+			// frozen authority. Changed entry names stay entry names: no
+			// realpath of the entry or any scope leaf, so an outside entry
+			// disguised as a symlink to an allowed target still reads as
+			// the outside entry it is. A missing authority fails closed.
+			const authority = entry.scopeAuthority;
+			if (!authority) {
 				entry.snapshot.status = "error";
-				entry.snapshot.error = `Direct write worker changed out-of-scope path(s): ${outOfScope.join(", ")}; files were NOT reverted. Post-run detection is not a sandbox; outside-repo and ignored side effects are not prevented.`;
-			} else if (comparison.changedPaths.length === 0) {
-				entry.snapshot.status = "error";
-				entry.snapshot.error = "Direct write worker changed the repository, but the changed path could not be identified; files were NOT reverted.";
+				entry.snapshot.error = "Direct write worker scope enforcement failed: the frozen scope authority is unavailable; files were NOT reverted.";
+			} else {
+				const outOfScope = comparison.changedPaths.filter((relative) => !gitEntryInScope(authority.scopeRels, relative));
+				if (outOfScope.length > 0) {
+					entry.snapshot.status = "error";
+					entry.snapshot.error = `Direct write worker changed out-of-scope path(s): ${outOfScope.join(", ")}; files were NOT reverted. Post-run detection is not a sandbox; outside-repo and ignored side effects are not prevented.`;
+				} else if (comparison.changedPaths.length === 0) {
+					entry.snapshot.status = "error";
+					entry.snapshot.error = "Direct write worker changed the repository, but the changed path could not be identified; files were NOT reverted.";
+				}
 			}
 		} else if (entry.gitGuard === "tester" && comparison) {
 			const mutation = comparison.error ?? (comparison.mutated ? detectMutationMessage(entry.baselineFingerprint!, comparison) : undefined);
@@ -1304,7 +1417,10 @@ export class OpenCodeTaskManager {
 	private prepareWorktree(entry: ManagedTask, cwd: string, scopes: string[]) {
 		const toplevel = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 		if (!toplevel) throw new Error("Worktree isolation requires a Git repository root.");
-		const repoRoot = path.resolve(toplevel.toString("utf8").trim());
+		// Only the Git line terminator is stripped: trim() would destroy valid
+		// leading whitespace in a cwd directory (e.g. ` workspace`) or a
+		// trailing-space repo root. Hash/ref/diagnostic outputs keep trim().
+		const repoRoot = parseGitToplevel(toplevel);
 		// The cwd's repo-relative subdirectory straight from git (the same
 		// authority as --show-toplevel), so no cross-spelling string math is
 		// needed between git's canonical long form and Node's os.tmpdir()
@@ -1312,15 +1428,11 @@ export class OpenCodeTaskManager {
 		// repo-relative path of cwd with forward slashes (empty for the root
 		// itself); realpath canonicalization alone did not converge the two
 		// spellings on the Windows runner, which broke child-cwd derivation
-		// and every downstream integration assertion.
+		// and every downstream integration assertion. Segment whitespace is
+		// preserved: only the line terminator is stripped.
 		const prefixBuffer = runGit(cwd, ["rev-parse", "--show-prefix"]);
 		if (!prefixBuffer) throw new Error("Worktree isolation requires a Git repository prefix.");
-		const relCwd = prefixBuffer
-			.toString("utf8")
-			.trim()
-			.split("/")
-			.filter((segment) => segment.length > 0 && segment !== ".")
-			.join(path.sep);
+		const relCwd = parseGitPrefix(prefixBuffer);
 		// Re-base the caller-spelled absolute scopes onto the git-canonical
 		// repoRoot spelling through same-spelling relative math against cwd
 		// joined under the git-reported cwd prefix, so scope containment and
@@ -1330,6 +1442,17 @@ export class OpenCodeTaskManager {
 			const rel = path.relative(cwd, scope);
 			if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return scope;
 			return path.join(repoRoot, relCwd, rel);
+		});
+		// Frozen Git entry namespace forms of the rebased scopes, captured
+		// before the worker runs. Both sides share the git-canonical repoRoot
+		// spelling, so this lexical mapping needs no realpath and can never
+		// be widened by a worker-retargeted scope leaf. Outside-cwd scopes
+		// map to `..` and contain no entry (fail closed).
+		const scopeRels = canonicalScopes.map((scope) => {
+			const rel = path.relative(repoRoot, scope);
+			if (rel === "") return ".";
+			if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return "..";
+			return toEntryRel(rel);
 		});
 		const key = pathForScopeComparison(repoRoot);
 		const baseDir = worktreeRootDir(repoRoot);
@@ -1375,6 +1498,7 @@ export class OpenCodeTaskManager {
 				childCwd,
 				baseHead: batch.baseHead,
 				scopes: canonicalScopes,
+				scopeRels,
 				batch,
 			};
 			entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
@@ -1423,11 +1547,15 @@ export class OpenCodeTaskManager {
 		const names = runGitResult(wt.path, ["diff", "--cached", "--name-only", "-z"]);
 		if (!names.ok) throw new Error("Failed to enumerate isolated worktree changes.");
 		const changedPaths = splitNul(names.stdout);
+		// Lexical Git-entry authorization against the acceptance-time frozen
+		// scopeRels. Entry names stay entry names: neither the changed entry
+		// nor any scope leaf is realpathed, so deleting/replacing a tracked
+		// outside-link symlink that resolves to an in-scope target (or a
+		// newly replaced ancestor directory symlink) still reads as the
+		// outside entry it is and refuses integration.
 		const outOfScope: string[] = [];
 		for (const rel of changedPaths) {
-			const originalAbs = path.resolve(wt.repoRoot, rel);
-			const inside = wt.scopes.some((scope) => pathWithinScope(originalAbs, scope));
-			if (!inside) outOfScope.push(rel);
+			if (!gitEntryInScope(wt.scopeRels, rel)) outOfScope.push(rel);
 		}
 		if (outOfScope.length > 0) {
 			wt.changedPaths = changedPaths;
@@ -1996,7 +2124,9 @@ export class OpenCodeTaskManager {
 			let entryRepo = entry.worktree?.repoRoot;
 			if (!entryRepo && entry.childCwd) {
 				const top = runGit(entry.childCwd, ["rev-parse", "--show-toplevel"]);
-				if (top) entryRepo = path.resolve(top.toString("utf8").trim());
+				// Only the line terminator is stripped so whitespace repo
+				// roots keep their identity here too.
+				if (top) entryRepo = parseGitToplevel(top);
 			}
 			if (entryRepo && pathForScopeComparison(entryRepo) === key) {
 				return `Cannot modify retained worktree while task ${entry.snapshot.id} "${entry.snapshot.name}" is running in the same repository.`;

@@ -276,11 +276,11 @@ Explicit roles:
 - `reviewer`: strictly read-only review with no bash and no edit tools. It always resolves to `high` thinking for a stronger independent perspective.
 
 - `read_only`: file changes are forbidden; overlapping research scopes are allowed.
-- `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship. Non-worktree write workers are checked after completion by comparing Git content fingerprints from before and after the run; only paths changed during that run are scope-checked, so pre-existing dirty changes are preserved.
+- `write`: changes are limited to declared paths. Concurrent tasks are rejected when scopes are identical or have a parent/child relationship. Non-worktree write workers are checked after completion by comparing Git content fingerprints from before and after the run; only paths changed during that run are scope-checked, so pre-existing dirty changes are preserved. Changed Git entries are authorized lexically by entry name against scope authority frozen at task acceptance (a tracked symlink such as `outside-link` stays `outside-link` even when it resolves to an in-scope target, and a worker-retargeted scope leaf cannot widen the frozen authority); filesystem identity (aliases, junctions, Windows casing) still converges for cwd/scope routing.
 - `opencode_workflow`: requires at least two sequential phases. Tasks inside one phase fan out under the same global four-worker cap.
 - `opencode_verified_task`: one-objective standard verification loop (see below) inside the `workflows` tool group.
 
-Path enforcement is a scheduler, prompt-level, and (for direct writes) post-run guard, not an operating-system sandbox. The post-run guard reports out-of-scope changes as errors and never reverts files; bash can still mutate during execution or outside the repository, and ignored side effects are not prevented. The parent Codex agent must still inspect the final diff and run relevant tests.
+Path enforcement is a scheduler, prompt-level, and (for direct writes) post-run guard, not an operating-system sandbox. The post-run guard reports out-of-scope changes as errors and never reverts files; bash can still mutate during execution or outside the repository, and ignored side effects are not prevented. Git path outputs (`--show-toplevel`/`--show-prefix`) strip only the line terminator so leading/trailing whitespace in directory names keeps its filesystem identity. The parent Codex agent must still inspect the final diff and run relevant tests.
 
 ## Opt-in worktree write isolation
 
@@ -429,7 +429,7 @@ Manage retained or conflicted worktrees in the running session with `/opencode-w
 - Read-only inspection is available to agents through the `inspection` tool group as `opencode_worktree_list` and `opencode_worktree_status`; these return no filesystem paths in model-facing output.
 - The dashboard may retain a "worktree cleanup needed" warning while retained worktrees exist. There is no automatic cleanup on orchestrator shutdown.
 - The registry is current-session-only. Restart/crash recovery and cross-session garbage collection are deferred; on a restart, temp artifacts may remain for the OS to clean up and are not listed, and no path is exposed in model-facing output.
-- Worktree isolation isolates the working tree; it is not a sandbox. It does not prevent a worker's bash from running arbitrary commands or writing outside the worktree during execution. Only the final staged patch within declared scopes is integrated.
+- Worktree isolation isolates the working tree; it is not a sandbox. It does not prevent a worker's bash from running arbitrary commands or writing outside the worktree during execution. Only the final staged patch within declared scopes is integrated. Scope authorization for that patch is lexical over Git entry names (deleting or replacing a tracked symlink counts as changing that entry, and replacing a scope ancestor directory counts as changing that ancestor), so outside entries cannot ride in through symlink targets.
 
 ### Roles and extension reload
 
@@ -483,7 +483,7 @@ npm test
 npm run typecheck
 ```
 
-The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, previous-phase context handoff, and one-turn orchestration context pruning.
+The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, previous-phase context handoff, one-turn orchestration context pruning, and the literal-backslash separator guard (282 tests green with typecheck clean; a repo-root `allowed\escape.txt` never authorizes under scope `allowed`, and a `\` scope is never repository-wide; the Git entry normalizer is verbatim on every platform with native separators converted exactly once at the manager boundary and Windows keeping case-insensitive comparison only; verified by real-Git worktree/direct-write regressions plus an 11-check actual-Git smoke on Ubuntu).
 
 ## Design note
 

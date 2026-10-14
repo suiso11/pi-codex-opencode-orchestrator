@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
@@ -1614,6 +1615,174 @@ test("direct write scope guard respects path boundaries and Japanese paths", asy
 		await japaneseManager.dispose();
 		await japaneseFake.cleanup();
 		await japaneseRepo.cleanup();
+	}
+});
+
+test("direct write rejects a POSIX literal-backslash entry outside the scope", async () => {
+	// POSIX-only: on Windows the same bytes name `allowed/escape.txt`, which
+	// genuinely is in scope. On POSIX `allowed\escape.txt` is one repo-root
+	// filename that must not authorize under scope `allowed`.
+	if (process.platform === "win32") return;
+	const fake = await fakeMutatingOpenCode('writeFileSync("allowed\\\\escape.txt", "trap\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	await mkdir(path.join(repo.dir, "allowed"), { recursive: true });
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-literal-trap", "write", ["allowed"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\)/);
+		assert.match(settled.error ?? "", /files were NOT reverted/);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write keeps a literal-backslash scope from becoming repository-wide", async () => {
+	// POSIX-only: a scope naming the literal file `\` authorizes exactly that
+	// entry. A `base.txt` change is out-of-scope; a `\` change is allowed.
+	if (process.platform === "win32") return;
+	const rejectFake = await fakeMutatingOpenCode('writeFileSync("base.txt", "worker\\n", "utf8");');
+	const rejectRepo = await fakeGitRepo();
+	const rejectManager = new OpenCodeTaskManager({ binary: rejectFake.binary, binaryArgs: rejectFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = rejectManager.spawn(spec("direct-backslash-scope", "write", ["\\"]), rejectRepo.dir);
+		const [settled] = await rejectManager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*base\.txt/);
+	} finally {
+		await rejectManager.dispose();
+		await rejectFake.cleanup();
+		await rejectRepo.cleanup();
+	}
+
+	const allowFake = await fakeMutatingOpenCode('writeFileSync("\\\\", "literal\\n", "utf8");');
+	const allowRepo = await fakeGitRepo();
+	const allowManager = new OpenCodeTaskManager({ binary: allowFake.binary, binaryArgs: allowFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = allowManager.spawn(spec("direct-backslash-self", "write", ["\\"]), allowRepo.dir);
+		const [settled] = await allowManager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(await readFile(path.join(allowRepo.dir, "\\"), "utf8"), "literal\n");
+	} finally {
+		await allowManager.dispose();
+		await allowFake.cleanup();
+		await allowRepo.cleanup();
+	}
+});
+
+// Real-Git repo with a tracked symlink trap: `outside-link` resolves to the
+// in-scope `allowed/a.txt`, and `scratch` is a git-ignored scope file.
+async function fakeScopeTrapRepo() {
+	const base = await mkdtemp(path.join(os.tmpdir(), "scope-trap-"));
+	const dir = base;
+	mkdirSync(path.join(dir, "allowed"), { recursive: true });
+	const git = (args: string[]) =>
+		execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+	git(["init", "-q"]);
+	writeFileSync(path.join(dir, "allowed", "a.txt"), "a\n", "utf8");
+	writeFileSync(path.join(dir, "base.txt"), "base\n", "utf8");
+	writeFileSync(path.join(dir, ".gitignore"), "scratch\n", "utf8");
+	try {
+		symlinkSync(path.join("allowed", "a.txt"), path.join(dir, "outside-link"));
+	} catch {
+		// Symlink creation needs a privilege the platform may not grant
+		// (Windows without Developer Mode); the caller returns early, matching
+		// the existing alias-spelling test precedent.
+		await rm(base, { recursive: true, force: true });
+		return undefined;
+	}
+	git(["add", "-A"]);
+	git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "base"]);
+	return {
+		dir,
+		git,
+		cleanup: () => rm(base, { recursive: true, force: true }),
+	};
+}
+
+test("direct write rejects deleting a tracked outside-link that resolves to an in-scope target", async () => {
+	// The worker deletes `outside-link`, a tracked entry outside the declared
+	// scope that currently resolves to the in-scope `allowed/a.txt`. Entry
+	// names are authoritative: the deletion is out-of-scope and fails the
+	// task without reverting anything.
+	const fake = await fakeMutatingOpenCode(
+		'const { unlinkSync } = await import("node:fs"); unlinkSync("outside-link");',
+	);
+	const repo = await fakeScopeTrapRepo();
+	if (!repo) return;
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-link-trap", "write", ["allowed/a.txt"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*outside-link/);
+		assert.match(settled.error ?? "", /files were NOT reverted/);
+		assert.ok(!existsSync(path.join(repo.dir, "outside-link")), "direct detection never reverts: the deletion stays");
+		assert.equal(await readFile(path.join(repo.dir, "allowed", "a.txt"), "utf8"), "a\n");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write keeps a retargeted ignored scope file from widening the authority", async () => {
+	// The declared scope is the ignored file `scratch`. The worker retargets
+	// it as a symlink at the repository root and modifies the tracked
+	// `base.txt` outside the scope. The frozen acceptance-time authority still
+	// rejects `base.txt`: re-resolving the mutated scope leaf would have
+	// widened the whole repository into scope.
+	const fake = await fakeMutatingOpenCode(
+		'const { symlinkSync } = await import("node:fs"); symlinkSync(".", "scratch", "dir"); writeFileSync("base.txt", "worker\\n", "utf8");',
+	);
+	const repo = await fakeScopeTrapRepo();
+	if (!repo) return;
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-retarget", "write", ["scratch"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*base\.txt/);
+		assert.equal(await readFile(path.join(repo.dir, "base.txt"), "utf8"), "worker\n");
+		assert.equal(lstatSync(path.join(repo.dir, "scratch")).isSymbolicLink(), true);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write allows an in-scope change through a directory alias spelling", async () => {
+	// The same repository reached through a symlinked alias keeps working:
+	// identity canonicalization still converges alias spellings while entry
+	// authorization stays lexical.
+	const fake = await fakeMutatingOpenCode('writeFileSync("allowed/a.txt", "changed\\n", "utf8");');
+	const repo = await fakeScopeTrapRepo();
+	if (!repo) return;
+	const aliasBase = await mkdtemp(path.join(os.tmpdir(), "scope-alias-"));
+	try {
+		const alias = path.join(aliasBase, "alias");
+		try {
+			symlinkSync(repo.dir, alias, "dir");
+		} catch {
+			return;
+		}
+		const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+		try {
+			const started = manager.spawn(spec("direct-alias", "write", ["allowed/a.txt"]), alias);
+			const [settled] = await manager.wait([started.id]);
+			assert.equal(settled.status, "done");
+			assert.equal(await readFile(path.join(repo.dir, "allowed", "a.txt"), "utf8"), "changed\n");
+		} finally {
+			await manager.dispose();
+		}
+	} finally {
+		await fake.cleanup();
+		await repo.cleanup();
+		await rm(aliasBase, { recursive: true, force: true });
 	}
 });
 

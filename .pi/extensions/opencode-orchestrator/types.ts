@@ -301,10 +301,10 @@ export function pathForScopeComparison(value: string, platform: NodeJS.Platform 
 	return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-// Canonicalize a path for identity comparison across spellings of the same
-// location. On Windows the same directory is routinely spelled several ways
-// at once: `git rev-parse --show-toplevel` returns the canonical long form
-// with forward slashes (e.g. `C:/Users/runneradmin/...`) while
+// Canonicalize a path for filesystem-identity comparison across spellings of
+// the same location. On Windows the same directory is routinely spelled
+// several ways at once: `git rev-parse --show-toplevel` returns the canonical
+// long form with forward slashes (e.g. `C:/Users/runneradmin/...`) while
 // `os.tmpdir()`-derived paths use the 8.3 short form (e.g.
 // `C:\Users\RUNNER~1\...`), and drive/case spellings vary. A plain
 // path.relative/path.resolve comparison then climbs out with `..` segments,
@@ -314,10 +314,13 @@ export function pathForScopeComparison(value: string, platform: NodeJS.Platform 
 // form; for paths that do not exist (yet) the nearest existing ancestor is
 // canonicalized and the remainder re-appended so existing and not-yet-created
 // paths under the same parent still compare equal. Never throws: on any
-// error the caller falls back to path.resolve. Never follows a leaf symlink
-// decision beyond what realpath reports; this is only a spelling
-// normalizer, not a trust decision, and every consumer still fails closed
-// (out-of-scope/retain) when the canonical comparison escapes.
+// error the caller falls back to path.resolve. Identity only: this follows
+// symlinks (including a leaf symlink), so it must NEVER authorize a Git entry
+// by name. Git entry authorization is a lexical entry-namespace decision (see
+// isGitEntryInScope): an entry such as `outside-link` stays `outside-link`
+// even when it currently resolves to an in-scope target. Every identity
+// consumer still fails closed (out-of-scope/retain) when the canonical
+// comparison escapes.
 export function canonicalizePath(value: string): string | undefined {
 	const absolute = path.resolve(value);
 	const pending: string[] = [];
@@ -341,6 +344,78 @@ export function scopeOverlaps(left: string, right: string) {
 	const a = pathForScopeComparison(left);
 	const b = pathForScopeComparison(right);
 	return a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
+}
+
+// Strip exactly one Git output line terminator (CRLF, LF, or a lone CR) from a
+// PATH-valued Git output such as `rev-parse --show-toplevel/--show-prefix`.
+// Unlike trim(), this preserves leading/trailing spaces that are valid in
+// directory names (e.g. a cwd named ` workspace` or a repo root with a
+// trailing space). Hash/ref/boolean outputs keep using trim().
+export function stripGitLineTerminator(value: string): string {
+	if (value.endsWith("\r\n")) return value.slice(0, -2);
+	if (value.endsWith("\n") || value.endsWith("\r")) return value.slice(0, -1);
+	return value;
+}
+
+// Split a `--show-prefix` output into repo-relative segments. Only the line
+// terminator is stripped; segment whitespace is preserved. Empty segments
+// (the trailing slash, the root's empty output) and "." segments are dropped.
+export function parseGitPrefixSegments(prefixOutput: string): string[] {
+	return stripGitLineTerminator(prefixOutput)
+		.split("/")
+		.filter((segment) => segment.length > 0 && segment !== ".");
+}
+
+// Normalize one repo-relative Git entry to the Git entry namespace:
+// `/` separators, no empty/dot segments, verbatim on every platform.
+// Inputs are already Git POSIX entry paths, so a backslash is an ordinary
+// filename character and is never folded; native separators convert exactly
+// once at the boundary (manager.toEntryRel). Never touches the filesystem,
+// so symlinks (leaf or ancestor) are never followed. A `..` segment is
+// preserved so the containment check fails closed.
+export function normalizeGitEntryRel(value: string): string {
+	return value
+		.split("/")
+		.filter((segment) => segment.length > 0 && segment !== ".")
+		.join("/");
+}
+
+// Lexical Git-entry authorization: is `entryRel` the same entry as, or an
+// entry under, the scope `scopeRel`? Both are repo-relative paths in the Git
+// entry namespace (see normalizeGitEntryRel). Pure string math: no realpath,
+// no lstat, no filesystem access, so a tracked outside-link symlink, a leaf
+// symlink retargeted at an in-scope file, or a newly replaced ancestor
+// directory symlink can never disguise an outside entry as in-scope.
+// `"."`/`""` is the repository root and contains every entry. Any scope that
+// escapes the repository (`..`-prefixed) contains nothing (fail closed).
+// Case-insensitive on Windows (matching pathForScopeComparison identity),
+// case-sensitive on POSIX.
+export function isGitEntryInScope(scopeRel: string, entryRel: string, platform: NodeJS.Platform = process.platform) {
+	const scope = normalizeGitEntryRel(scopeRel);
+	const entry = normalizeGitEntryRel(entryRel);
+	if (scope === "" || scope === ".") return true;
+	if (scope === ".." || scope.startsWith("../") || entry === ".." || entry.startsWith("../")) return false;
+	if (platform === "win32") {
+		const a = entry.toLowerCase();
+		const b = scope.toLowerCase();
+		return a === b || a.startsWith(`${b}/`);
+	}
+	return entry === scope || entry.startsWith(`${scope}/`);
+}
+
+// Overlap check over scope keys frozen at task acceptance (each key is a
+// pathForScopeComparison snapshot taken before any worker could mutate the
+// tree). The live scopeOverlaps() re-canonicalizes both sides at call time,
+// which would follow a worker-retargeted scope leaf (e.g. an ignored scope
+// file symlinked at an outside tracked directory) and widen the authority.
+// Frozen keys keep alias/case handling from acceptance time without ever
+// re-reading worker-mutated leaves. Keys already carry the platform spelling
+// (case-folded on Windows), so comparison here is exact with a path-separator
+// boundary.
+export function frozenScopeKeysOverlap(leftKey: string, rightKey: string) {
+	return leftKey === rightKey ||
+		leftKey.startsWith(`${rightKey}${path.sep}`) ||
+		rightKey.startsWith(`${leftKey}${path.sep}`);
 }
 
 export function findScopeConflict(left: string[], right: string[]) {
