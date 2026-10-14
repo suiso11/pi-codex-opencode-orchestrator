@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import * as path from "node:path";
 
 export const DEFAULT_MODEL = "opencode-go/glm-5.2";
@@ -295,8 +296,45 @@ export function normalizeScopes(cwd: string, relevantPaths: string[]) {
 }
 
 export function pathForScopeComparison(value: string, platform: NodeJS.Platform = process.platform) {
-	const resolved = path.resolve(value);
+	const canonical = canonicalizePath(value);
+	const resolved = canonical ?? path.resolve(value);
 	return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+// Canonicalize a path for identity comparison across spellings of the same
+// location. On Windows the same directory is routinely spelled several ways
+// at once: `git rev-parse --show-toplevel` returns the canonical long form
+// with forward slashes (e.g. `C:/Users/runneradmin/...`) while
+// `os.tmpdir()`-derived paths use the 8.3 short form (e.g.
+// `C:\Users\RUNNER~1\...`), and drive/case spellings vary. A plain
+// path.relative/path.resolve comparison then climbs out with `..` segments,
+// which broke worktree child-cwd derivation, scope containment, and
+// repo-relative views on native Windows (the 19 CI failures). realpathSync
+// resolves short names, junctions, and separator spellings to one canonical
+// form; for paths that do not exist (yet) the nearest existing ancestor is
+// canonicalized and the remainder re-appended so existing and not-yet-created
+// paths under the same parent still compare equal. Never throws: on any
+// error the caller falls back to path.resolve. Never follows a leaf symlink
+// decision beyond what realpath reports; this is only a spelling
+// normalizer, not a trust decision, and every consumer still fails closed
+// (out-of-scope/retain) when the canonical comparison escapes.
+export function canonicalizePath(value: string): string | undefined {
+	const absolute = path.resolve(value);
+	const pending: string[] = [];
+	let current: string | undefined = absolute;
+	while (current !== undefined) {
+		try {
+			const real = realpathSync(current);
+			pending.reverse();
+			return pending.length > 0 ? path.join(real, ...pending) : real;
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			pending.push(path.basename(current));
+			current = parent;
+		}
+	}
+	return undefined;
 }
 
 export function scopeOverlaps(left: string, right: string) {
