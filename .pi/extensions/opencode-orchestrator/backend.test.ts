@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,6 +16,7 @@ import { CollieBackendAdapter, collieGateError } from "./backends/collie.ts";
 import { PiBackendAdapter, piToolList } from "./backends/pi.ts";
 import { TOOL_PROFILES } from "./types.ts";
 import type { TaskSpec, WorkerReport } from "./types.ts";
+import { buildWorkerEnv } from "./worker-env.ts";
 
 function spawnInput(overrides: Partial<BackendSpawnInput> = {}): BackendSpawnInput {
 	return {
@@ -187,3 +189,196 @@ test("shared output protocol helpers remain stable", () => {
 		assert.deepEqual(adapter.normalizeExitReport(report), report);
 	}
 });
+
+// Worker GitHub-auth preservation: buildWorkerEnv -> adapter.buildEnv feeds a
+// real local `gh auth token` read from owned synthetic hosts.yml fixtures.
+// Fixture tokens are distinct FAKE values; stdout is compared with a boolean
+// assert.ok so a resolver regression that reads the parent real store can
+// never leak a secret through a failure message. Buffers are cleared in
+// finally. No network, no GH_TOKEN family, no real configs are touched.
+function writeGhHostsFixture(dir: string, fakeToken: string): void {
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		path.join(dir, "hosts.yml"),
+		`github.com:\n    user: fixture-user\n    oauth_token: ${fakeToken}\n    git_protocol: https\n`,
+		{ encoding: "utf-8" },
+	);
+}
+
+function localGhAvailable(): boolean {
+	try {
+		return spawnSync("gh", ["--version"], { timeout: 10_000 }).status === 0;
+	} catch {
+		return false;
+	}
+}
+
+function ghChildEnv(built: NodeJS.ProcessEnv, ownedHome: string): NodeJS.ProcessEnv {
+	const child: NodeJS.ProcessEnv = {};
+	if (process.env.PATH !== undefined) child.PATH = process.env.PATH;
+	for (const name of ["SystemRoot", "PATHEXT", "COMSPEC", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL"] as const) {
+		if (process.env[name] !== undefined) child[name] = process.env[name];
+	}
+	child.HOME = ownedHome;
+	child.USERPROFILE = ownedHome;
+	if (built.GH_CONFIG_DIR !== undefined) child.GH_CONFIG_DIR = built.GH_CONFIG_DIR;
+	if (built.XDG_CONFIG_HOME !== undefined) child.XDG_CONFIG_HOME = built.XDG_CONFIG_HOME;
+	child.GH_NO_UPDATE_NOTIFIER = "1";
+	child.GH_NO_EXTENSION_UPDATE_NOTIFIER = "1";
+	child.GH_PROMPT_DISABLED = "1";
+	child.GH_TELEMETRY = "0";
+	return child;
+}
+
+function readGhTokenSync(childEnv: NodeJS.ProcessEnv): { status: number | null; stdout: Buffer; stderr: Buffer } {
+	const result = spawnSync("gh", ["auth", "token"], { env: childEnv, timeout: 15_000 });
+	return {
+		status: result.status,
+		stdout: Buffer.from(result.stdout ?? Buffer.alloc(0)),
+		stderr: Buffer.from(result.stderr ?? Buffer.alloc(0)),
+	};
+}
+
+test("worker gh auth keeps explicit GH_CONFIG_DIR while XDG stays private", () => {
+	if (!localGhAvailable()) return;
+	const root = mkdtempSync(path.join(os.tmpdir(), "gh-auth-explicit-"));
+	let capturedOut: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	let capturedErr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	const adapter = openCodeAdapter();
+	const preparation = adapter.prepare(spawnInput());
+	try {
+		const explicitDir = path.join(root, "explicit");
+		const xdgRoot = path.join(root, "xdg");
+		const homeDir = path.join(root, "home");
+		const appDataRoot = path.join(root, "appdata");
+		writeGhHostsFixture(explicitDir, "FAKE-GH-EXPLICIT-8f2c1a");
+		writeGhHostsFixture(path.join(xdgRoot, "gh"), "FAKE-GH-XDG-4d9b2e");
+		writeGhHostsFixture(path.join(homeDir, ".config", "gh"), "FAKE-GH-HOME-1c7f5a");
+		writeGhHostsFixture(path.join(appDataRoot, "GitHub CLI"), "FAKE-GH-APPDATA-6e3b9d");
+		const workerEnv = buildWorkerEnv({
+			PATH: process.env.PATH ?? "",
+			HOME: homeDir,
+			USERPROFILE: homeDir,
+			XDG_CONFIG_HOME: xdgRoot,
+			GH_CONFIG_DIR: explicitDir,
+			AppData: appDataRoot,
+		});
+		const built = adapter.buildEnv(workerEnv, spawnInput(), preparation);
+		assert.equal(built.GH_CONFIG_DIR, explicitDir);
+		assert.equal(built.XDG_CONFIG_HOME, preparation.runtimeDir);
+		assert.ok(built.XDG_CONFIG_HOME !== xdgRoot);
+		const probed = readGhTokenSync(ghChildEnv(built, homeDir));
+		capturedOut = probed.stdout;
+		capturedErr = probed.stderr;
+		assert.equal(probed.status, 0);
+		assert.ok(capturedOut.toString("utf8").trim() === "FAKE-GH-EXPLICIT-8f2c1a");
+	} finally {
+		capturedOut.fill(0);
+		capturedErr.fill(0);
+		adapter.cleanupAgent(preparation.agentName, preparation);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("worker gh auth prefers XDG_CONFIG_HOME/gh over home and AppData stores", () => {
+	if (!localGhAvailable()) return;
+	const root = mkdtempSync(path.join(os.tmpdir(), "gh-auth-xdg-"));
+	let capturedOut: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	let capturedErr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	const adapter = openCodeAdapter();
+	const preparation = adapter.prepare(spawnInput());
+	try {
+		const xdgRoot = path.join(root, "xdg");
+		const homeDir = path.join(root, "home");
+		const appDataRoot = path.join(root, "appdata");
+		writeGhHostsFixture(path.join(xdgRoot, "gh"), "FAKE-GH-XDG-9a4e2c");
+		writeGhHostsFixture(path.join(homeDir, ".config", "gh"), "FAKE-GH-HOME-3b8d1f");
+		writeGhHostsFixture(path.join(appDataRoot, "GitHub CLI"), "FAKE-GH-APPDATA-5c1a7e");
+		const workerEnv = buildWorkerEnv({
+			PATH: process.env.PATH ?? "",
+			HOME: homeDir,
+			USERPROFILE: homeDir,
+			XDG_CONFIG_HOME: xdgRoot,
+			AppData: appDataRoot,
+		});
+		const built = adapter.buildEnv(workerEnv, spawnInput(), preparation);
+		assert.equal(built.GH_CONFIG_DIR, path.join(xdgRoot, "gh"));
+		assert.equal(built.XDG_CONFIG_HOME, preparation.runtimeDir);
+		const probed = readGhTokenSync(ghChildEnv(built, homeDir));
+		capturedOut = probed.stdout;
+		capturedErr = probed.stderr;
+		assert.equal(probed.status, 0);
+		assert.ok(capturedOut.toString("utf8").trim() === "FAKE-GH-XDG-9a4e2c");
+	} finally {
+		capturedOut.fill(0);
+		capturedErr.fill(0);
+		adapter.cleanupAgent(preparation.agentName, preparation);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("worker gh auth falls back to HOME/.config/gh", () => {
+	if (!localGhAvailable()) return;
+	const root = mkdtempSync(path.join(os.tmpdir(), "gh-auth-home-"));
+	let capturedOut: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	let capturedErr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	const adapter = openCodeAdapter();
+	const preparation = adapter.prepare(spawnInput());
+	try {
+		const homeDir = path.join(root, "home");
+		writeGhHostsFixture(path.join(homeDir, ".config", "gh"), "FAKE-GH-HOME-2e6b4a");
+		const workerEnv = buildWorkerEnv({
+			PATH: process.env.PATH ?? "",
+			HOME: homeDir,
+			USERPROFILE: homeDir,
+		});
+		const built = adapter.buildEnv(workerEnv, spawnInput(), preparation);
+		assert.equal(built.GH_CONFIG_DIR, path.join(homeDir, ".config", "gh"));
+		assert.equal(built.XDG_CONFIG_HOME, preparation.runtimeDir);
+		const probed = readGhTokenSync(ghChildEnv(built, homeDir));
+		capturedOut = probed.stdout;
+		capturedErr = probed.stderr;
+		assert.equal(probed.status, 0);
+		assert.ok(capturedOut.toString("utf8").trim() === "FAKE-GH-HOME-2e6b4a");
+	} finally {
+		capturedOut.fill(0);
+		capturedErr.fill(0);
+		adapter.cleanupAgent(preparation.agentName, preparation);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+if (process.platform === "win32") {
+	test("worker gh auth uses mixed-case AppData store on Windows", () => {
+		if (!localGhAvailable()) return;
+		const root = mkdtempSync(path.join(os.tmpdir(), "gh-auth-appdata-"));
+		let capturedOut: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+		let capturedErr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+		const adapter = openCodeAdapter();
+		const preparation = adapter.prepare(spawnInput());
+		try {
+			const homeDir = path.join(root, "home");
+			const appDataRoot = path.join(root, "appdata");
+			writeGhHostsFixture(path.join(appDataRoot, "GitHub CLI"), "FAKE-GH-APPDATA-7d2f8b");
+			writeGhHostsFixture(path.join(homeDir, ".config", "gh"), "FAKE-GH-HOME-4a9c3d");
+			const workerEnv = buildWorkerEnv({
+				PATH: process.env.PATH ?? "",
+				HOME: homeDir,
+				USERPROFILE: homeDir,
+				AppData: appDataRoot,
+			});
+			const built = adapter.buildEnv(workerEnv, spawnInput(), preparation);
+			assert.equal(built.GH_CONFIG_DIR, path.join(appDataRoot, "GitHub CLI"));
+			const probed = readGhTokenSync(ghChildEnv(built, homeDir));
+			capturedOut = probed.stdout;
+			capturedErr = probed.stderr;
+			assert.equal(probed.status, 0);
+			assert.ok(capturedOut.toString("utf8").trim() === "FAKE-GH-APPDATA-7d2f8b");
+		} finally {
+			capturedOut.fill(0);
+			capturedErr.fill(0);
+			adapter.cleanupAgent(preparation.agentName, preparation);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+}
