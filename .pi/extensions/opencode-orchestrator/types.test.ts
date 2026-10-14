@@ -18,15 +18,19 @@ import {
 	enforceToolLimit,
 	extractUsageFromEvent,
 	findScopeConflict,
+	frozenScopeKeysOverlap,
+	isGitEntryInScope,
 	mergeUsage,
 	normalizeScopes,
 	normalizeWorkerModelValue,
+	parseGitPrefixSegments,
 	pathForScopeComparison,
 	parseWorkerReport,
 	resolveModel,
 	resolveThinkingLevel,
 	resolveToolProfile,
 	scopeOverlaps,
+	stripGitLineTerminator,
 	taskResultText,
 	taskResultsText,
 	toolsForProfile,
@@ -156,6 +160,37 @@ test("scope overlap is path-boundary aware", () => {
 		)?.right,
 		path.join(cwd, "src/a.ts"),
 	);
+});
+
+test("git entry authorization is lexical: symlink targets never authorize entry names", () => {
+	// A tracked outside-link resolving to allowed/a.txt stays outside-link.
+	assert.equal(isGitEntryInScope("allowed/a.txt", "outside-link"), false);
+	assert.equal(isGitEntryInScope("allowed/a.txt", "allowed/a.txt"), true);
+	assert.equal(isGitEntryInScope("allowed", "allowed/a.txt"), true);
+	// Replacing a scope ancestor directory with a symlink is out-of-scope.
+	assert.equal(isGitEntryInScope("allowed/a.txt", "allowed"), false);
+	assert.equal(isGitEntryInScope(".", "anything/at/all"), true);
+	assert.equal(isGitEntryInScope("..", "base.txt"), false);
+	assert.equal(isGitEntryInScope("src/a", "src/a-b/c"), false);
+	// Windows identity stays case-insensitive while POSIX stays sensitive.
+	assert.equal(isGitEntryInScope("Allowed/A.txt", "allowed/a.txt", "win32"), true);
+	assert.equal(isGitEntryInScope("Allowed/A.txt", "allowed/a.txt", "linux"), false);
+});
+
+test("git path outputs strip only the line terminator, preserving pathname whitespace", () => {
+	assert.equal(stripGitLineTerminator(" lead/\n"), " lead/");
+	assert.equal(stripGitLineTerminator("/repo/root \n"), "/repo/root ");
+	assert.equal(stripGitLineTerminator("/repo/root\r\n"), "/repo/root");
+	assert.equal(stripGitLineTerminator("/repo/root"), "/repo/root");
+	assert.deepEqual(parseGitPrefixSegments(" lead/\n"), [" lead"]);
+	assert.deepEqual(parseGitPrefixSegments("sub dir/inner /\n"), ["sub dir", "inner "]);
+	assert.deepEqual(parseGitPrefixSegments("\n"), []);
+});
+
+test("frozen scope keys overlap on path boundaries without re-reading leaves", () => {
+	assert.equal(frozenScopeKeysOverlap(path.join(cwd, "src"), path.join(cwd, "src", "a.ts")), true);
+	assert.equal(frozenScopeKeysOverlap(path.join(cwd, "src", "a.ts"), path.join(cwd, "src", "b.ts")), false);
+	assert.equal(frozenScopeKeysOverlap(path.join(cwd, "src", "a"), path.join(cwd, "src", "a-b", "c.ts")), false);
 });
 
 test("scope comparison is case-insensitive on Windows", () => {

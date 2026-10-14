@@ -19,7 +19,7 @@ async function fakeWorker() {
 	await writeFile(
 		script,
 		`
-import { writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, unlinkSync, rmSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 const prompt = process.argv.at(-1) || "";
@@ -40,6 +40,9 @@ if (prompt.includes("WRITE_BINARY")) writeFileSync("bin.dat", Buffer.from(Array.
 if (prompt.includes("MODIFY_BASE")) writeFileSync("base.txt", "base-modified-by-worker\\n", "utf8");
 if (prompt.includes("DELETE_TRACKED")) unlinkSync("delete-me.txt");
 if (prompt.includes("WRITE_OUT_OF_SCOPE")) { mkdirSync("outsiders", { recursive: true }); writeFileSync("outsiders/out.txt", "out-of-scope\\n", "utf8"); }
+if (prompt.includes("DELETE_OUTSIDE_LINK")) unlinkSync("outside-link");
+if (prompt.includes("WRITE_ALLOWED_A")) { mkdirSync("allowed", { recursive: true }); writeFileSync(path.join("allowed", "a.txt"), "A-from-worker\\n", "utf8"); }
+if (prompt.includes("REPLACE_ALLOWED_WITH_LINK")) { rmSync("allowed", { recursive: true, force: true }); symlinkSync("outsiders", "allowed", "dir"); }
 if (prompt.includes("GIT_COMMIT")) {
   execFileSync("git", ["-c", "user.name=worker", "-c", "user.email=worker@example.com", "commit", "-am", "worker commit", "--allow-empty"], { cwd: process.cwd(), stdio: "ignore" });
 }
@@ -610,6 +613,173 @@ test("out-of-scope change rejects integration and retains the worktree", async (
 		assert.equal(await readFile(path.join(repo.dir, "src", "a.txt"), "utf8"), "a\n");
 		const { baseDir } = worktreeBaseDir(repo.dir);
 		assert.ok(existsSync(path.join(baseDir, id)), "retained worktree path must still exist");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+// Real-Git repo with a tracked symlink trap: `outside-link` is a tracked
+// entry that resolves to the in-scope target `allowed/a.txt`. Authorization
+// is over entry names, so deleting/replacing `outside-link` is an
+// out-of-scope change even though it currently resolves inside the scope.
+async function fakeSymlinkTrapRepo() {
+	const base = await mkdtemp(path.join(os.tmpdir(), "wt-trap-"));
+	const dir = path.join(base, "repo");
+	await mkdir(path.join(dir, "allowed"), { recursive: true });
+	await mkdir(path.join(dir, "outsiders"), { recursive: true });
+	const git = (args: string[]) =>
+		execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+	git(["init", "-q"]);
+	git(["config", "core.autocrlf", "false"]);
+	await writeFile(path.join(dir, "allowed", "a.txt"), "a\n", "utf8");
+	await writeFile(path.join(dir, "outsiders", "evil.txt"), "evil\n", "utf8");
+	try {
+		await symlink(path.join("allowed", "a.txt"), path.join(dir, "outside-link"));
+	} catch {
+		// Symlink creation needs a privilege the platform may not grant
+		// (Windows without Developer Mode); the caller returns early, matching
+		// the existing alias-spelling test precedent.
+		await rm(base, { recursive: true, force: true });
+		return undefined;
+	}
+	git(["add", "-A"]);
+	git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "base"]);
+	return {
+		dir,
+		git,
+		cleanup: () => rm(base, { recursive: true, force: true }),
+	};
+}
+
+test("worktree rejects deleting a tracked outside-link that resolves to an in-scope target", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeSymlinkTrapRepo();
+	if (!repo) return;
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	try {
+		const started = manager.spawn(
+			{ ...spec("wt-link-trap", "write", ["allowed/a.txt"], "DELETE_OUTSIDE_LINK WRITE_ALLOWED_A"), worktree: true },
+			repo.dir,
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.equal(settled.worktree?.status, "retained");
+		assert.match(settled.worktree?.error ?? "", /Out-of-scope change detected: outside-link/);
+		assert.equal((await lstat(path.join(repo.dir, "outside-link"))).isSymbolicLink(), true, "the outside entry must still exist at the root");
+		assert.equal(await readFile(path.join(repo.dir, "allowed", "a.txt"), "utf8"), "a\n", "the in-scope change must not integrate with a rejected patch");
+		const { baseDir } = worktreeBaseDir(repo.dir);
+		assert.ok(existsSync(path.join(baseDir, id)), "retained worktree path must still exist");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("worktree rejects replacing a scope ancestor directory with a symlink", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeSymlinkTrapRepo();
+	if (!repo) return;
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	try {
+		const started = manager.spawn(
+			{ ...spec("wt-ancestor-trap", "write", ["allowed/a.txt"], "REPLACE_ALLOWED_WITH_LINK"), worktree: true },
+			repo.dir,
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.equal(settled.worktree?.status, "retained");
+		assert.match(settled.worktree?.error ?? "", /Out-of-scope change detected: allowed/);
+		assert.equal((await lstat(path.join(repo.dir, "allowed"))).isDirectory(), true, "the scope ancestor must still be a directory at the root");
+		assert.equal(await readFile(path.join(repo.dir, "allowed", "a.txt"), "utf8"), "a\n");
+		const { baseDir } = worktreeBaseDir(repo.dir);
+		assert.ok(existsSync(path.join(baseDir, id)), "retained worktree path must still exist");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("worktree preserves a leading-space subdirectory for child cwd, scopes, and integration", async () => {
+	const fake = await fakeWorker();
+	const repo = await fakeGitRepo();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	try {
+		// A valid directory name with a leading space: `--show-prefix` prints
+		// ` lead/` and only the line terminator may be stripped.
+		const spaced = path.join(repo.dir, " lead");
+		await mkdir(spaced, { recursive: true });
+		const started = manager.spawn(
+			{ ...spec("wt-space", "write", ["cwd-marker.txt"], "WRITE_CWD_MARKER"), worktree: true },
+			spaced,
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(settled.worktree?.status, "integrated");
+		assert.equal(await readFile(path.join(repo.dir, " lead", "cwd-marker.txt"), "utf8"), "cwd-marker\n", "integration must land in the real whitespace directory");
+		assert.ok(!existsSync(path.join(repo.dir, "lead")), "a trimmed doppelganger directory must never be created");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("worktree integrates from a trailing-space repository root", async () => {
+	// Windows forbids trailing spaces in file names at the OS level, so this
+	// environment-shaped name can only exist on POSIX.
+	if (process.platform === "win32") return;
+	const fake = await fakeWorker();
+	const base = await mkdtemp(path.join(os.tmpdir(), "wt-trailing-"));
+	const dir = path.join(base, "root ");
+	const git = (args: string[]) =>
+		execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+	await mkdir(dir, { recursive: true });
+	git(["init", "-q"]);
+	git(["config", "core.autocrlf", "false"]);
+	await writeFile(path.join(dir, "base.txt"), "base\n", "utf8");
+	git(["add", "-A"]);
+	git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "base"]);
+	const repo = { dir, cleanup: () => rm(base, { recursive: true, force: true }) };
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	try {
+		// `--show-toplevel` ends with the trailing space plus the line
+		// terminator; only the terminator may be stripped.
+		const started = manager.spawn(
+			{ ...spec("wt-trailing", "write", ["base.txt"], "MODIFY_BASE"), worktree: true },
+			dir,
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(settled.worktree?.status, "integrated");
+		assert.equal(await readFile(path.join(dir, "base.txt"), "utf8"), "base-modified-by-worker\n");
 	} finally {
 		await manager.dispose();
 		await fake.cleanup();
