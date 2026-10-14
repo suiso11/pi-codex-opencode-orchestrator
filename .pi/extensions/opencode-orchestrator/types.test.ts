@@ -21,6 +21,7 @@ import {
 	frozenScopeKeysOverlap,
 	isGitEntryInScope,
 	mergeUsage,
+	normalizeGitEntryRel,
 	normalizeScopes,
 	normalizeWorkerModelValue,
 	parseGitPrefixSegments,
@@ -175,6 +176,19 @@ test("git entry authorization is lexical: symlink targets never authorize entry 
 	// Windows identity stays case-insensitive while POSIX stays sensitive.
 	assert.equal(isGitEntryInScope("Allowed/A.txt", "allowed/a.txt", "win32"), true);
 	assert.equal(isGitEntryInScope("Allowed/A.txt", "allowed/a.txt", "linux"), false);
+	// POSIX backslash is a literal filename character, never a separator: the
+	// repo-root literal `allowed\escape.txt` is not under scope `allowed`, and
+	// a scope naming the literal file `\` is not the repository root.
+	assert.equal(isGitEntryInScope("allowed", "allowed\\escape.txt", "linux"), false);
+	assert.equal(isGitEntryInScope("allowed\\escape.txt", "allowed\\escape.txt", "linux"), true);
+	assert.equal(isGitEntryInScope("\\", "base.txt", "linux"), false);
+	assert.equal(isGitEntryInScope("\\", "\\", "linux"), true);
+	assert.equal(normalizeGitEntryRel("allowed\\escape.txt", "linux"), "allowed\\escape.txt");
+	assert.equal(normalizeGitEntryRel("\\", "linux"), "\\");
+	// Windows keeps folding backslash as a native separator.
+	assert.equal(isGitEntryInScope("allowed", "allowed\\escape.txt", "win32"), true);
+	assert.equal(isGitEntryInScope("allowed", "allowed/escape.txt", "win32"), true);
+	assert.equal(normalizeGitEntryRel("allowed\\escape.txt", "win32"), "allowed/escape.txt");
 });
 
 test("git path outputs strip only the line terminator, preserving pathname whitespace", () => {

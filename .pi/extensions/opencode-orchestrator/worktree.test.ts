@@ -42,6 +42,8 @@ if (prompt.includes("DELETE_TRACKED")) unlinkSync("delete-me.txt");
 if (prompt.includes("WRITE_OUT_OF_SCOPE")) { mkdirSync("outsiders", { recursive: true }); writeFileSync("outsiders/out.txt", "out-of-scope\\n", "utf8"); }
 if (prompt.includes("DELETE_OUTSIDE_LINK")) unlinkSync("outside-link");
 if (prompt.includes("WRITE_ALLOWED_A")) { mkdirSync("allowed", { recursive: true }); writeFileSync(path.join("allowed", "a.txt"), "A-from-worker\\n", "utf8"); }
+if (prompt.includes("WRITE_LITERAL_TRAP")) writeFileSync("allowed\\\\escape.txt", "trap-from-worker\\n", "utf8");
+if (prompt.includes("WRITE_BACKSLASH_FILE")) writeFileSync("\\\\", "root-literal\\n", "utf8");
 if (prompt.includes("REPLACE_ALLOWED_WITH_LINK")) { rmSync("allowed", { recursive: true, force: true }); symlinkSync("outsiders", "allowed", "dir"); }
 if (prompt.includes("GIT_COMMIT")) {
   execFileSync("git", ["-c", "user.name=worker", "-c", "user.email=worker@example.com", "commit", "-am", "worker commit", "--allow-empty"], { cwd: process.cwd(), stdio: "ignore" });
@@ -217,6 +219,121 @@ test("dirty root rejects a worktree batch while a single direct write remains al
 		await manager.dispose();
 		await fake.cleanup();
 		await cleanupRepo(repo, []);
+	}
+});
+
+// Real-Git repo for the POSIX separator trap: `allowed/a.txt` and `base.txt`
+// are tracked. On POSIX a worker writing `allowed\escape.txt` creates one
+// repo-root filename containing a backslash — an outside entry that must
+// never authorize under scope `allowed`.
+async function fakeBackslashTrapRepo() {
+	const base = await mkdtemp(path.join(os.tmpdir(), "wt-sep-"));
+	const dir = path.join(base, "repo");
+	await mkdir(path.join(dir, "allowed"), { recursive: true });
+	const git = (args: string[]) =>
+		execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+	git(["init", "-q"]);
+	git(["config", "core.autocrlf", "false"]);
+	await writeFile(path.join(dir, "allowed", "a.txt"), "a\n", "utf8");
+	await writeFile(path.join(dir, "base.txt"), "base\n", "utf8");
+	git(["add", "-A"]);
+	git(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "base"]);
+	return {
+		dir,
+		git,
+		cleanup: () => rm(base, { recursive: true, force: true }),
+	};
+}
+
+test("worktree rejects a POSIX literal-backslash entry outside the scope", async () => {
+	// POSIX-only: on Windows the same bytes name `allowed/escape.txt`, which
+	// genuinely is in scope. On POSIX the worker's `allowed\escape.txt` is a
+	// repo-root literal outside scope `allowed`: integration is refused, the
+	// worktree is retained, and the root never sees the outside content.
+	if (process.platform === "win32") return;
+	const fake = await fakeWorker();
+	const repo = await fakeBackslashTrapRepo();
+	const manager = new OpenCodeTaskManager({
+		binary: fake.binary,
+		binaryArgs: fake.binaryArgs,
+		timeoutMs: 2_000,
+	});
+	let id = "";
+	try {
+		const started = manager.spawn(
+			{ ...spec("wt-literal-trap", "write", ["allowed"], "WRITE_LITERAL_TRAP WRITE_ALLOWED_A"), worktree: true },
+			repo.dir,
+		);
+		id = started.id;
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.equal(settled.worktree?.status, "retained");
+		assert.match(settled.worktree?.error ?? "", /Out-of-scope change detected: allowed\\/);
+		assert.ok(!existsSync(path.join(repo.dir, "allowed\\escape.txt")), "out-of-scope content must never reach the root");
+		assert.equal(await readFile(path.join(repo.dir, "allowed", "a.txt"), "utf8"), "a\n", "the in-scope change must not integrate with a rejected patch");
+		const { baseDir } = worktreeBaseDir(repo.dir);
+		assert.ok(existsSync(path.join(baseDir, id)), "retained worktree path must still exist");
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await cleanupRepo(repo, [id]);
+	}
+});
+
+test("worktree keeps a literal-backslash scope from becoming repository-wide", async () => {
+	// POSIX-only: a scope naming the literal file `\` authorizes exactly that
+	// entry. A worker touching `base.txt` is retained out-of-scope, while a
+	// worker writing the literal `\` file integrates it to the root.
+	if (process.platform === "win32") return;
+	const fake = await fakeWorker();
+	try {
+		const rejectRepo = await fakeBackslashTrapRepo();
+		const rejectManager = new OpenCodeTaskManager({
+			binary: fake.binary,
+			binaryArgs: fake.binaryArgs,
+			timeoutMs: 2_000,
+		});
+		let rejectId = "";
+		try {
+			const started = rejectManager.spawn(
+				{ ...spec("wt-backslash-scope", "write", ["\\"], "MODIFY_BASE"), worktree: true },
+				rejectRepo.dir,
+			);
+			rejectId = started.id;
+			const [settled] = await rejectManager.wait([started.id]);
+			assert.equal(settled.status, "error");
+			assert.equal(settled.worktree?.status, "retained");
+			assert.match(settled.worktree?.error ?? "", /Out-of-scope change detected: base\.txt/);
+			assert.equal(await readFile(path.join(rejectRepo.dir, "base.txt"), "utf8"), "base\n");
+		} finally {
+			await rejectManager.dispose();
+			await cleanupRepo(rejectRepo, [rejectId]);
+		}
+
+		const allowRepo = await fakeBackslashTrapRepo();
+		const allowManager = new OpenCodeTaskManager({
+			binary: fake.binary,
+			binaryArgs: fake.binaryArgs,
+			timeoutMs: 2_000,
+		});
+		let allowId = "";
+		try {
+			const started = allowManager.spawn(
+				{ ...spec("wt-backslash-self", "write", ["\\"], "WRITE_BACKSLASH_FILE"), worktree: true },
+				allowRepo.dir,
+			);
+			allowId = started.id;
+			const [settled] = await allowManager.wait([started.id]);
+			assert.equal(settled.status, "done");
+			assert.equal(settled.worktree?.status, "integrated");
+			assert.equal(await readFile(path.join(allowRepo.dir, "\\"), "utf8"), "root-literal\n");
+			assert.equal(await readFile(path.join(allowRepo.dir, "base.txt"), "utf8"), "base\n");
+		} finally {
+			await allowManager.dispose();
+			await cleanupRepo(allowRepo, [allowId]);
+		}
+	} finally {
+		await fake.cleanup();
 	}
 });
 
