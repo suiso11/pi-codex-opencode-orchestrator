@@ -33,6 +33,7 @@ import type {
 import {
 	boundedAppend,
 	buildWorkerPrompt,
+	canonicalizePath,
 	configuredModelCapabilities,
 	configuredModelProfiles,
 	configuredTesterProfile,
@@ -383,8 +384,21 @@ function pathWithinScope(fileAbs: string, scope: string) {
 	// Containment is decided with path.relative (not a string prefix) so that
 	// Japanese/space-containing paths and prefix lookalikes (e.g. scope "src/a"
 	// vs file "src/a-b/c") are handled correctly on every platform.
-	const relative = path.relative(pathForScopeComparison(scope), pathForScopeComparison(fileAbs));
+	const relative = canonicalRelative(pathForScopeComparison(scope), pathForScopeComparison(fileAbs));
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+// Relative path between two locations that may use different spellings of the
+// same directory. On native Windows, git reports the canonical long form
+// (`C:/Users/runneradmin/...`) while Node's os.tmpdir() uses the 8.3 short
+// form (`C:\Users\RUNNER~1\...`); a plain path.relative then climbs out with
+// `..` segments, which previously broke worktree child-cwd derivation, scope
+// containment, and repo-relative views. Both sides go through
+// pathForScopeComparison (realpath canonicalization, case-folded on Windows)
+// so identical locations compare equal. Pure string math on canonical forms;
+// callers still treat any escaping result as outside (fail closed).
+function canonicalRelative(from: string, to: string): string {
+	return path.relative(pathForScopeComparison(from), pathForScopeComparison(to));
 }
 
 // Stable OS-temp base directory derived from the repository root hash. Working
@@ -419,8 +433,18 @@ function worktreeRedactionPaths(wt: WorktreeRuntime): string[] {
 	const add = (value: string | undefined) => {
 		if (!value) return;
 		candidates.add(value);
+		// Alternate spellings of the same location (Windows short/long
+		// forms, junctions) must redact too: diagnostics from git
+		// subprocesses may print the canonical form while Node holds the
+		// original spelling.
+		const canonical = canonicalizePath(value);
+		if (canonical) candidates.add(canonical);
 		candidates.add(value.replaceAll(path.sep, path.posix.sep));
 		if (path.sep !== path.posix.sep) candidates.add(value.replaceAll(path.posix.sep, path.sep));
+		if (canonical) {
+			candidates.add(canonical.replaceAll(path.sep, path.posix.sep));
+			if (path.sep !== path.posix.sep) candidates.add(canonical.replaceAll(path.posix.sep, path.sep));
+		}
 	};
 	add(wt.path);
 	add(wt.childCwd);
@@ -1281,6 +1305,32 @@ export class OpenCodeTaskManager {
 		const toplevel = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 		if (!toplevel) throw new Error("Worktree isolation requires a Git repository root.");
 		const repoRoot = path.resolve(toplevel.toString("utf8").trim());
+		// The cwd's repo-relative subdirectory straight from git (the same
+		// authority as --show-toplevel), so no cross-spelling string math is
+		// needed between git's canonical long form and Node's os.tmpdir()
+		// 8.3 short form on native Windows. --show-prefix prints the
+		// repo-relative path of cwd with forward slashes (empty for the root
+		// itself); realpath canonicalization alone did not converge the two
+		// spellings on the Windows runner, which broke child-cwd derivation
+		// and every downstream integration assertion.
+		const prefixBuffer = runGit(cwd, ["rev-parse", "--show-prefix"]);
+		if (!prefixBuffer) throw new Error("Worktree isolation requires a Git repository prefix.");
+		const relCwd = prefixBuffer
+			.toString("utf8")
+			.trim()
+			.split("/")
+			.filter((segment) => segment.length > 0 && segment !== ".")
+			.join(path.sep);
+		// Re-base the caller-spelled absolute scopes onto the git-canonical
+		// repoRoot spelling through same-spelling relative math against cwd
+		// joined under the git-reported cwd prefix, so scope containment and
+		// repo-relative views below compare a single spelling. A scope outside
+		// cwd is kept as-is and still fails closed downstream.
+		const canonicalScopes = scopes.map((scope) => {
+			const rel = path.relative(cwd, scope);
+			if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return scope;
+			return path.join(repoRoot, relCwd, rel);
+		});
 		const key = pathForScopeComparison(repoRoot);
 		const baseDir = worktreeRootDir(repoRoot);
 		let batch = this.worktreeBatches.get(key);
@@ -1318,14 +1368,13 @@ export class OpenCodeTaskManager {
 				);
 				throw new Error(`Failed to create isolated worktree: ${stderr || "git worktree add failed"}`);
 			}
-			const relCwd = path.relative(repoRoot, cwd);
 			const childCwd = relCwd ? path.join(wtPath, relCwd) : wtPath;
 			entry.worktree = {
 				path: wtPath,
 				repoRoot,
 				childCwd,
 				baseHead: batch.baseHead,
-				scopes,
+				scopes: canonicalScopes,
 				batch,
 			};
 			entry.snapshot.worktree = { isolated: true, baseHead: batch.baseHead, status: "pending" };
@@ -1667,7 +1716,11 @@ export class OpenCodeTaskManager {
 				normalized.push(file);
 				continue;
 			}
-			const relative = path.relative(wt.path, path.resolve(file));
+			// Canonical comparison: the worker-reported absolute path and the
+			// worktree root may spell the same temp location differently
+			// (Windows short/long forms); a plain relative would miss and
+			// leave the absolute path in the report.
+			const relative = canonicalRelative(wt.path, file);
 			if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
 				normalized.push(file);
 				continue;
@@ -1743,8 +1796,9 @@ export class OpenCodeTaskManager {
 	// A path equal to the repo root itself is rendered as "." so the public
 	// RetainedWorktreeView.scopes never exposes the absolute repo root.
 	private repoRelative(repoRoot: string, abs: string): string {
-		const rel = path.relative(repoRoot, abs);
+		const rel = canonicalRelative(repoRoot, abs);
 		if (rel === "") return ".";
+		if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return abs;
 		return rel.split(path.sep).join(path.posix.sep);
 	}
 

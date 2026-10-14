@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ModelCapability, TaskSpec, ToolProfile, WorkerReport, WorkerRole } from "../types.ts";
 import { enforceToolLimit, resolveToolProfile, TOOL_PROFILES, toolsForProfile } from "../types.ts";
+import { resolveGhConfigDir, sourceKey } from "../worker-env.ts";
 import { activityFromEvent, type BackendDecodedLine, type BackendDecodedStderrChunk, type BackendPreparation, type BackendSpawnInput, type WorkerBackendAdapter } from "./backend.ts";
 
 // The generated agent definition lives inside the per-spawn private runtime
@@ -205,11 +206,23 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		if (!preparation.runtimeDir || !preparation.configDir) {
 			throw new Error("OpenCode worker preparation is missing its private config directories.");
 		}
+		// Derive the canonical GitHub CLI config dir BEFORE XDG_CONFIG_HOME is
+		// made private below: explicit GH_CONFIG_DIR wins, then the original
+		// XDG_CONFIG_HOME/gh, then (Windows) AppData/GitHub CLI, then the
+		// native home store (USERPROFILE on Windows, HOME elsewhere).
+		// Only the supplied env is read.
+		const ghConfigDir = resolveGhConfigDir(env);
 		const next: NodeJS.ProcessEnv = { ...env };
 		// Fail-closed: ambient OpenCode config selectors and inline config are
 		// discarded; the child only ever sees the manager-generated config.
 		delete next.OPENCODE_CONFIG;
 		delete next.XDG_CONFIG_DIRS;
+		// Normalize any case-variant GH_CONFIG_DIR to the single canonical key
+		// so a preserved mixed-case spelling cannot leave a duplicate.
+		const variant = sourceKey(next, "GH_CONFIG_DIR");
+		if (variant !== undefined && variant !== "GH_CONFIG_DIR") delete next[variant];
+		if (ghConfigDir !== undefined) next.GH_CONFIG_DIR = ghConfigDir;
+		else delete next.GH_CONFIG_DIR;
 		const forced = buildOpenCodeConfigContent(input.spec.role, input.spec.executor === true, env);
 		if (forced === undefined) delete next.OPENCODE_CONFIG_CONTENT;
 		else next.OPENCODE_CONFIG_CONTENT = forced;
@@ -218,6 +231,7 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		// XDG_DATA_HOME/LOCALAPPDATA are deliberately left untouched so saved
 		// CLI authentication keeps working. XDG_CONFIG_HOME is the exception:
 		// it is private above so global config cannot leak into this worker.
+		// GH_CONFIG_DIR above preserves the pre-privatization GitHub CLI store.
 		next.OPENCODE_CONFIG_DIR = preparation.configDir;
 		next.XDG_CONFIG_HOME = preparation.runtimeDir;
 		next.OPENCODE_DISABLE_PROJECT_CONFIG = "1";

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
 	buildAgentFrontmatter,
 	buildWorkerPrompt,
+	canonicalizePath,
 	configuredModelCapabilities,
 	configuredModelProfiles,
 	configuredTesterProfile,
@@ -165,6 +167,32 @@ test("scope comparison is case-insensitive on Windows", () => {
 	);
 	if (process.platform === "win32") {
 		assert.equal(scopeOverlaps(parent, childWithDifferentCase), true);
+	}
+});
+
+test("scope comparison canonicalizes alias spellings of the same directory", () => {
+	// Same directory reached through a symlink alias: the Linux analogue of
+	// Windows short/long (RUNNER~1) spellings that broke worktree path math.
+	// Non-existent leaves canonicalize through the nearest existing ancestor
+	// so staged-but-not-yet-created scope spellings still compare equal.
+	const base = mkdtempSync(path.join(os.tmpdir(), "scope-alias-"));
+	try {
+		const realDir = path.join(base, "real");
+		mkdirSync(path.join(realDir, "sub"), { recursive: true });
+		const alias = path.join(base, "alias");
+		try {
+			symlinkSync(realDir, alias, "dir");
+		} catch {
+			return;
+		}
+		assert.equal(canonicalizePath(path.join(alias, "sub")), canonicalizePath(path.join(realDir, "sub")));
+		assert.equal(
+			pathForScopeComparison(path.join(alias, "sub", "missing.txt")),
+			pathForScopeComparison(path.join(realDir, "sub", "missing.txt")),
+		);
+		assert.equal(scopeOverlaps(path.join(alias, "sub"), path.join(realDir, "sub", "a.ts")), true);
+	} finally {
+		rmSync(base, { recursive: true, force: true });
 	}
 });
 
