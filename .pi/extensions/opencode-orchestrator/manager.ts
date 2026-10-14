@@ -467,8 +467,8 @@ function freezeScopeAuthority(cwd: string, scopes: string[]): { repoRoot: string
 // outside entry as a symlink to an allowed target, or a newly replaced
 // ancestor directory symlink can never read as in-scope. Git already reports
 // the entry namespace verbatim (`-z`, forward slashes), so the entry is
-// normalized with platform-scoped backslash semantics only: a POSIX literal
-// backslash stays a filename character and never authorizes as a separator.
+// normalized verbatim on every platform: a literal backslash stays a
+// filename character and never authorizes as a separator.
 function gitEntryInScope(scopeRels: readonly string[], entryRel: string): boolean {
 	const entry = normalizeGitEntryRel(entryRel);
 	return scopeRels.some((scopeRel) => isGitEntryInScope(scopeRel, entry));

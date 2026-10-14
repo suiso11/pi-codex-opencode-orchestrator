@@ -483,7 +483,7 @@ npm test
 npm run typecheck
 ```
 
-The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, previous-phase context handoff, one-turn orchestration context pruning, and the POSIX literal-backslash separator guard (a repo-root `allowed\escape.txt` never authorizes under scope `allowed`, and a `\` scope is never repository-wide; verified by real-Git worktree/direct-write regressions plus an actual-Git smoke on Ubuntu, with Windows backslash-as-separator behavior pinned).
+The tests cover scope normalization, write-conflict detection, the four-worker cap, cancellation, parallel execution, workflow sequencing, previous-phase context handoff, one-turn orchestration context pruning, and the literal-backslash separator guard (282 tests green with typecheck clean; a repo-root `allowed\escape.txt` never authorizes under scope `allowed`, and a `\` scope is never repository-wide; the Git entry normalizer is verbatim on every platform with native separators converted exactly once at the manager boundary and Windows keeping case-insensitive comparison only; verified by real-Git worktree/direct-write regressions plus an 11-check actual-Git smoke on Ubuntu).
 
 ## Design note
 
