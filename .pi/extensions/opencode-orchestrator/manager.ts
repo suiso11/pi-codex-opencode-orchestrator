@@ -428,7 +428,10 @@ function parseGitPrefix(buffer: Buffer): string {
 }
 
 // Repo-relative POSIX form of a lexical relative path for the Git entry
-// namespace (no filesystem access, so no symlink is ever followed).
+// namespace (no filesystem access, so no symlink is ever followed). Only the
+// native filesystem separator is folded: on POSIX the split is a no-op, so a
+// literal backslash in a Git-provided name is preserved verbatim; on Windows
+// native backslash separators become `/` before entry normalization.
 function toEntryRel(value: string): string {
 	return normalizeGitEntryRel(value.split(path.sep).join(path.posix.sep));
 }
@@ -462,9 +465,12 @@ function freezeScopeAuthority(cwd: string, scopes: string[]): { repoRoot: string
 // the entry nor any scope leaf is realpathed, so a tracked outside-link
 // symlink resolving to an in-scope target, a direct write disguising an
 // outside entry as a symlink to an allowed target, or a newly replaced
-// ancestor directory symlink can never read as in-scope.
+// ancestor directory symlink can never read as in-scope. Git already reports
+// the entry namespace verbatim (`-z`, forward slashes), so the entry is
+// normalized with platform-scoped backslash semantics only: a POSIX literal
+// backslash stays a filename character and never authorizes as a separator.
 function gitEntryInScope(scopeRels: readonly string[], entryRel: string): boolean {
-	const entry = normalizeGitEntryRel(entryRel.replaceAll("\\", "/"));
+	const entry = normalizeGitEntryRel(entryRel);
 	return scopeRels.some((scopeRel) => isGitEntryInScope(scopeRel, entry));
 }
 

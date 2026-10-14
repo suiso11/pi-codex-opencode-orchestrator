@@ -370,9 +370,15 @@ export function parseGitPrefixSegments(prefixOutput: string): string[] {
 // entry namespace: forward slashes, no empty/dot segments, no drive letters.
 // Never touches the filesystem, so symlinks (leaf or ancestor) are never
 // followed. A `..` segment is preserved so the containment check fails closed.
-export function normalizeGitEntryRel(value: string): string {
-	return value
-		.replaceAll("\\", "/")
+// Backslash handling is platform-scoped, never guessed: on Windows a
+// backslash is a native separator and folds to `/`; on POSIX a backslash is
+// an ordinary filename character (Git `-z` already reports the POSIX entry
+// namespace verbatim) and is preserved, so a repo-root literal such as
+// `allowed\escape.txt` never reads as `allowed/escape.txt` and a scope naming
+// the literal file `\` never collapses to the repository root.
+export function normalizeGitEntryRel(value: string, platform: NodeJS.Platform = process.platform): string {
+	const slashed = platform === "win32" ? value.replaceAll("\\", "/") : value;
+	return slashed
 		.split("/")
 		.filter((segment) => segment.length > 0 && segment !== ".")
 		.join("/");
@@ -389,8 +395,8 @@ export function normalizeGitEntryRel(value: string): string {
 // Case-insensitive on Windows (matching pathForScopeComparison identity),
 // case-sensitive on POSIX.
 export function isGitEntryInScope(scopeRel: string, entryRel: string, platform: NodeJS.Platform = process.platform) {
-	const scope = normalizeGitEntryRel(scopeRel);
-	const entry = normalizeGitEntryRel(entryRel);
+	const scope = normalizeGitEntryRel(scopeRel, platform);
+	const entry = normalizeGitEntryRel(entryRel, platform);
 	if (scope === "" || scope === ".") return true;
 	if (scope === ".." || scope.startsWith("../") || entry === ".." || entry.startsWith("../")) return false;
 	if (platform === "win32") {

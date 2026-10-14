@@ -1618,6 +1618,61 @@ test("direct write scope guard respects path boundaries and Japanese paths", asy
 	}
 });
 
+test("direct write rejects a POSIX literal-backslash entry outside the scope", async () => {
+	// POSIX-only: on Windows the same bytes name `allowed/escape.txt`, which
+	// genuinely is in scope. On POSIX `allowed\escape.txt` is one repo-root
+	// filename that must not authorize under scope `allowed`.
+	if (process.platform === "win32") return;
+	const fake = await fakeMutatingOpenCode('writeFileSync("allowed\\\\escape.txt", "trap\\n", "utf8");');
+	const repo = await fakeGitRepo();
+	await mkdir(path.join(repo.dir, "allowed"), { recursive: true });
+	const manager = new OpenCodeTaskManager({ binary: fake.binary, binaryArgs: fake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = manager.spawn(spec("direct-literal-trap", "write", ["allowed"]), repo.dir);
+		const [settled] = await manager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\)/);
+		assert.match(settled.error ?? "", /files were NOT reverted/);
+	} finally {
+		await manager.dispose();
+		await fake.cleanup();
+		await repo.cleanup();
+	}
+});
+
+test("direct write keeps a literal-backslash scope from becoming repository-wide", async () => {
+	// POSIX-only: a scope naming the literal file `\` authorizes exactly that
+	// entry. A `base.txt` change is out-of-scope; a `\` change is allowed.
+	if (process.platform === "win32") return;
+	const rejectFake = await fakeMutatingOpenCode('writeFileSync("base.txt", "worker\\n", "utf8");');
+	const rejectRepo = await fakeGitRepo();
+	const rejectManager = new OpenCodeTaskManager({ binary: rejectFake.binary, binaryArgs: rejectFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = rejectManager.spawn(spec("direct-backslash-scope", "write", ["\\"]), rejectRepo.dir);
+		const [settled] = await rejectManager.wait([started.id]);
+		assert.equal(settled.status, "error");
+		assert.match(settled.error ?? "", /out-of-scope path\(s\).*base\.txt/);
+	} finally {
+		await rejectManager.dispose();
+		await rejectFake.cleanup();
+		await rejectRepo.cleanup();
+	}
+
+	const allowFake = await fakeMutatingOpenCode('writeFileSync("\\\\", "literal\\n", "utf8");');
+	const allowRepo = await fakeGitRepo();
+	const allowManager = new OpenCodeTaskManager({ binary: allowFake.binary, binaryArgs: allowFake.binaryArgs, timeoutMs: 2_000 });
+	try {
+		const started = allowManager.spawn(spec("direct-backslash-self", "write", ["\\"]), allowRepo.dir);
+		const [settled] = await allowManager.wait([started.id]);
+		assert.equal(settled.status, "done");
+		assert.equal(await readFile(path.join(allowRepo.dir, "\\"), "utf8"), "literal\n");
+	} finally {
+		await allowManager.dispose();
+		await allowFake.cleanup();
+		await allowRepo.cleanup();
+	}
+});
+
 // Real-Git repo with a tracked symlink trap: `outside-link` resolves to the
 // in-scope `allowed/a.txt`, and `scratch` is a git-ignored scope file.
 async function fakeScopeTrapRepo() {
