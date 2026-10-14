@@ -208,8 +208,9 @@ export class OpenCodeBackendAdapter implements WorkerBackendAdapter {
 		}
 		// Derive the canonical GitHub CLI config dir BEFORE XDG_CONFIG_HOME is
 		// made private below: explicit GH_CONFIG_DIR wins, then the original
-		// XDG_CONFIG_HOME/gh, then (Windows) AppData/GitHub CLI, then
-		// HOME/.config/gh. Only the supplied env is read.
+		// XDG_CONFIG_HOME/gh, then (Windows) AppData/GitHub CLI, then the
+		// native home store (USERPROFILE on Windows, HOME elsewhere).
+		// Only the supplied env is read.
 		const ghConfigDir = resolveGhConfigDir(env);
 		const next: NodeJS.ProcessEnv = { ...env };
 		// Fail-closed: ambient OpenCode config selectors and inline config are

@@ -54,8 +54,13 @@ function lookupValue(source: NodeJS.ProcessEnv, requested: string): string | und
  * Canonical GitHub CLI config directory for a worker child, following the
  * official gh contract (https://cli.github.com/manual/gh_help_environment):
  * explicit GH_CONFIG_DIR wins, then $XDG_CONFIG_HOME/gh, then (Windows only)
- * $AppData/GitHub CLI, then $HOME/.config/gh. Only the supplied source is
- * read; ambient process.env is never consulted here. Explicit directories are
+ * $AppData/GitHub CLI, then the native home store. The home variable follows
+ * Go's os.UserHomeDir (which native gh uses): %USERPROFILE% on Windows,
+ * $HOME on POSIX. The generic order is never used: when GH/XDG/AppData are
+ * unset and HOME != USERPROFILE, a HOME-first fallback would point at the
+ * wrong account store on Windows. Only the supplied source is read; ambient
+ * process.env is never consulted here (apart from the os.homedir() fallback
+ * below, which itself follows the platform home). Explicit directories are
  * used verbatim (no trimming) so valid paths with spaces keep working.
  */
 export function resolveGhConfigDir(
@@ -70,8 +75,14 @@ export function resolveGhConfigDir(
 		const appData = lookupValue(source, "AppData");
 		if (appData !== undefined && appData !== "") return path.join(appData, "GitHub CLI");
 	}
-	const home = lookupValue(source, "HOME") ?? lookupValue(source, "USERPROFILE");
-	let base = home !== undefined && home !== "" ? home : undefined;
+	const primary = lookupValue(source, platform === "win32" ? "USERPROFILE" : "HOME");
+	const secondary = lookupValue(source, platform === "win32" ? "HOME" : "USERPROFILE");
+	const home = primary !== undefined && primary !== ""
+		? primary
+		: secondary !== undefined && secondary !== ""
+			? secondary
+			: undefined;
+	let base = home;
 	if (base === undefined) {
 		try {
 			const fallback = os.homedir();

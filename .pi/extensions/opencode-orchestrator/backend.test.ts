@@ -348,6 +348,50 @@ test("worker gh auth falls back to HOME/.config/gh", () => {
 	}
 });
 
+test("worker gh auth home fallback follows the native platform store", () => {
+	if (!localGhAvailable()) return;
+	const root = mkdtempSync(path.join(os.tmpdir(), "gh-auth-home-select-"));
+	let capturedOut: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	let capturedErr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	const adapter = openCodeAdapter();
+	const preparation = adapter.prepare(spawnInput());
+	try {
+		const homeDir = path.join(root, "home");
+		const profileDir = path.join(root, "profile");
+		writeGhHostsFixture(path.join(homeDir, ".config", "gh"), "FAKE-GH-HOME-DISTINCT-a1b2c3");
+		writeGhHostsFixture(path.join(profileDir, ".config", "gh"), "FAKE-GH-PROFILE-DISTINCT-d4e5f6");
+		// No GH_CONFIG_DIR/XDG_CONFIG_HOME/AppData selectors: the home
+		// fallback alone must pick the native platform store. Native gh
+		// (go-gh v2.12.2 ConfigDir via Go os.UserHomeDir) uses %USERPROFILE%
+		// on Windows and $HOME on POSIX; a generic HOME-first fallback
+		// points at the wrong account store on Windows when they differ.
+		const workerEnv = buildWorkerEnv({
+			PATH: process.env.PATH ?? "",
+			HOME: homeDir,
+			USERPROFILE: profileDir,
+		});
+		const built = adapter.buildEnv(workerEnv, spawnInput(), preparation);
+		const onWindows = process.platform === "win32";
+		const expectedDir = onWindows ? profileDir : homeDir;
+		const expectedToken = onWindows ? "FAKE-GH-PROFILE-DISTINCT-d4e5f6" : "FAKE-GH-HOME-DISTINCT-a1b2c3";
+		assert.equal(built.GH_CONFIG_DIR, path.join(expectedDir, ".config", "gh"));
+		assert.equal(built.XDG_CONFIG_HOME, preparation.runtimeDir);
+		const child = ghChildEnv(built, homeDir);
+		child.HOME = homeDir;
+		child.USERPROFILE = profileDir;
+		const probed = readGhTokenSync(child);
+		capturedOut = probed.stdout;
+		capturedErr = probed.stderr;
+		assert.equal(probed.status, 0);
+		assert.ok(capturedOut.toString("utf8").trim() === expectedToken);
+	} finally {
+		capturedOut.fill(0);
+		capturedErr.fill(0);
+		adapter.cleanupAgent(preparation.agentName, preparation);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 if (process.platform === "win32") {
 	test("worker gh auth uses mixed-case AppData store on Windows", () => {
 		if (!localGhAvailable()) return;
